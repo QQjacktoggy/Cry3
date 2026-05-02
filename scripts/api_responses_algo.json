@@ -1,0 +1,408 @@
+{
+  "futures_grid_open_orders": {
+    "_error": "HTTP 401: {\"code\":-1002,\"msg\":\"You are not authorized to execute this request.\"}"
+  },
+  "futures_grid_historical_orders": {
+    "_error": "HTTP 401: {\"code\":-1002,\"msg\":\"You are not authorized to execute this request.\"}"
+  },
+  "futures_grid_sub_orders": {},
+  "fapi_open_orders_BTCUSDC": [],
+  "fapi_open_orders_ETHUSDC": [],
+  "fapi_open_orders_SOLUSDC": [],
+  "fapi_user_trades_BTCUSDC": {
+    "_count": 20,
+    "sample": [
+      {
+        "symbol": "BTCUSDC",
+        "id": 457010673,
+        "orderId": 55381533839,
+        "side": "BUY",
+        "price": "76190",
+        "qty": "0.001",
+        "realizedPnl": "0",
+        "quoteQty": "76.1900",
+        "commission": "0",
+        "commissionAsset": "USDC",
+        "time": 1777379097069,
+        "positionSide": "BOTH",
+        "buyer": true,
+        "maker": true
+      },
+      {
+        "symbol": "BTCUSDC",
+        "id": 457044631,
+        "orderId": 55383291033,
+        "side": "SELL",
+        "price": "76272.5",
+        "qty": "0.001",
+        "realizedPnl": "0.08250000",
+        "quoteQty": "76.2725",
+        "commission": "0.03050900",
+        "commissionAsset": "USDC",
+        "time": 1777379898552,
+        "positionSide": "BOTH",
+        "buyer": false,
+        "maker": false
+      },
+      {
+        "symbol": "BTCUSDC",
+        "id": 457081505,
+        "orderId": 55385171099,
+        "side": "BUY",
+        "price": "76328",
+        "qty": "0.001",
+        "realizedPnl": "0",
+        "quoteQty": "76.3280",
+        "commission": "0",
+        "commissionAsset": "USDC",
+        "time": 1777381017407,
+        "positionSide": "BOTH",
+        "buyer": true,
+        "maker": true
+      }
+    ],
+    "last": {
+      "symbol": "BTCUSDC",
+      "id": 457436513,
+      "orderId": 55411670963,
+      "side": "SELL",
+      "price": "76041",
+      "qty": "0.002",
+      "realizedPnl": "0.12200000",
+      "quoteQty": "152.0820",
+      "commission": "0",
+      "commissionAsset": "USDC",
+      "time": 1777391642220,
+      "positionSide": "BOTH",
+      "buyer": false,
+      "maker": true
+    }
+  },
+  "fapi_user_trades_ETHUSDC": {
+    "_count": 20,
+    "sample": [
+      {
+        "symbol": "ETHUSDC",
+        "id": 711792150,
+        "orderId": 59992172070,
+        "side": "BUY",
+        "price": "2277.40",
+        "qty": "0.078",
+        "realizedPnl": "0",
+        "quoteQty": "177.63720",
+        "commission": "0",
+        "commissionAsset": "USDC",
+        "time": 1777393890200,
+        "positionSide": "BOTH",
+        "buyer": true,
+        "maker": true
+      },
+      {
+        "symbol": "ETHUSDC",
+        "id": 711809785,
+        "orderId": 59994975372,
+        "side": "SELL",
+        "price": "2283.81",
+        "qty": "0.078",
+        "realizedPnl": "0.49998000",
+        "quoteQty": "178.13718",
+        "commission": "0",
+        "commissionAsset": "USDC",
+        "time": 1777395217642,
+        "positionSide": "BOTH",
+        "buyer": false,
+        "maker": true
+      },
+      {
+        "symbol": "ETHUSDC",
+        "id": 712053112,
+        "orderId": 60044959811,
+        "side": "BUY",
+        "price": "2286.50",
+        "qty": "0.090",
+        "realizedPnl": "0",
+        "quoteQty": "205.78500",
+        "commission": "0",
+        "commissionAsset": "USDC",
+        "time": 1777421909082,
+        "positionSide": "BOTH",
+        "buyer": true,
+        "maker": true
+      }
+    ],
+    "last": {
+      "symbol": "ETHUSDC",
+      "id": 712696918,
+      "orderId": 60132732683,
+      "side": "SELL",
+      "price": "2314.09",
+      "qty": "0.059",
+      "realizedPnl": "-1.40479000",
+      "quoteQty": "136.53131",
+      "commission": "0",
+      "commissionAsset": "USDC",
+      "time": 1777465352095,
+      "positionSide": "BOTH",
+      "buyer": false,
+      "maker": true
+    }
+  },
+  "fapi_user_trades_SOLUSDC": [],
+  "fapi_all_orders_BTCUSDC": {
+    "_count": 20,
+    "sample": [
+      {
+        "orderId": 55380967122,
+        "symbol": "BTCUSDC",
+        "status": "FILLED",
+        "clientOrderId": "aos_4lr4DMBp5S4DPoFaNiFs",
+        "price": "0",
+        "avgPrice": "76321.0000",
+        "origQty": "0.001",
+        "executedQty": "0.001",
+        "cumQuote": "76.3210",
+        "timeInForce": "GTC",
+        "type": "MARKET",
+        "reduceOnly": true,
+        "closePosition": false,
+        "side": "SELL",
+        "positionSide": "BOTH",
+        "stopPrice": "0",
+        "workingType": "CONTRACT_PRICE",
+        "priceMatch": "NONE",
+        "selfTradePreventionMode": "NONE",
+        "goodTillDate": 0,
+        "priceProtect": false,
+        "origType": "MARKET",
+        "time": 1777378836516,
+        "updateTime": 1777378836549
+      },
+      {
+        "orderId": 55381533839,
+        "symbol": "BTCUSDC",
+        "status": "FILLED",
+        "clientOrderId": "aos_usdt_4FW2v7AdgU0RBngi1vGJ",
+        "price": "76190",
+        "avgPrice": "76190.0000",
+        "origQty": "0.001",
+        "executedQty": "0.001",
+        "cumQuote": "76.1900",
+        "timeInForce": "GTX",
+        "type": "LIMIT",
+        "reduceOnly": false,
+        "closePosition": false,
+        "side": "BUY",
+        "positionSide": "BOTH",
+        "stopPrice": "0",
+        "workingType": "CONTRACT_PRICE",
+        "priceMatch": "NONE",
+        "selfTradePreventionMode": "EXPIRE_MAKER",
+        "goodTillDate": 0,
+        "priceProtect": false,
+        "origType": "LIMIT",
+        "time": 1777379082048,
+        "updateTime": 1777379097069
+      },
+      {
+        "orderId": 55383291033,
+        "symbol": "BTCUSDC",
+        "status": "FILLED",
+        "clientOrderId": "aos_GDSftEVHv7hTgoEToHKD",
+        "price": "76265.8",
+        "avgPrice": "76272.5000",
+        "origQty": "0.001",
+        "executedQty": "0.001",
+        "cumQuote": "76.2725",
+        "timeInForce": "GTC",
+        "type": "LIMIT",
+        "reduceOnly": true,
+        "closePosition": false,
+        "side": "SELL",
+        "positionSide": "BOTH",
+        "stopPrice": "0",
+        "workingType": "CONTRACT_PRICE",
+        "priceMatch": "NONE",
+        "selfTradePreventionMode": "NONE",
+        "goodTillDate": 0,
+        "priceProtect": false,
+        "origType": "LIMIT",
+        "time": 1777379898532,
+        "updateTime": 1777379898552
+      }
+    ]
+  },
+  "futures_income_summary": {
+    "STRATEGY_UMFUTURES_TRANSFER": {
+      "count": 22,
+      "total": -17.243986379999996,
+      "sample": {
+        "symbol": "",
+        "incomeType": "STRATEGY_UMFUTURES_TRANSFER",
+        "income": "139.98091689",
+        "asset": "USDT",
+        "time": 1777181386000,
+        "info": "UM_GRID_CLOSE",
+        "tranId": 1100654940273778688,
+        "tradeId": ""
+      }
+    },
+    "TRANSFER": {
+      "count": 2,
+      "total": -0.8374915699999974,
+      "sample": {
+        "symbol": "",
+        "incomeType": "TRANSFER",
+        "income": "-162.83749157",
+        "asset": "USDT",
+        "time": 1777184373000,
+        "info": "TRANSFER",
+        "tranId": 365823888546,
+        "tradeId": ""
+      }
+    },
+    "COMMISSION": {
+      "count": 17,
+      "total": -1.11774715,
+      "sample": {
+        "symbol": "BTCUSDC",
+        "incomeType": "COMMISSION",
+        "income": "-0.03062004",
+        "asset": "USDC",
+        "time": 1777373814000,
+        "info": "456684777",
+        "tranId": 96111456684777,
+        "tradeId": "456684777"
+      }
+    },
+    "REALIZED_PNL": {
+      "count": 25,
+      "total": -2.64384,
+      "sample": {
+        "symbol": "BTCUSDC",
+        "incomeType": "REALIZED_PNL",
+        "income": "0.03990000",
+        "asset": "USDC",
+        "time": 1777374023000,
+        "info": "456692572",
+        "tranId": 96110456692572,
+        "tradeId": "456692572"
+      }
+    },
+    "FUNDING_FEE": {
+      "count": 1,
+      "total": -0.003494,
+      "sample": {
+        "symbol": "ETHUSDC",
+        "incomeType": "FUNDING_FEE",
+        "income": "-0.00349400",
+        "asset": "USDC",
+        "time": 1777449603000,
+        "info": "FUNDING_FEE",
+        "tranId": 1017799224183111680,
+        "tradeId": ""
+      }
+    }
+  },
+  "futures_income_raw_last_10": [
+    {
+      "symbol": "",
+      "incomeType": "STRATEGY_UMFUTURES_TRANSFER",
+      "income": "164.93715458",
+      "asset": "USDC",
+      "time": 1777571746000,
+      "info": "UM_GRID_CLOSE",
+      "tranId": 1102292225368932352,
+      "tradeId": ""
+    },
+    {
+      "symbol": "",
+      "incomeType": "STRATEGY_UMFUTURES_TRANSFER",
+      "income": "-161.00000000",
+      "asset": "USDC",
+      "time": 1777572035000,
+      "info": "UM_GRID_CREATE",
+      "tranId": 1102293437644390400,
+      "tradeId": ""
+    },
+    {
+      "symbol": "",
+      "incomeType": "STRATEGY_UMFUTURES_TRANSFER",
+      "income": "161.28027324",
+      "asset": "USDC",
+      "time": 1777592473000,
+      "info": "UM_GRID_CLOSE",
+      "tranId": 1102379162549563392,
+      "tradeId": ""
+    },
+    {
+      "symbol": "",
+      "incomeType": "STRATEGY_UMFUTURES_TRANSFER",
+      "income": "-165.22000000",
+      "asset": "USDC",
+      "time": 1777592645000,
+      "info": "UM_GRID_CREATE",
+      "tranId": 1102379881467940864,
+      "tradeId": ""
+    },
+    {
+      "symbol": "",
+      "incomeType": "STRATEGY_UMFUTURES_TRANSFER",
+      "income": "168.46740445",
+      "asset": "USDC",
+      "time": 1777668873000,
+      "info": "UM_GRID_CLOSE",
+      "tranId": 1102699604827787264,
+      "tradeId": ""
+    },
+    {
+      "symbol": "",
+      "incomeType": "STRATEGY_UMFUTURES_TRANSFER",
+      "income": "-168.46000000",
+      "asset": "USDC",
+      "time": 1777683473000,
+      "info": "UM_GRID_CREATE",
+      "tranId": 1102760845399117824,
+      "tradeId": ""
+    },
+    {
+      "symbol": "",
+      "incomeType": "STRATEGY_UMFUTURES_TRANSFER",
+      "income": "168.46000000",
+      "asset": "USDC",
+      "time": 1777683927000,
+      "info": "UM_GRID_CLOSE",
+      "tranId": 1102762749134598144,
+      "tradeId": ""
+    },
+    {
+      "symbol": "",
+      "incomeType": "STRATEGY_UMFUTURES_TRANSFER",
+      "income": "-168.46000000",
+      "asset": "USDC",
+      "time": 1777684431000,
+      "info": "UM_GRID_CREATE",
+      "tranId": 1102764860429217792,
+      "tradeId": ""
+    },
+    {
+      "symbol": "",
+      "incomeType": "STRATEGY_UMFUTURES_TRANSFER",
+      "income": "169.00248924",
+      "asset": "USDC",
+      "time": 1777731755000,
+      "info": "UM_GRID_CLOSE",
+      "tranId": 1102963353823121408,
+      "tradeId": ""
+    },
+    {
+      "symbol": "",
+      "incomeType": "STRATEGY_UMFUTURES_TRANSFER",
+      "income": "-168.00000000",
+      "asset": "USDC",
+      "time": 1777735951000,
+      "info": "UM_GRID_CREATE",
+      "tranId": 1102980954354298880,
+      "tradeId": ""
+    }
+  ]
+}

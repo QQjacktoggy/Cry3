@@ -1,0 +1,355 @@
+"""Telegram bot command handlers.
+
+Each handler corresponds to a / command defined in spec.
+All handlers receive ApplicationContext from python-telegram-bot v21.
+"""
+
+from telegram import Update
+from telegram.ext import ContextTypes
+
+from config.settings import Settings
+from config.strategies import get_strategy, STRATEGY_REGISTRY
+from src.gridbot.ai.gemini import GeminiAnalyzer
+from src.gridbot.binance.client import BinanceFuturesClient
+from src.gridbot.binance.models import IncomeRecord, MarketSnapshot, PositionInfo
+from src.gridbot.grid.analyzer import compute_metrics
+from src.gridbot.grid.models import GridMetrics
+from src.gridbot.storage.repositories import (
+    FuturesTradeRepository,
+    GridSessionRepository,
+    IncomeRepository,
+    MarketSnapshotRepository,
+    PerformanceRepository,
+    RecommendationRepository,
+)
+from src.gridbot.telegram.formatters import (
+    format_full_report,
+    format_pnl_summary,
+    format_recommendation,
+    format_risk_dashboard,
+    format_sessions,
+)
+from src.gridbot.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/start — Welcome message."""
+    await update.message.reply_text(
+        "🤖 <b>Binance 合約網格監控 Bot</b>\n\n"
+        "我會定期監控你的網格機器人表現，\n"
+        "並透過 Gemini AI 提供策略建議。\n\n"
+        "輸入 /help 查看所有可用指令。",
+        parse_mode="HTML",
+    )
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/help — List all commands."""
+    await update.message.reply_text(
+        "📋 <b>可用指令</b>\n\n"
+        "/status — 所有交易對即時狀態\n"
+        "/status <code>BTCUSDC</code> — 特定交易對狀態\n"
+        "/metrics — 詳細表現報告\n"
+        "/risk — 風險儀表板\n"
+        "/strategy — 當前策略與參數\n"
+        "/analyze — 立即觸發 Gemini 分析\n"
+        "/ask <code>問題</code> — 向 Gemini 提問\n"
+        "/sessions — 網格輪次歷史\n"
+        "/pnl — 累計損益報表\n"
+        "/history — 最近建議紀錄\n"
+        "/interval <code>分鐘</code> — 設定抓取間隔\n"
+        "/pause — 暫停定期抓取\n"
+        "/resume — 恢復定期抓取\n"
+        "/help — 列出所有指令",
+        parse_mode="HTML",
+    )
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/status — Current status for all or specific symbol."""
+    app_data = context.application.bot_data
+
+    binance_client: BinanceFuturesClient = app_data["binance_client"]
+    settings: Settings = app_data["settings"]
+    income_repo: IncomeRepository = app_data["income_repo"]
+    session_repo: GridSessionRepository = app_data["session_repo"]
+
+    # Check if specific symbol requested
+    args = context.args
+    target_symbols = settings.symbols_list
+    if args and args[0].upper() in target_symbols:
+        target_symbols = [args[0].upper()]
+
+    await update.message.reply_text("⏳ 正在取得最新資料...")
+
+    try:
+        all_metrics: dict[str, GridMetrics] = {}
+        all_markets: dict[str, MarketSnapshot] = {}
+        all_positions: dict[str, PositionInfo | None] = {}
+
+        for symbol in target_symbols:
+            result = await binance_client.fetch_symbol_data(symbol)
+            income_records = [
+                IncomeRecord.from_api({
+                    "tranId": r["tran_id"], "symbol": r.get("symbol", ""),
+                    "incomeType": r["income_type"], "income": str(r["income"]),
+                    "asset": r["asset"], "time": r["time_ms"],
+                    "info": r.get("info", ""), "tradeId": r.get("trade_id", ""),
+                })
+                for r in await income_repo.get_records(symbol=symbol)
+            ]
+
+            active_session = await session_repo.get_active_session()
+            session_invested = active_session["invested_amount"] if active_session else None
+            session_start = active_session["created_at_ms"] if active_session else None
+
+            all_metrics[symbol] = compute_metrics(
+                result,
+                income_records=income_records if income_records else None,
+                session_invested=session_invested,
+                session_start_ms=session_start,
+            )
+            all_markets[symbol] = result.market
+            all_positions[symbol] = result.position
+
+        account = await binance_client.get_account_info()
+        report = format_full_report(
+            metrics=all_metrics,
+            markets=all_markets,
+            positions=all_positions,
+            account_balance=account.total_margin_balance,
+            margin_ratio=account.margin_ratio,
+        )
+        await update.message.reply_text(report, parse_mode="HTML")
+
+    except Exception as exc:
+        logger.error("cmd_status_failed", error=str(exc))
+        await update.message.reply_text(f"❌ 取得狀態失敗：{str(exc)[:200]}")
+
+
+async def cmd_risk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/risk — Risk dashboard."""
+    app_data = context.application.bot_data
+    binance_client: BinanceFuturesClient = app_data["binance_client"]
+    settings: Settings = app_data["settings"]
+
+    try:
+        positions: dict[str, PositionInfo | None] = {}
+        for symbol in settings.symbols_list:
+            positions[symbol] = await binance_client.get_position(symbol)
+
+        account = await binance_client.get_account_info()
+        report = format_risk_dashboard(
+            positions=positions,
+            margin_ratio=account.margin_ratio,
+            margin_warning=settings.margin_ratio_warning,
+            margin_critical=settings.margin_ratio_critical,
+        )
+        await update.message.reply_text(report, parse_mode="HTML")
+
+    except Exception as exc:
+        logger.error("cmd_risk_failed", error=str(exc))
+        await update.message.reply_text(f"❌ 取得風險資訊失敗：{str(exc)[:200]}")
+
+
+async def cmd_strategy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/strategy — Current strategy details."""
+    settings: Settings = context.application.bot_data["settings"]
+    strategy = get_strategy(settings.active_strategy_name)
+    b = strategy.bounds
+
+    text = (
+        f"📋 <b>當前策略: {strategy.display_name}</b>\n\n"
+        f"名稱: {strategy.name}\n"
+        f"風險等級: {strategy.risk_level}\n"
+        f"描述: {strategy.description}\n\n"
+        f"<b>參數邊界:</b>\n"
+        f"  格距: {b.grid_spacing_pct_min}% ~ {b.grid_spacing_pct_max}%\n"
+        f"  格數: {b.num_grids_min} ~ {b.num_grids_max}\n"
+        f"  區間寬度: {b.price_range_width_pct_min}% ~ {b.price_range_width_pct_max}%\n"
+        f"  槓桿: {b.leverage_min}x ~ {b.leverage_max}x\n"
+        f"  方向: {', '.join(b.allowed_directions)}\n\n"
+        f"適用條件: {', '.join(strategy.suitable_conditions)}"
+    )
+    await update.message.reply_text(text, parse_mode="HTML")
+
+
+async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/analyze — Trigger Gemini analysis now."""
+    app_data = context.application.bot_data
+    binance_client: BinanceFuturesClient = app_data["binance_client"]
+    settings: Settings = app_data["settings"]
+    analyzer: GeminiAnalyzer = app_data["gemini_analyzer"]
+    income_repo: IncomeRepository = app_data["income_repo"]
+    session_repo: GridSessionRepository = app_data["session_repo"]
+    rec_repo: RecommendationRepository = app_data["rec_repo"]
+
+    await update.message.reply_text("🤖 正在執行 Gemini AI 分析...")
+
+    try:
+        all_metrics: dict[str, GridMetrics] = {}
+        all_markets: dict[str, MarketSnapshot] = {}
+        all_positions: dict[str, PositionInfo | None] = {}
+        all_funding: dict[str, list[dict]] = {}
+
+        for symbol in settings.symbols_list:
+            result = await binance_client.fetch_symbol_data(symbol)
+            income_records = [
+                IncomeRecord.from_api({
+                    "tranId": r["tran_id"], "symbol": r.get("symbol", ""),
+                    "incomeType": r["income_type"], "income": str(r["income"]),
+                    "asset": r["asset"], "time": r["time_ms"],
+                    "info": r.get("info", ""), "tradeId": r.get("trade_id", ""),
+                })
+                for r in await income_repo.get_records(symbol=symbol)
+            ]
+
+            active_session = await session_repo.get_active_session()
+            session_invested = active_session["invested_amount"] if active_session else None
+            session_start = active_session["created_at_ms"] if active_session else None
+
+            all_metrics[symbol] = compute_metrics(
+                result,
+                income_records=income_records if income_records else None,
+                session_invested=session_invested,
+                session_start_ms=session_start,
+            )
+            all_markets[symbol] = result.market
+            all_positions[symbol] = result.position
+            all_funding[symbol] = await binance_client.get_funding_rate_history(symbol, limit=10)
+
+        account = await binance_client.get_account_info()
+
+        rec = await analyzer.analyze(
+            metrics=all_metrics,
+            markets=all_markets,
+            positions=all_positions,
+            funding_rates=all_funding,
+            current_strategy=settings.active_strategy_name,
+            account_balance=account.total_margin_balance,
+            margin_ratio=account.margin_ratio,
+        )
+
+        # Save recommendation
+        await rec_repo.save({
+            "symbol": ",".join(settings.symbols_list),
+            "recommended_strategy": rec.recommended_strategy,
+            "confidence": rec.confidence,
+            "parameter_adjustments": [a.model_dump() for a in rec.parameter_adjustments],
+            "market_summary": rec.market_condition_summary,
+            "reasoning": rec.reasoning,
+            "risk_warnings": rec.risk_warnings,
+            "trigger": "manual",
+        })
+
+        report = format_recommendation(rec, settings.active_strategy_name)
+        await update.message.reply_text(report, parse_mode="HTML")
+
+    except Exception as exc:
+        logger.error("cmd_analyze_failed", error=str(exc))
+        await update.message.reply_text(f"❌ 分析失敗：{str(exc)[:300]}")
+
+
+async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/ask <question> — Free-form question to Gemini."""
+    if not context.args:
+        await update.message.reply_text("用法: /ask <你的問題>")
+        return
+
+    question = " ".join(context.args)
+    analyzer: GeminiAnalyzer = context.application.bot_data["gemini_analyzer"]
+
+    await update.message.reply_text("🤔 思考中...")
+    answer = await analyzer.ask(question)
+    await update.message.reply_text(answer)
+
+
+async def cmd_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/sessions — Grid session history."""
+    session_repo: GridSessionRepository = context.application.bot_data["session_repo"]
+    sessions = await session_repo.get_sessions(limit=10)
+    total_profit = await session_repo.get_total_profit()
+
+    report = format_sessions(sessions, total_profit)
+    await update.message.reply_text(report, parse_mode="HTML")
+
+
+async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/pnl — Cumulative P&L summary."""
+    income_repo: IncomeRepository = context.application.bot_data["income_repo"]
+    session_repo: GridSessionRepository = context.application.bot_data["session_repo"]
+
+    income_summary = {}
+    for itype in ["REALIZED_PNL", "COMMISSION", "FUNDING_FEE"]:
+        income_summary[itype] = await income_repo.sum_income(itype)
+
+    session_profit = await session_repo.get_total_profit()
+    report = format_pnl_summary(income_summary, session_profit)
+    await update.message.reply_text(report, parse_mode="HTML")
+
+
+async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/history — Recent AI recommendations."""
+    rec_repo: RecommendationRepository = context.application.bot_data["rec_repo"]
+    recs = await rec_repo.get_recent(limit=5)
+
+    if not recs:
+        await update.message.reply_text("尚無分析紀錄。使用 /analyze 觸發分析。")
+        return
+
+    lines = ["📜 <b>最近建議紀錄</b>", ""]
+    from datetime import datetime, timezone
+    for r in recs:
+        time_str = datetime.fromtimestamp(
+            r["created_at_ms"] / 1000, tz=timezone.utc
+        ).strftime("%m/%d %H:%M")
+        acted = "✅" if r.get("acted_upon") else "⏳"
+        lines.append(
+            f"{acted} {time_str} | {r['recommended_strategy']} "
+            f"(信心: {r['confidence']:.0%}) | {r.get('trigger', 'scheduled')}"
+        )
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_interval(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/interval <minutes> — Set fetch interval."""
+    if not context.args:
+        settings: Settings = context.application.bot_data["settings"]
+        await update.message.reply_text(f"目前抓取間隔: {settings.fetch_interval_minutes} 分鐘\n用法: /interval <分鐘>")
+        return
+
+    try:
+        minutes = int(context.args[0])
+        if minutes < 1 or minutes > 1440:
+            await update.message.reply_text("間隔必須在 1 ~ 1440 分鐘之間")
+            return
+
+        # Store in bot_data (runtime only, doesn't persist to .env)
+        context.application.bot_data["settings"].fetch_interval_minutes = minutes
+        await update.message.reply_text(f"✅ 抓取間隔已設為 {minutes} 分鐘")
+
+    except ValueError:
+        await update.message.reply_text("請輸入有效的數字")
+
+
+async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/pause — Pause scheduled fetching."""
+    scheduler = context.application.bot_data.get("scheduler")
+    if scheduler:
+        scheduler.pause()
+        await update.message.reply_text("⏸️ 已暫停定期抓取")
+    else:
+        await update.message.reply_text("排程器未初始化")
+
+
+async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/resume — Resume scheduled fetching."""
+    scheduler = context.application.bot_data.get("scheduler")
+    if scheduler:
+        scheduler.resume()
+        await update.message.reply_text("▶️ 已恢復定期抓取")
+    else:
+        await update.message.reply_text("排程器未初始化")

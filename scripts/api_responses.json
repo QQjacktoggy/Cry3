@@ -1,0 +1,894 @@
+{
+  "futures_grid_open_orders": {
+    "_error": "HTTP 400: {\"code\":-1021,\"msg\":\"Timestamp for this request was 1000ms ahead of the server's time.\"}"
+  },
+  "futures_grid_historical_orders": {
+    "_error": "HTTP 400: {\"code\":-1021,\"msg\":\"Timestamp for this request was 1000ms ahead of the server's time.\"}"
+  },
+  "futures_grid_sub_orders": {},
+  "futures_ticker_BTCUSDC": {
+    "symbol": "BTCUSDC",
+    "priceChange": "-223.4",
+    "priceChangePercent": "-0.284",
+    "weightedAvgPrice": "78256.4",
+    "lastPrice": "78391.6",
+    "lastQty": "0.094",
+    "openPrice": "78615.0",
+    "highPrice": "78642.7",
+    "lowPrice": "77710.0",
+    "volume": "18076.352",
+    "quoteVolume": "1414591055.1",
+    "openTime": 1777650300000,
+    "closeTime": 1777736733269,
+    "firstId": 460427801,
+    "lastId": 460937508,
+    "count": 505435
+  },
+  "futures_mark_price_BTCUSDC": {
+    "symbol": "BTCUSDC",
+    "markPrice": "78392.78768498",
+    "indexPrice": "78438.77353298",
+    "estimatedSettlePrice": "78396.46162928",
+    "lastFundingRate": "0.00002022",
+    "interestRate": "0.00010000",
+    "nextFundingTime": 1777737600000,
+    "time": 1777736745000
+  },
+  "futures_funding_rate_BTCUSDC": [
+    {
+      "symbol": "BTCUSDC",
+      "fundingTime": 1777593600000,
+      "fundingRate": "0.00003534",
+      "markPrice": "76297.00000000"
+    },
+    {
+      "symbol": "BTCUSDC",
+      "fundingTime": 1777622400005,
+      "fundingRate": "0.00007312",
+      "markPrice": "77096.26600244"
+    },
+    {
+      "symbol": "BTCUSDC",
+      "fundingTime": 1777651200000,
+      "fundingRate": "-0.00002191",
+      "markPrice": "78416.92591507"
+    },
+    {
+      "symbol": "BTCUSDC",
+      "fundingTime": 1777680000006,
+      "fundingRate": "-0.00004961",
+      "markPrice": "78193.40000000"
+    },
+    {
+      "symbol": "BTCUSDC",
+      "fundingTime": 1777708800000,
+      "fundingRate": "0.00000945",
+      "markPrice": "78191.60000000"
+    }
+  ],
+  "futures_klines_BTCUSDC": {
+    "_note": "showing 3 of 24 klines",
+    "sample": [
+      [
+        1777651200000,
+        "78394.4",
+        "78642.7",
+        "78126.5",
+        "78169.8",
+        "2199.937",
+        1777654799999,
+        "172272031.8936",
+        57242,
+        "1074.957",
+        "84174343.6346",
+        "0"
+      ],
+      [
+        1777654800000,
+        "78169.5",
+        "78549.7",
+        "78087.7",
+        "78504.0",
+        "1655.257",
+        1777658399999,
+        "129618807.4996",
+        37728,
+        "900.216",
+        "70485519.1619",
+        "0"
+      ],
+      [
+        1777658400000,
+        "78505.7",
+        "78586.8",
+        "78330.0",
+        "78385.2",
+        "1177.740",
+        1777661999999,
+        "92426183.6267",
+        33308,
+        "546.542",
+        "42890872.3061",
+        "0"
+      ]
+    ]
+  },
+  "futures_position_BTCUSDC": [],
+  "futures_ticker_ETHUSDC": {
+    "symbol": "ETHUSDC",
+    "priceChange": "-6.64",
+    "priceChangePercent": "-0.287",
+    "weightedAvgPrice": "2300.18",
+    "lastPrice": "2306.06",
+    "lastQty": "0.018",
+    "openPrice": "2312.70",
+    "highPrice": "2313.51",
+    "lowPrice": "2277.89",
+    "volume": "416202.604",
+    "quoteVolume": "957341126.94",
+    "openTime": 1777650300000,
+    "closeTime": 1777736740920,
+    "firstId": 715796303,
+    "lastId": 716366795,
+    "count": 567782
+  },
+  "futures_mark_price_ETHUSDC": {
+    "symbol": "ETHUSDC",
+    "markPrice": "2306.06000000",
+    "indexPrice": "2307.49660494",
+    "estimatedSettlePrice": "2306.88881102",
+    "lastFundingRate": "0.00001870",
+    "interestRate": "0.00010000",
+    "nextFundingTime": 1777737600000,
+    "time": 1777736745000
+  },
+  "futures_funding_rate_ETHUSDC": [
+    {
+      "symbol": "ETHUSDC",
+      "fundingTime": 1777593600000,
+      "fundingRate": "0.00001863",
+      "markPrice": "2256.43891553"
+    },
+    {
+      "symbol": "ETHUSDC",
+      "fundingTime": 1777622400005,
+      "fundingRate": "0.00007399",
+      "markPrice": "2278.58698601"
+    },
+    {
+      "symbol": "ETHUSDC",
+      "fundingTime": 1777651200000,
+      "fundingRate": "-0.00000794",
+      "markPrice": "2306.96477191"
+    },
+    {
+      "symbol": "ETHUSDC",
+      "fundingTime": 1777680000006,
+      "fundingRate": "-0.00001118",
+      "markPrice": "2294.61000000"
+    },
+    {
+      "symbol": "ETHUSDC",
+      "fundingTime": 1777708800000,
+      "fundingRate": "-0.00000309",
+      "markPrice": "2300.13000000"
+    }
+  ],
+  "futures_klines_ETHUSDC": {
+    "_note": "showing 3 of 24 klines",
+    "sample": [
+      [
+        1777651200000,
+        "2306.60",
+        "2313.33",
+        "2297.00",
+        "2300.89",
+        "52152.358",
+        1777654799999,
+        "120119154.22643",
+        66587,
+        "26696.084",
+        "61489573.20184",
+        "0"
+      ],
+      [
+        1777654800000,
+        "2300.78",
+        "2312.52",
+        "2297.46",
+        "2310.52",
+        "28990.632",
+        1777658399999,
+        "66838335.63169",
+        39760,
+        "16352.804",
+        "37703919.79564",
+        "0"
+      ],
+      [
+        1777658400000,
+        "2310.51",
+        "2311.58",
+        "2302.29",
+        "2303.48",
+        "22999.184",
+        1777661999999,
+        "53062775.90190",
+        33902,
+        "11130.200",
+        "25679242.37977",
+        "0"
+      ]
+    ]
+  },
+  "futures_position_ETHUSDC": [],
+  "futures_ticker_SOLUSDC": {
+    "symbol": "SOLUSDC",
+    "priceChange": "-0.5400",
+    "priceChangePercent": "-0.639",
+    "weightedAvgPrice": "83.8624",
+    "lastPrice": "83.9300",
+    "lastQty": "1.72",
+    "openPrice": "84.4700",
+    "highPrice": "84.5900",
+    "lowPrice": "83.2700",
+    "volume": "1265591.53",
+    "quoteVolume": "106135524.9847",
+    "openTime": 1777650300000,
+    "closeTime": 1777736739052,
+    "firstId": 346433047,
+    "lastId": 346673474,
+    "count": 239148
+  },
+  "futures_mark_price_SOLUSDC": {
+    "symbol": "SOLUSDC",
+    "markPrice": "83.93000000",
+    "indexPrice": "83.98060622",
+    "estimatedSettlePrice": "83.97966009",
+    "lastFundingRate": "-0.00001117",
+    "interestRate": "0.00010000",
+    "nextFundingTime": 1777737600000,
+    "time": 1777736745000
+  },
+  "futures_funding_rate_SOLUSDC": [
+    {
+      "symbol": "SOLUSDC",
+      "fundingTime": 1777593600000,
+      "fundingRate": "0.00010000",
+      "markPrice": "83.04417198"
+    },
+    {
+      "symbol": "SOLUSDC",
+      "fundingTime": 1777622400005,
+      "fundingRate": "0.00010000",
+      "markPrice": "83.91000000"
+    },
+    {
+      "symbol": "SOLUSDC",
+      "fundingTime": 1777651200000,
+      "fundingRate": "0.00009693",
+      "markPrice": "84.43888661"
+    },
+    {
+      "symbol": "SOLUSDC",
+      "fundingTime": 1777680000006,
+      "fundingRate": "0.00006001",
+      "markPrice": "83.71000000"
+    },
+    {
+      "symbol": "SOLUSDC",
+      "fundingTime": 1777708800000,
+      "fundingRate": "0.00003458",
+      "markPrice": "83.69435804"
+    }
+  ],
+  "futures_klines_SOLUSDC": {
+    "_note": "showing 3 of 24 klines",
+    "sample": [
+      [
+        1777651200000,
+        "84.4200",
+        "84.5900",
+        "83.9400",
+        "83.9700",
+        "134583.13",
+        1777654799999,
+        "11338457.536500",
+        27005,
+        "59706.00",
+        "5029961.752000",
+        "0"
+      ],
+      [
+        1777654800000,
+        "83.9700",
+        "84.2500",
+        "83.8800",
+        "84.1800",
+        "59068.73",
+        1777658399999,
+        "4965107.663600",
+        15190,
+        "29609.41",
+        "2488917.882700",
+        "0"
+      ],
+      [
+        1777658400000,
+        "84.1900",
+        "84.2800",
+        "83.9400",
+        "83.9500",
+        "45919.08",
+        1777661999999,
+        "3861949.791900",
+        11321,
+        "23230.22",
+        "1953558.452500",
+        "0"
+      ]
+    ]
+  },
+  "futures_position_SOLUSDC": [],
+  "futures_account": {
+    "totalWalletBalance": "0.00000000",
+    "totalUnrealizedProfit": "0.00000000",
+    "totalMarginBalance": "0.00000000",
+    "totalMaintMargin": "0.00000000",
+    "totalCrossWalletBalance": "0.00000000",
+    "totalCrossUnPnl": "0.00000000",
+    "availableBalance": "0.00000000",
+    "maxWithdrawAmount": "0.00000000",
+    "assets_sample": [
+      {
+        "asset": "USDC",
+        "walletBalance": "1.01001558",
+        "unrealizedProfit": "0.00000000",
+        "marginBalance": "1.01001558",
+        "maintMargin": "0.00000000",
+        "initialMargin": "0.00000000",
+        "positionInitialMargin": "0.00000000",
+        "openOrderInitialMargin": "0.00000000",
+        "maxWithdrawAmount": "1.01001558",
+        "crossWalletBalance": "1.01001558",
+        "crossUnPnl": "0.00000000",
+        "availableBalance": "1.01001558",
+        "marginAvailable": true,
+        "updateTime": 1777735951940
+      }
+    ],
+    "positions_with_balance": []
+  },
+  "futures_funding_income": [
+    {
+      "symbol": "ETHUSDC",
+      "incomeType": "FUNDING_FEE",
+      "income": "-0.00349400",
+      "asset": "USDC",
+      "time": 1777449603000,
+      "info": "FUNDING_FEE",
+      "tranId": 1017799224183111680,
+      "tradeId": ""
+    }
+  ],
+  "futures_commission_BTCUSDC": {
+    "symbol": "BTCUSDC",
+    "makerCommissionRate": "0",
+    "takerCommissionRate": "0.000400",
+    "rpiCommissionRate": "0"
+  },
+  "futures_commission_ETHUSDC": {
+    "symbol": "ETHUSDC",
+    "makerCommissionRate": "0",
+    "takerCommissionRate": "0.000400",
+    "rpiCommissionRate": "0"
+  },
+  "futures_commission_SOLUSDC": {
+    "symbol": "SOLUSDC",
+    "makerCommissionRate": "0",
+    "takerCommissionRate": "0.000400",
+    "rpiCommissionRate": "0"
+  },
+  "futures_all_income": [
+    {
+      "symbol": "BTCUSDC",
+      "incomeType": "COMMISSION",
+      "income": "-0.03052840",
+      "asset": "USDC",
+      "time": 1777378836000,
+      "info": "456978483",
+      "tranId": 96110456978483,
+      "tradeId": "456978483"
+    },
+    {
+      "symbol": "BTCUSDC",
+      "incomeType": "REALIZED_PNL",
+      "income": "0.08250000",
+      "asset": "USDC",
+      "time": 1777379898000,
+      "info": "457044631",
+      "tranId": 96110457044631,
+      "tradeId": "457044631"
+    },
+    {
+      "symbol": "BTCUSDC",
+      "incomeType": "COMMISSION",
+      "income": "-0.03050900",
+      "asset": "USDC",
+      "time": 1777379898000,
+      "info": "457044631",
+      "tranId": 96110457044631,
+      "tradeId": "457044631"
+    },
+    {
+      "symbol": "BTCUSDC",
+      "incomeType": "REALIZED_PNL",
+      "income": "-0.30640000",
+      "asset": "USDC",
+      "time": 1777381803000,
+      "info": "457114370",
+      "tranId": 96110457114370,
+      "tradeId": "457114370"
+    },
+    {
+      "symbol": "BTCUSDC",
+      "incomeType": "REALIZED_PNL",
+      "income": "0.17070000",
+      "asset": "USDC",
+      "time": 1777383375000,
+      "info": "457192414",
+      "tranId": 96110457192414,
+      "tradeId": "457192414"
+    },
+    {
+      "symbol": "BTCUSDC",
+      "incomeType": "COMMISSION",
+      "income": "-0.09141228",
+      "asset": "USDC",
+      "time": 1777383375000,
+      "info": "457192414",
+      "tranId": 96110457192414,
+      "tradeId": "457192414"
+    },
+    {
+      "symbol": "BTCUSDC",
+      "incomeType": "REALIZED_PNL",
+      "income": "0.63900000",
+      "asset": "USDC",
+      "time": 1777383981000,
+      "info": "457219497",
+      "tranId": 96110457219497,
+      "tradeId": "457219497"
+    },
+    {
+      "symbol": "BTCUSDC",
+      "incomeType": "REALIZED_PNL",
+      "income": "-0.55160000",
+      "asset": "USDC",
+      "time": 1777385775000,
+      "info": "457272809",
+      "tranId": 96110457272809,
+      "tradeId": "457272809"
+    },
+    {
+      "symbol": "BTCUSDC",
+      "incomeType": "COMMISSION",
+      "income": "-0.06076336",
+      "asset": "USDC",
+      "time": 1777385775000,
+      "info": "457272809",
+      "tranId": 96110457272809,
+      "tradeId": "457272809"
+    },
+    {
+      "symbol": "BTCUSDC",
+      "incomeType": "REALIZED_PNL",
+      "income": "-0.27610000",
+      "asset": "USDC",
+      "time": 1777385775000,
+      "info": "457272810",
+      "tranId": 96110457272810,
+      "tradeId": "457272810"
+    },
+    {
+      "symbol": "BTCUSDC",
+      "incomeType": "COMMISSION",
+      "income": "-0.03038156",
+      "asset": "USDC",
+      "time": 1777385775000,
+      "info": "457272810",
+      "tranId": 96110457272810,
+      "tradeId": "457272810"
+    },
+    {
+      "symbol": "BTCUSDC",
+      "incomeType": "REALIZED_PNL",
+      "income": "-0.82860000",
+      "asset": "USDC",
+      "time": 1777385775000,
+      "info": "457272811",
+      "tranId": 96110457272811,
+      "tradeId": "457272811"
+    },
+    {
+      "symbol": "BTCUSDC",
+      "incomeType": "COMMISSION",
+      "income": "-0.09114456",
+      "asset": "USDC",
+      "time": 1777385775000,
+      "info": "457272811",
+      "tranId": 96110457272811,
+      "tradeId": "457272811"
+    },
+    {
+      "symbol": "BTCUSDC",
+      "incomeType": "REALIZED_PNL",
+      "income": "-0.27650000",
+      "asset": "USDC",
+      "time": 1777385775000,
+      "info": "457272812",
+      "tranId": 96110457272812,
+      "tradeId": "457272812"
+    },
+    {
+      "symbol": "BTCUSDC",
+      "incomeType": "COMMISSION",
+      "income": "-0.03038140",
+      "asset": "USDC",
+      "time": 1777385775000,
+      "info": "457272812",
+      "tranId": 96110457272812,
+      "tradeId": "457272812"
+    },
+    {
+      "symbol": "BTCUSDC",
+      "incomeType": "REALIZED_PNL",
+      "income": "-0.82950000",
+      "asset": "USDC",
+      "time": 1777385775000,
+      "info": "457272813",
+      "tranId": 96110457272813,
+      "tradeId": "457272813"
+    },
+    {
+      "symbol": "BTCUSDC",
+      "incomeType": "COMMISSION",
+      "income": "-0.09114420",
+      "asset": "USDC",
+      "time": 1777385775000,
+      "info": "457272813",
+      "tranId": 96110457272813,
+      "tradeId": "457272813"
+    },
+    {
+      "symbol": "BTCUSDC",
+      "incomeType": "REALIZED_PNL",
+      "income": "0.51800000",
+      "asset": "USDC",
+      "time": 1777386177000,
+      "info": "457285851",
+      "tranId": 96111457285851,
+      "tradeId": "457285851"
+    },
+    {
+      "symbol": "BTCUSDC",
+      "incomeType": "COMMISSION",
+      "income": "-0.15179280",
+      "asset": "USDC",
+      "time": 1777386177000,
+      "info": "457285851",
+      "tranId": 96111457285851,
+      "tradeId": "457285851"
+    },
+    {
+      "symbol": "BTCUSDC",
+      "incomeType": "REALIZED_PNL",
+      "income": "0.16550000",
+      "asset": "USDC",
+      "time": 1777388368000,
+      "info": "457366935",
+      "tranId": 96110457366935,
+      "tradeId": "457366935"
+    },
+    {
+      "symbol": "BTCUSDC",
+      "incomeType": "COMMISSION",
+      "income": "-0.15176619",
+      "asset": "USDC",
+      "time": 1777388368000,
+      "info": "457366935",
+      "tranId": 96110457366935,
+      "tradeId": "457366935"
+    },
+    {
+      "symbol": "BTCUSDC",
+      "incomeType": "REALIZED_PNL",
+      "income": "0.12200000",
+      "asset": "USDC",
+      "time": 1777391642000,
+      "info": "457436513",
+      "tranId": 96110457436513,
+      "tradeId": "457436513"
+    },
+    {
+      "symbol": "ETHUSDC",
+      "incomeType": "REALIZED_PNL",
+      "income": "0.49998000",
+      "asset": "USDC",
+      "time": 1777395217000,
+      "info": "711809785",
+      "tranId": 96120711809785,
+      "tradeId": "711809785"
+    },
+    {
+      "symbol": "ETHUSDC",
+      "incomeType": "REALIZED_PNL",
+      "income": "0.40500000",
+      "asset": "USDC",
+      "time": 1777424051000,
+      "info": "712065724",
+      "tranId": 96120712065724,
+      "tradeId": "712065724"
+    },
+    {
+      "symbol": "ETHUSDC",
+      "incomeType": "REALIZED_PNL",
+      "income": "0.15781000",
+      "asset": "USDC",
+      "time": 1777427283000,
+      "info": "712105761",
+      "tranId": 96120712105761,
+      "tradeId": "712105761"
+    },
+    {
+      "symbol": "ETHUSDC",
+      "incomeType": "COMMISSION",
+      "income": "-0.03933760",
+      "asset": "USDC",
+      "time": 1777427283000,
+      "info": "712105761",
+      "tranId": 96120712105761,
+      "tradeId": "712105761"
+    },
+    {
+      "symbol": "ETHUSDC",
+      "incomeType": "REALIZED_PNL",
+      "income": "0.20552000",
+      "asset": "USDC",
+      "time": 1777427283000,
+      "info": "712105762",
+      "tranId": 96120712105762,
+      "tradeId": "712105762"
+    },
+    {
+      "symbol": "ETHUSDC",
+      "incomeType": "COMMISSION",
+      "income": "-0.05123036",
+      "asset": "USDC",
+      "time": 1777427283000,
+      "info": "712105762",
+      "tranId": 96120712105762,
+      "tradeId": "712105762"
+    },
+    {
+      "symbol": "ETHUSDC",
+      "incomeType": "REALIZED_PNL",
+      "income": "0.28325000",
+      "asset": "USDC",
+      "time": 1777427637000,
+      "info": "712117959",
+      "tranId": 96121712117959,
+      "tradeId": "712117959"
+    },
+    {
+      "symbol": "ETHUSDC",
+      "incomeType": "REALIZED_PNL",
+      "income": "0.36733000",
+      "asset": "USDC",
+      "time": 1777429771000,
+      "info": "712135358",
+      "tranId": 96121712135358,
+      "tradeId": "712135358"
+    },
+    {
+      "symbol": "ETHUSDC",
+      "incomeType": "COMMISSION",
+      "income": "-0.09978426",
+      "asset": "USDC",
+      "time": 1777429771000,
+      "info": "712135358",
+      "tranId": 96121712135358,
+      "tradeId": "712135358"
+    },
+    {
+      "symbol": "ETHUSDC",
+      "incomeType": "REALIZED_PNL",
+      "income": "0.44000000",
+      "asset": "USDC",
+      "time": 1777432285000,
+      "info": "712152756",
+      "tranId": 96120712152756,
+      "tradeId": "712152756"
+    },
+    {
+      "symbol": "ETHUSDC",
+      "incomeType": "REALIZED_PNL",
+      "income": "-1.99906000",
+      "asset": "USDC",
+      "time": 1777434512000,
+      "info": "712211836",
+      "tranId": 96121712211836,
+      "tradeId": "712211836"
+    },
+    {
+      "symbol": "ETHUSDC",
+      "incomeType": "FUNDING_FEE",
+      "income": "-0.00349400",
+      "asset": "USDC",
+      "time": 1777449603000,
+      "info": "FUNDING_FEE",
+      "tranId": 1017799224183111680,
+      "tradeId": ""
+    },
+    {
+      "symbol": "ETHUSDC",
+      "incomeType": "REALIZED_PNL",
+      "income": "0.24867000",
+      "asset": "USDC",
+      "time": 1777456168000,
+      "info": "712496475",
+      "tranId": 96120712496475,
+      "tradeId": "712496475"
+    },
+    {
+      "symbol": "ETHUSDC",
+      "incomeType": "COMMISSION",
+      "income": "-0.07581826",
+      "asset": "USDC",
+      "time": 1777456168000,
+      "info": "712496475",
+      "tranId": 96120712496475,
+      "tradeId": "712496475"
+    },
+    {
+      "symbol": "ETHUSDC",
+      "incomeType": "REALIZED_PNL",
+      "income": "-0.59525000",
+      "asset": "USDC",
+      "time": 1777465352000,
+      "info": "712696915",
+      "tranId": 96120712696915,
+      "tradeId": "712696915"
+    },
+    {
+      "symbol": "ETHUSDC",
+      "incomeType": "REALIZED_PNL",
+      "income": "-1.40479000",
+      "asset": "USDC",
+      "time": 1777465352000,
+      "info": "712696918",
+      "tranId": 96120712696918,
+      "tradeId": "712696918"
+    },
+    {
+      "symbol": "",
+      "incomeType": "STRATEGY_UMFUTURES_TRANSFER",
+      "income": "161.20144066",
+      "asset": "USDC",
+      "time": 1777555144000,
+      "info": "UM_GRID_CLOSE",
+      "tranId": 1102222592308834304,
+      "tradeId": ""
+    },
+    {
+      "symbol": "",
+      "incomeType": "STRATEGY_UMFUTURES_TRANSFER",
+      "income": "-163.17000000",
+      "asset": "USDC",
+      "time": 1777556082000,
+      "info": "UM_GRID_CREATE",
+      "tranId": 1102226529041899520,
+      "tradeId": ""
+    },
+    {
+      "symbol": "",
+      "incomeType": "STRATEGY_UMFUTURES_TRANSFER",
+      "income": "164.93715458",
+      "asset": "USDC",
+      "time": 1777571746000,
+      "info": "UM_GRID_CLOSE",
+      "tranId": 1102292225368932352,
+      "tradeId": ""
+    },
+    {
+      "symbol": "",
+      "incomeType": "STRATEGY_UMFUTURES_TRANSFER",
+      "income": "-161.00000000",
+      "asset": "USDC",
+      "time": 1777572035000,
+      "info": "UM_GRID_CREATE",
+      "tranId": 1102293437644390400,
+      "tradeId": ""
+    },
+    {
+      "symbol": "",
+      "incomeType": "STRATEGY_UMFUTURES_TRANSFER",
+      "income": "161.28027324",
+      "asset": "USDC",
+      "time": 1777592473000,
+      "info": "UM_GRID_CLOSE",
+      "tranId": 1102379162549563392,
+      "tradeId": ""
+    },
+    {
+      "symbol": "",
+      "incomeType": "STRATEGY_UMFUTURES_TRANSFER",
+      "income": "-165.22000000",
+      "asset": "USDC",
+      "time": 1777592645000,
+      "info": "UM_GRID_CREATE",
+      "tranId": 1102379881467940864,
+      "tradeId": ""
+    },
+    {
+      "symbol": "",
+      "incomeType": "STRATEGY_UMFUTURES_TRANSFER",
+      "income": "168.46740445",
+      "asset": "USDC",
+      "time": 1777668873000,
+      "info": "UM_GRID_CLOSE",
+      "tranId": 1102699604827787264,
+      "tradeId": ""
+    },
+    {
+      "symbol": "",
+      "incomeType": "STRATEGY_UMFUTURES_TRANSFER",
+      "income": "-168.46000000",
+      "asset": "USDC",
+      "time": 1777683473000,
+      "info": "UM_GRID_CREATE",
+      "tranId": 1102760845399117824,
+      "tradeId": ""
+    },
+    {
+      "symbol": "",
+      "incomeType": "STRATEGY_UMFUTURES_TRANSFER",
+      "income": "168.46000000",
+      "asset": "USDC",
+      "time": 1777683927000,
+      "info": "UM_GRID_CLOSE",
+      "tranId": 1102762749134598144,
+      "tradeId": ""
+    },
+    {
+      "symbol": "",
+      "incomeType": "STRATEGY_UMFUTURES_TRANSFER",
+      "income": "-168.46000000",
+      "asset": "USDC",
+      "time": 1777684431000,
+      "info": "UM_GRID_CREATE",
+      "tranId": 1102764860429217792,
+      "tradeId": ""
+    },
+    {
+      "symbol": "",
+      "incomeType": "STRATEGY_UMFUTURES_TRANSFER",
+      "income": "169.00248924",
+      "asset": "USDC",
+      "time": 1777731755000,
+      "info": "UM_GRID_CLOSE",
+      "tranId": 1102963353823121408,
+      "tradeId": ""
+    },
+    {
+      "symbol": "",
+      "incomeType": "STRATEGY_UMFUTURES_TRANSFER",
+      "income": "-168.00000000",
+      "asset": "USDC",
+      "time": 1777735951000,
+      "info": "UM_GRID_CREATE",
+      "tranId": 1102980954354298880,
+      "tradeId": ""
+    }
+  ]
+}
