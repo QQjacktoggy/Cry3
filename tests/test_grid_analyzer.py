@@ -214,6 +214,40 @@ class TestComputeMetrics(unittest.TestCase):
         self.assertAlmostEqual(m.investment_amount, 100.0, places=2)
         self.assertIsNotNone(m.apr_estimate)  # Should compute APR with >24h
 
+    def test_grid_trades_override_excludes_manual(self):
+        """When grid_trades is provided, result.trades should be ignored.
+
+        This is the core fix for issue #1: trade-based statistics
+        (total_trades, maker/taker, fill_rate, grid_range) must only
+        count grid trades, not manual futures trades.
+        """
+        # result.trades has 3 trades (including manual)
+        all_trades = [
+            _make_trade(1, side="BUY", price=80000, time_ms=1700000000000),
+            _make_trade(2, side="SELL", price=80100, time_ms=1700000060000),
+            _make_trade(3, side="BUY", price=79500, time_ms=1700000120000),  # manual
+        ]
+        # grid_trades only has the 2 grid trades
+        grid_only = [
+            _make_trade(1, side="BUY", price=80000, time_ms=1700000000000),
+            _make_trade(2, side="SELL", price=80100, time_ms=1700000060000),
+        ]
+        market = _make_market()
+        result = FetchResult(
+            symbol="BTCUSDC", trades=all_trades, income_records=[],
+            market=market, position=None, account=None,
+        )
+
+        # Without grid_trades: uses all 3 trades
+        m_all = compute_metrics(result)
+        self.assertEqual(m_all.total_trades, 3)
+
+        # With grid_trades: uses only 2 grid trades
+        m_grid = compute_metrics(result, grid_trades=grid_only)
+        self.assertEqual(m_grid.total_trades, 2)
+        self.assertEqual(m_grid.buy_trades, 1)
+        self.assertEqual(m_grid.sell_trades, 1)
+
 
 class TestIncomeGridFiltering(unittest.TestCase):
     """Test that income tagging logic works correctly.

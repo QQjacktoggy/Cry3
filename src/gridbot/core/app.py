@@ -7,7 +7,7 @@ from config.settings import Settings
 from src.gridbot.ai.gemini import GeminiAnalyzer
 from src.gridbot.binance.client import BinanceFuturesClient
 from src.gridbot.binance.fetcher import BinanceFetcher
-from src.gridbot.binance.models import IncomeRecord, MarketSnapshot, PositionInfo
+from src.gridbot.binance.models import FuturesTrade, IncomeRecord, MarketSnapshot, PositionInfo
 from src.gridbot.core.scheduler import Scheduler
 from src.gridbot.grid.analyzer import compute_metrics
 from src.gridbot.grid.models import GridMetrics
@@ -159,6 +159,10 @@ class App:
                 )
             ]
 
+            # Load grid-only trades from DB (excludes manual futures trades)
+            grid_trade_rows = await self.trade_repo.get_trades(symbol, grid_only=True)
+            grid_trades = [FuturesTrade.from_db(r) for r in grid_trade_rows]
+
             # Per-symbol session lookup — prevents cross-symbol contamination
             active_session = await self.session_repo.get_active_session(symbol=symbol)
             session_invested = active_session["invested_amount"] if active_session else None
@@ -167,6 +171,7 @@ class App:
             all_metrics[symbol] = compute_metrics(
                 result,
                 income_records=income_records if income_records else None,
+                grid_trades=grid_trades if grid_trades else None,
                 session_invested=session_invested,
                 session_start_ms=session_start,
             )
@@ -177,14 +182,46 @@ class App:
         return all_metrics, all_markets, all_positions, all_funding
 
     async def _send_telegram_report(self, results: dict) -> None:
-        """Send periodic status report via Telegram."""
+        """Send periodic status report via Telegram.
+
+        Uses grid-only filtered trades and income from DB to ensure
+        scheduled reports exclude manual futures trades.
+        """
         try:
             all_metrics: dict[str, GridMetrics] = {}
             all_markets: dict[str, MarketSnapshot] = {}
             all_positions: dict[str, PositionInfo | None] = {}
 
             for symbol, result in results.items():
-                all_metrics[symbol] = compute_metrics(result)
+                # Load grid-only income from DB
+                income_records = [
+                    IncomeRecord.from_api({
+                        "tranId": r["tran_id"], "symbol": r.get("symbol", ""),
+                        "incomeType": r["income_type"], "income": str(r["income"]),
+                        "asset": r["asset"], "time": r["time_ms"],
+                        "info": r.get("info", ""), "tradeId": r.get("trade_id", ""),
+                    })
+                    for r in await self.income_repo.get_records(
+                        symbol=symbol, grid_only=True
+                    )
+                ]
+
+                # Load grid-only trades from DB
+                grid_trade_rows = await self.trade_repo.get_trades(symbol, grid_only=True)
+                grid_trades = [FuturesTrade.from_db(r) for r in grid_trade_rows]
+
+                # Per-symbol session lookup
+                active_session = await self.session_repo.get_active_session(symbol=symbol)
+                session_invested = active_session["invested_amount"] if active_session else None
+                session_start = active_session["created_at_ms"] if active_session else None
+
+                all_metrics[symbol] = compute_metrics(
+                    result,
+                    income_records=income_records if income_records else None,
+                    grid_trades=grid_trades if grid_trades else None,
+                    session_invested=session_invested,
+                    session_start_ms=session_start,
+                )
                 all_markets[symbol] = result.market
                 all_positions[symbol] = result.position
 

@@ -11,7 +11,7 @@ from config.settings import Settings
 from config.strategies import get_strategy, STRATEGY_REGISTRY
 from src.gridbot.ai.gemini import GeminiAnalyzer
 from src.gridbot.binance.client import BinanceFuturesClient
-from src.gridbot.binance.models import IncomeRecord, MarketSnapshot, PositionInfo
+from src.gridbot.binance.models import FuturesTrade, IncomeRecord, MarketSnapshot, PositionInfo
 from src.gridbot.grid.analyzer import compute_metrics
 from src.gridbot.grid.models import GridMetrics
 from src.gridbot.storage.repositories import (
@@ -75,6 +75,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     settings: Settings = app_data["settings"]
     income_repo: IncomeRepository = app_data["income_repo"]
     session_repo: GridSessionRepository = app_data["session_repo"]
+    trade_repo: FuturesTradeRepository = app_data["trade_repo"]
 
     # Check if specific symbol requested
     args = context.args
@@ -103,6 +104,10 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 )
             ]
 
+            # Load grid-only trades from DB (excludes manual futures trades)
+            grid_trade_rows = await trade_repo.get_trades(symbol, grid_only=True)
+            grid_trades = [FuturesTrade.from_db(r) for r in grid_trade_rows]
+
             # Per-symbol session lookup
             active_session = await session_repo.get_active_session(symbol=symbol)
             session_invested = active_session["invested_amount"] if active_session else None
@@ -111,6 +116,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             all_metrics[symbol] = compute_metrics(
                 result,
                 income_records=income_records if income_records else None,
+                grid_trades=grid_trades if grid_trades else None,
                 session_invested=session_invested,
                 session_start_ms=session_start,
             )
@@ -187,6 +193,7 @@ async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     analyzer: GeminiAnalyzer = app_data["gemini_analyzer"]
     income_repo: IncomeRepository = app_data["income_repo"]
     session_repo: GridSessionRepository = app_data["session_repo"]
+    trade_repo: FuturesTradeRepository = app_data["trade_repo"]
     rec_repo: RecommendationRepository = app_data["rec_repo"]
 
     await update.message.reply_text("🤖 正在執行 Gemini AI 分析...")
@@ -211,6 +218,10 @@ async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 )
             ]
 
+            # Load grid-only trades from DB (excludes manual futures trades)
+            grid_trade_rows = await trade_repo.get_trades(symbol, grid_only=True)
+            grid_trades = [FuturesTrade.from_db(r) for r in grid_trade_rows]
+
             # Per-symbol session lookup
             active_session = await session_repo.get_active_session(symbol=symbol)
             session_invested = active_session["invested_amount"] if active_session else None
@@ -219,6 +230,7 @@ async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             all_metrics[symbol] = compute_metrics(
                 result,
                 income_records=income_records if income_records else None,
+                grid_trades=grid_trades if grid_trades else None,
                 session_invested=session_invested,
                 session_start_ms=session_start,
             )
@@ -303,6 +315,7 @@ async def cmd_metrics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     settings: Settings = app_data["settings"]
     income_repo: IncomeRepository = app_data["income_repo"]
     session_repo: GridSessionRepository = app_data["session_repo"]
+    trade_repo: FuturesTradeRepository = app_data["trade_repo"]
 
     await update.message.reply_text("📊 正在計算詳細指標...")
 
@@ -323,6 +336,10 @@ async def cmd_metrics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 )
             ]
 
+            # Load grid-only trades from DB (excludes manual futures trades)
+            grid_trade_rows = await trade_repo.get_trades(symbol, grid_only=True)
+            grid_trades = [FuturesTrade.from_db(r) for r in grid_trade_rows]
+
             active_session = await session_repo.get_active_session(symbol=symbol)
             session_invested = active_session["invested_amount"] if active_session else None
             session_start = active_session["created_at_ms"] if active_session else None
@@ -330,6 +347,7 @@ async def cmd_metrics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             m = compute_metrics(
                 result,
                 income_records=income_records if income_records else None,
+                grid_trades=grid_trades if grid_trades else None,
                 session_invested=session_invested,
                 session_start_ms=session_start,
             )

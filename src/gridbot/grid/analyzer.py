@@ -11,6 +11,7 @@ from src.gridbot.grid.models import GridMetrics
 def compute_metrics(
     result: FetchResult,
     income_records: list[IncomeRecord] | None = None,
+    grid_trades: list[FuturesTrade] | None = None,
     session_invested: float | None = None,
     session_start_ms: int | None = None,
     strategy_label: str = "unknown",
@@ -21,11 +22,15 @@ def compute_metrics(
         result: FetchResult from the fetcher (trades, market, position, account).
         income_records: Pre-fetched income records for this symbol.
                         If None, uses result.income_records.
+        grid_trades: Grid-only trades loaded from the database (is_grid_trade=1).
+                     If provided, overrides result.trades for all trade-based
+                     statistics (counts, fill rate, grid range, APR).
+                     This prevents manual futures trades from polluting metrics.
         session_invested: Investment amount from active grid session.
         session_start_ms: Start time of active grid session.
         strategy_label: Current strategy name for labeling.
     """
-    trades = result.trades
+    trades = grid_trades if grid_trades is not None else result.trades
     income = income_records if income_records is not None else result.income_records
     position = result.position
     account = result.account
