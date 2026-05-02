@@ -62,6 +62,26 @@ class FuturesTrade:
             "is_maker": self.is_maker,
         }
 
+    @classmethod
+    def from_db(cls, row: dict) -> "FuturesTrade":
+        """Reconstruct a FuturesTrade from a SQLite row dict."""
+        return cls(
+            trade_id=row["trade_id"],
+            order_id=row["order_id"],
+            symbol=row["symbol"],
+            side=row["side"],
+            price=float(row["price"]),
+            qty=float(row["qty"]),
+            quote_qty=float(row["quote_qty"]),
+            realized_pnl=float(row["realized_pnl"]),
+            commission=float(row["commission"]),
+            commission_asset=row["commission_asset"],
+            time_ms=row["time_ms"],
+            position_side=row.get("position_side", "BOTH"),
+            is_buyer=row["side"] == "BUY",
+            is_maker=bool(row.get("is_maker", False)),
+        )
+
 
 @dataclass
 class IncomeRecord:
