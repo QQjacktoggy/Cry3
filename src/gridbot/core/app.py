@@ -217,8 +217,8 @@ class App:
 
                 all_metrics[symbol] = compute_metrics(
                     result,
-                    income_records=income_records if income_records else None,
-                    grid_trades=grid_trades if grid_trades else None,
+                    income_records=income_records,
+                    grid_trades=grid_trades,
                     session_invested=session_invested,
                     session_start_ms=session_start,
                 )
