@@ -96,13 +96,15 @@ class IncomeRepository:
     async def upsert_record(self, record: dict) -> None:
         await self._db.execute(
             """INSERT INTO income_records
-            (tran_id, symbol, income_type, income, asset, time_ms, info, trade_id, fetched_at_ms)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(tran_id) DO NOTHING""",
+            (tran_id, symbol, income_type, income, asset, time_ms, info, trade_id, is_grid_trade, fetched_at_ms)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(tran_id) DO UPDATE SET
+                is_grid_trade=CASE WHEN excluded.is_grid_trade != -1 THEN excluded.is_grid_trade ELSE income_records.is_grid_trade END""",
             (
                 record["tran_id"], record["symbol"], record["income_type"],
                 record["income"], record["asset"], record["time_ms"],
                 record["info"], record["trade_id"],
+                record.get("is_grid_trade", -1),
                 int(time.time() * 1000),
             ),
         )
@@ -111,15 +113,30 @@ class IncomeRepository:
         for record in records:
             await self.upsert_record(record)
 
-    async def get_latest_time(self, income_type: str | None = None) -> int | None:
-        """Get timestamp of the most recent income record."""
+    async def get_latest_time(
+        self,
+        income_type: str | None = None,
+        symbol: str | None = None,
+    ) -> int | None:
+        """Get timestamp of the most recent income record.
+
+        Supports per-symbol and per-type filtering to avoid cross-symbol
+        watermark skew.
+        """
+        conditions: list[str] = []
+        params: list = []
         if income_type:
-            row = await self._db.fetchone(
-                "SELECT MAX(time_ms) as max_time FROM income_records WHERE income_type = ?",
-                (income_type,),
-            )
-        else:
-            row = await self._db.fetchone("SELECT MAX(time_ms) as max_time FROM income_records")
+            conditions.append("income_type = ?")
+            params.append(income_type)
+        if symbol:
+            conditions.append("symbol = ?")
+            params.append(symbol)
+
+        where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+        row = await self._db.fetchone(
+            f"SELECT MAX(time_ms) as max_time FROM income_records{where}",
+            tuple(params) if params else (),
+        )
         return row["max_time"] if row and row["max_time"] else None
 
     async def get_records(
@@ -127,8 +144,14 @@ class IncomeRepository:
         income_type: str | None = None,
         symbol: str | None = None,
         since_ms: int = 0,
+        grid_only: bool = False,
         limit: int = 500,
     ) -> list[dict]:
+        """Get income records with optional grid-only filtering.
+
+        grid_only=True excludes manual-trade income (is_grid_trade=0)
+        but includes unknown (-1) and grid (1) records.
+        """
         conditions = ["time_ms >= ?"]
         params: list = [since_ms]
 
@@ -138,6 +161,8 @@ class IncomeRepository:
         if symbol:
             conditions.append("symbol = ?")
             params.append(symbol)
+        if grid_only:
+            conditions.append("is_grid_trade != 0")
 
         params.append(limit)
         where = " AND ".join(conditions)
@@ -151,18 +176,26 @@ class IncomeRepository:
         income_type: str,
         symbol: str | None = None,
         since_ms: int = 0,
+        grid_only: bool = False,
     ) -> float:
-        """Sum income of a given type for a symbol since a timestamp."""
+        """Sum income of a given type for a symbol since a timestamp.
+
+        grid_only=True excludes manual-trade income (is_grid_trade=0).
+        """
+        conditions = ["income_type = ?", "time_ms >= ?"]
+        params: list = [income_type, since_ms]
+
         if symbol:
-            row = await self._db.fetchone(
-                "SELECT COALESCE(SUM(income), 0) as total FROM income_records WHERE income_type = ? AND symbol = ? AND time_ms >= ?",
-                (income_type, symbol, since_ms),
-            )
-        else:
-            row = await self._db.fetchone(
-                "SELECT COALESCE(SUM(income), 0) as total FROM income_records WHERE income_type = ? AND time_ms >= ?",
-                (income_type, since_ms),
-            )
+            conditions.append("symbol = ?")
+            params.append(symbol)
+        if grid_only:
+            conditions.append("is_grid_trade != 0")
+
+        where = " AND ".join(conditions)
+        row = await self._db.fetchone(
+            f"SELECT COALESCE(SUM(income), 0) as total FROM income_records WHERE {where}",
+            tuple(params),
+        )
         return row["total"] if row else 0.0
 
     async def get_grid_transfers(self, since_ms: int = 0) -> list[dict]:
@@ -204,8 +237,17 @@ class GridSessionRepository:
             ),
         )
 
-    async def get_active_session(self) -> dict | None:
-        """Get the currently active (running) grid session."""
+    async def get_active_session(self, symbol: str | None = None) -> dict | None:
+        """Get the currently active (running) grid session.
+
+        When symbol is provided, returns only the session for that symbol,
+        preventing cross-symbol session contamination.
+        """
+        if symbol:
+            return await self._db.fetchone(
+                "SELECT * FROM grid_sessions WHERE is_active = 1 AND symbol = ? ORDER BY created_at_ms DESC LIMIT 1",
+                (symbol,),
+            )
         return await self._db.fetchone(
             "SELECT * FROM grid_sessions WHERE is_active = 1 ORDER BY created_at_ms DESC LIMIT 1"
         )

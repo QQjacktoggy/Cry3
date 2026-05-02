@@ -154,10 +154,13 @@ class App:
                     "asset": r["asset"], "time": r["time_ms"],
                     "info": r.get("info", ""), "tradeId": r.get("trade_id", ""),
                 })
-                for r in await self.income_repo.get_records(symbol=symbol)
+                for r in await self.income_repo.get_records(
+                    symbol=symbol, grid_only=True
+                )
             ]
 
-            active_session = await self.session_repo.get_active_session()
+            # Per-symbol session lookup — prevents cross-symbol contamination
+            active_session = await self.session_repo.get_active_session(symbol=symbol)
             session_invested = active_session["invested_amount"] if active_session else None
             session_start = active_session["created_at_ms"] if active_session else None
 

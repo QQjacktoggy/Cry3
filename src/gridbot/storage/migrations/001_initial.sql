@@ -1,40 +1,8 @@
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 
-CREATE TABLE IF NOT EXISTS grid_orders (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    algo_id         INTEGER UNIQUE NOT NULL,
-    symbol          TEXT NOT NULL,
-    side            TEXT NOT NULL,
-    total_qty       REAL,
-    executed_qty    REAL,
-    leverage        INTEGER,
-    margin_type     TEXT,
-    grid_status     TEXT NOT NULL,
-    created_time_ms INTEGER NOT NULL,
-    updated_time_ms INTEGER NOT NULL,
-    fetched_at_ms   INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_grid_orders_symbol ON grid_orders(symbol);
-
-CREATE TABLE IF NOT EXISTS grid_sub_orders (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    algo_id         INTEGER NOT NULL,
-    sub_order_id    INTEGER UNIQUE NOT NULL,
-    symbol          TEXT NOT NULL,
-    side            TEXT NOT NULL,
-    price           REAL NOT NULL,
-    qty             REAL NOT NULL,
-    executed_qty    REAL NOT NULL,
-    fee             REAL NOT NULL,
-    fee_asset       TEXT NOT NULL,
-    order_status    TEXT NOT NULL,
-    trade_time_ms   INTEGER NOT NULL,
-    fetched_at_ms   INTEGER NOT NULL,
-    FOREIGN KEY (algo_id) REFERENCES grid_orders(algo_id)
-);
-CREATE INDEX IF NOT EXISTS idx_sub_orders_algo ON grid_sub_orders(algo_id);
-CREATE INDEX IF NOT EXISTS idx_sub_orders_time ON grid_sub_orders(trade_time_ms);
+-- Note: grid_orders / grid_sub_orders were removed in the FAPI migration.
+-- Tables created here are the ones that survive all migrations.
 
 CREATE TABLE IF NOT EXISTS market_snapshots (
     id                   INTEGER PRIMARY KEY AUTOINCREMENT,

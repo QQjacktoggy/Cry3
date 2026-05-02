@@ -2,10 +2,11 @@
 
 Handles:
 1. Incremental trade sync (only fetch new trades since last known)
-2. Income record sync (realized PnL, commissions, funding fees)
+2. Income record sync with per-symbol/per-type watermarks
 3. Grid session tracking (CREATE/CLOSE pairing)
 4. Market snapshots
 5. Grid trade filtering (exclude manual trades via clientOrderId)
+6. Income record grid tagging (links income tradeId → grid order)
 """
 
 from collections import Counter
@@ -22,6 +23,13 @@ from src.gridbot.storage.repositories import (
 from src.gridbot.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+# Income types that are per-symbol and per-trade
+SYMBOL_INCOME_TYPES = ["REALIZED_PNL", "COMMISSION"]
+# Income types fetched globally (not symbol-scoped)
+GLOBAL_INCOME_TYPES = ["STRATEGY_UMFUTURES_TRANSFER"]
+# FUNDING_FEE is position-level but has a symbol; fetched per-symbol
+FUNDING_INCOME_TYPES = ["FUNDING_FEE"]
 
 
 class BinanceFetcher:
@@ -44,33 +52,72 @@ class BinanceFetcher:
         self._audit_repo = audit_repo
 
     async def fetch_symbol(self, symbol: str) -> FetchResult:
-        """Fetch and persist all data for a single trading pair."""
-        # Determine incremental sync points
-        last_trade_time = await self._trade_repo.get_latest_trade_time(symbol)
-        last_income_time = await self._income_repo.get_latest_time()
+        """Fetch and persist all data for a single trading pair.
 
+        Uses per-symbol, per-income-type watermarks to avoid cross-symbol skew.
+        """
+        # ── Trades: per-symbol watermark ──
+        last_trade_time = await self._trade_repo.get_latest_trade_time(symbol)
         trades_since = (last_trade_time + 1) if last_trade_time else None
-        income_since = (last_income_time + 1) if last_income_time else None
+
+        # ── Income: per-symbol, per-type watermarks ──
+        # Each (symbol, income_type) combination has its own cursor.
+        income_since_map: dict[str, int | None] = {}
+        for itype in SYMBOL_INCOME_TYPES + FUNDING_INCOME_TYPES:
+            last_time = await self._income_repo.get_latest_time(
+                income_type=itype, symbol=symbol
+            )
+            income_since_map[itype] = (last_time + 1) if last_time else None
 
         # Fetch from Binance
         result = await self._client.fetch_symbol_data(
             symbol=symbol,
             trades_since_ms=trades_since,
-            income_since_ms=income_since,
+            income_since_ms=None,  # We handle per-type below
         )
 
-        # Filter and tag grid trades
+        # ── Fetch per-type income with per-symbol watermarks ──
+        income_records: list[IncomeRecord] = []
+        for itype in SYMBOL_INCOME_TYPES + FUNDING_INCOME_TYPES:
+            batch = await self._client.get_income_history(
+                income_type=itype,
+                symbol=symbol,
+                start_time=income_since_map[itype],
+                limit=500,
+            )
+            income_records.extend(batch)
+        # Override the result's income_records with properly watermarked ones
+        result = FetchResult(
+            symbol=result.symbol,
+            trades=result.trades,
+            income_records=income_records,
+            market=result.market,
+            position=result.position,
+            account=result.account,
+        )
+
+        # ── Identify grid trades by clientOrderId ──
         grid_trade_order_ids = await self._identify_grid_trades(symbol, result)
 
-        # Persist trades
+        # Build a set of trade_ids that are grid trades for income tagging
+        grid_trade_ids = set()
+        for trade in result.trades:
+            if trade.order_id in grid_trade_order_ids:
+                grid_trade_ids.add(str(trade.trade_id))
+
+        # ── Persist trades ──
         for trade in result.trades:
             trade_dict = trade.to_dict()
             trade_dict["is_grid_trade"] = trade.order_id in grid_trade_order_ids
             await self._trade_repo.upsert_trade(trade_dict)
 
-        # Persist income records
+        # ── Persist income records with grid tagging ──
         for income in result.income_records:
-            await self._income_repo.upsert_record(income.to_dict())
+            income_dict = income.to_dict()
+            income_dict["is_grid_trade"] = self._classify_income_grid(
+                income, grid_trade_ids
+            )
+            await self._income_repo.upsert_record(income_dict)
 
         # Persist market snapshot
         await self._market_repo.save_snapshot(result.market.to_dict())
@@ -86,6 +133,7 @@ class BinanceFetcher:
                 "symbol": symbol,
                 "new_trades": len(result.trades),
                 "new_income_records": len(result.income_records),
+                "grid_trades": len(grid_trade_order_ids),
                 "price": result.market.current_price,
                 "funding_rate": result.market.funding_rate,
                 "has_position": result.position is not None,
@@ -97,11 +145,35 @@ class BinanceFetcher:
             "fetch_cycle_complete",
             symbol=symbol,
             new_trades=len(result.trades),
+            grid_trades=len(grid_trade_order_ids),
             new_income=len(result.income_records),
             price=result.market.current_price,
         )
 
         return result
+
+    def _classify_income_grid(
+        self,
+        income: IncomeRecord,
+        grid_trade_ids: set[str],
+    ) -> int:
+        """Classify an income record as grid (1), manual (0), or unknown (-1).
+
+        REALIZED_PNL and COMMISSION have tradeId → look up in grid_trade_ids.
+        FUNDING_FEE is position-level → always 1 (grid bot holds the position).
+        Others → -1 unknown.
+        """
+        if income.income_type in ("REALIZED_PNL", "COMMISSION"):
+            if income.trade_id and income.trade_id in grid_trade_ids:
+                return 1
+            elif income.trade_id:
+                return 0  # has a tradeId but not in grid set → manual
+            # tradeId missing → check DB for historical match
+            return -1
+        elif income.income_type == "FUNDING_FEE":
+            # Funding is position-level; in a grid-only account it's attributable
+            return 1
+        return -1  # STRATEGY_UMFUTURES_TRANSFER, etc.
 
     async def _identify_grid_trades(self, symbol: str, result: FetchResult) -> set[int]:
         """Identify which order IDs belong to grid bot trades.
@@ -202,15 +274,16 @@ class BinanceFetcher:
         return None
 
     async def fetch_global_income(self) -> list[IncomeRecord]:
-        """Fetch global income records (STRATEGY_UMFUTURES_TRANSFER, FUNDING_FEE).
+        """Fetch global income records (STRATEGY_UMFUTURES_TRANSFER).
 
-        These are not symbol-specific, so fetched separately.
+        Uses per-type watermark to avoid cross-stream cursor contamination.
+        FUNDING_FEE is now fetched per-symbol in fetch_symbol(), not here.
         """
-        last_time = await self._income_repo.get_latest_time("STRATEGY_UMFUTURES_TRANSFER")
-        since = (last_time + 1) if last_time else None
-
         records: list[IncomeRecord] = []
-        for itype in ["STRATEGY_UMFUTURES_TRANSFER", "FUNDING_FEE"]:
+        for itype in GLOBAL_INCOME_TYPES:
+            last_time = await self._income_repo.get_latest_time(income_type=itype)
+            since = (last_time + 1) if last_time else None
+
             batch = await self._client.get_income_history(
                 income_type=itype,
                 start_time=since,
@@ -225,7 +298,7 @@ class BinanceFetcher:
 
     async def fetch_all_symbols(self, symbols: list[str]) -> dict[str, FetchResult]:
         """Fetch data for all configured trading pairs."""
-        # First, fetch global income (grid sessions, funding fees)
+        # First, fetch global income (grid sessions)
         await self.fetch_global_income()
 
         # Then fetch per-symbol data

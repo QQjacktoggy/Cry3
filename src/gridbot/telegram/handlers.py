@@ -98,10 +98,13 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                     "asset": r["asset"], "time": r["time_ms"],
                     "info": r.get("info", ""), "tradeId": r.get("trade_id", ""),
                 })
-                for r in await income_repo.get_records(symbol=symbol)
+                for r in await income_repo.get_records(
+                    symbol=symbol, grid_only=True
+                )
             ]
 
-            active_session = await session_repo.get_active_session()
+            # Per-symbol session lookup
+            active_session = await session_repo.get_active_session(symbol=symbol)
             session_invested = active_session["invested_amount"] if active_session else None
             session_start = active_session["created_at_ms"] if active_session else None
 
@@ -203,10 +206,13 @@ async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     "asset": r["asset"], "time": r["time_ms"],
                     "info": r.get("info", ""), "tradeId": r.get("trade_id", ""),
                 })
-                for r in await income_repo.get_records(symbol=symbol)
+                for r in await income_repo.get_records(
+                    symbol=symbol, grid_only=True
+                )
             ]
 
-            active_session = await session_repo.get_active_session()
+            # Per-symbol session lookup
+            active_session = await session_repo.get_active_session(symbol=symbol)
             session_invested = active_session["invested_amount"] if active_session else None
             session_start = active_session["created_at_ms"] if active_session else None
 
@@ -283,11 +289,99 @@ async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     income_summary = {}
     for itype in ["REALIZED_PNL", "COMMISSION", "FUNDING_FEE"]:
-        income_summary[itype] = await income_repo.sum_income(itype)
+        income_summary[itype] = await income_repo.sum_income(itype, grid_only=True)
 
     session_profit = await session_repo.get_total_profit()
     report = format_pnl_summary(income_summary, session_profit)
     await update.message.reply_text(report, parse_mode="HTML")
+
+
+async def cmd_metrics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/metrics — Detailed performance metrics per symbol."""
+    app_data = context.application.bot_data
+    binance_client: BinanceFuturesClient = app_data["binance_client"]
+    settings: Settings = app_data["settings"]
+    income_repo: IncomeRepository = app_data["income_repo"]
+    session_repo: GridSessionRepository = app_data["session_repo"]
+
+    await update.message.reply_text("📊 正在計算詳細指標...")
+
+    try:
+        lines = ["📊 <b>詳細表現指標</b>", ""]
+
+        for symbol in settings.symbols_list:
+            result = await binance_client.fetch_symbol_data(symbol)
+            income_records = [
+                IncomeRecord.from_api({
+                    "tranId": r["tran_id"], "symbol": r.get("symbol", ""),
+                    "incomeType": r["income_type"], "income": str(r["income"]),
+                    "asset": r["asset"], "time": r["time_ms"],
+                    "info": r.get("info", ""), "tradeId": r.get("trade_id", ""),
+                })
+                for r in await income_repo.get_records(
+                    symbol=symbol, grid_only=True
+                )
+            ]
+
+            active_session = await session_repo.get_active_session(symbol=symbol)
+            session_invested = active_session["invested_amount"] if active_session else None
+            session_start = active_session["created_at_ms"] if active_session else None
+
+            m = compute_metrics(
+                result,
+                income_records=income_records if income_records else None,
+                session_invested=session_invested,
+                session_start_ms=session_start,
+            )
+
+            lines.append(f"━━ {symbol} ━━")
+            # P&L breakdown
+            pnl_emoji = "🟢" if m.net_pnl >= 0 else "🔴"
+            lines.append(f"{pnl_emoji} 已實現損益: ${m.realized_pnl:.4f}")
+            lines.append(f"  未實現損益: ${m.unrealized_pnl:.4f}")
+            lines.append(f"  手續費: ${m.commission_total:.4f}")
+            lines.append(f"  Funding 費: ${m.funding_cost:.4f}")
+            lines.append(f"  <b>淨損益: ${m.net_pnl:.4f}</b>")
+            lines.append("")
+            # Trade stats
+            lines.append(f"🔄 交易統計:")
+            lines.append(f"  總成交: {m.total_trades} 筆")
+            lines.append(f"  買/賣: {m.buy_trades} / {m.sell_trades}")
+            lines.append(f"  Maker/Taker: {m.maker_trades} / {m.taker_trades} ({m.maker_ratio:.0%} Maker)")
+            if m.avg_trade_interval_minutes:
+                lines.append(f"  平均交易間隔: {m.avg_trade_interval_minutes:.1f} 分鐘")
+            lines.append(f"  交易頻率: {m.trades_per_hour:.1f} 筆/時")
+            lines.append("")
+            # Grid efficiency
+            lines.append(f"📐 網格效率:")
+            lines.append(f"  Fill Rate: {m.fill_rate:.0%}")
+            lines.append(f"  價格範圍利用率: {m.price_range_utilization:.0%}")
+            if m.grid_lower_price and m.grid_upper_price:
+                lines.append(f"  網格範圍: ${m.grid_lower_price:,.2f} ~ ${m.grid_upper_price:,.2f}")
+            lines.append("")
+            # Position & risk
+            if m.leverage is not None:
+                lines.append(f"⚡ 持倉:")
+                lines.append(f"  方向: {m.position_direction} | 槓桿: {m.leverage}x")
+                if m.liquidation_price:
+                    lines.append(f"  清算價: ${m.liquidation_price:,.2f}")
+                if m.distance_to_liquidation_pct:
+                    lines.append(f"  距清算: {m.distance_to_liquidation_pct:.1f}%")
+                lines.append("")
+            # APR
+            if m.apr_estimate is not None:
+                lines.append(f"📈 年化預估: {m.apr_estimate:.1f}%")
+            if m.investment_amount:
+                lines.append(f"📐 本輪投入: ${m.investment_amount:.2f}")
+            if m.running_hours:
+                lines.append(f"⏱ 運行時間: {m.running_hours:.1f} 小時")
+            lines.append("")
+
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    except Exception as exc:
+        logger.error("cmd_metrics_failed", error=str(exc))
+        await update.message.reply_text(f"❌ 取得指標失敗：{str(exc)[:200]}")
 
 
 async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

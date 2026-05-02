@@ -24,6 +24,7 @@ from src.gridbot.telegram.handlers import (
     cmd_help,
     cmd_history,
     cmd_interval,
+    cmd_metrics,
     cmd_pause,
     cmd_pnl,
     cmd_resume,
@@ -73,7 +74,7 @@ def build_telegram_app(
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("metrics", cmd_status))  # alias
+    app.add_handler(CommandHandler("metrics", cmd_metrics))
     app.add_handler(CommandHandler("risk", cmd_risk))
     app.add_handler(CommandHandler("strategy", cmd_strategy))
     app.add_handler(CommandHandler("analyze", cmd_analyze))
