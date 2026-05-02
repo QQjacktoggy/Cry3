@@ -248,6 +248,31 @@ class TestComputeMetrics(unittest.TestCase):
         self.assertEqual(m_grid.buy_trades, 1)
         self.assertEqual(m_grid.sell_trades, 1)
 
+    def test_empty_grid_trades_does_not_fallback_to_manual(self):
+        """Empty grid_trades=[] must NOT fallback to result.trades.
+
+        Regression test for PR #2 review: if DB returns zero grid trades
+        but the account has manual trades, metrics must report 0 trades,
+        not silently include the manual ones.
+        """
+        manual_trades = [
+            _make_trade(1, side="BUY", price=80000, time_ms=1700000000000),
+            _make_trade(2, side="SELL", price=80100, time_ms=1700000060000),
+        ]
+        market = _make_market()
+        result = FetchResult(
+            symbol="BTCUSDC", trades=manual_trades, income_records=[],
+            market=market, position=None, account=None,
+        )
+
+        # grid_trades=[] means "DB confirmed zero grid trades"
+        m = compute_metrics(result, grid_trades=[])
+        self.assertEqual(m.total_trades, 0)
+        self.assertEqual(m.buy_trades, 0)
+        self.assertEqual(m.sell_trades, 0)
+        self.assertEqual(m.maker_trades, 0)
+        self.assertAlmostEqual(m.maker_ratio, 0.0)
+
 
 class TestIncomeGridFiltering(unittest.TestCase):
     """Test that income tagging logic works correctly.
