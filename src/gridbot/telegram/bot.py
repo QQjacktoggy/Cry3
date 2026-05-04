@@ -18,7 +18,6 @@ from src.gridbot.telegram.handlers import (
     cmd_pnl,
     cmd_recommend,
     cmd_resume,
-    cmd_risk,
     cmd_sessions,
     cmd_start,
     cmd_status,
@@ -55,7 +54,6 @@ def build_telegram_app(
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("sessions", cmd_sessions))
     app.add_handler(CommandHandler("pnl", cmd_pnl))
-    app.add_handler(CommandHandler("risk", cmd_risk))
     app.add_handler(CommandHandler("recommend", cmd_recommend))
     app.add_handler(CommandHandler("ask", cmd_ask))
     app.add_handler(CommandHandler("pause", cmd_pause))
@@ -63,6 +61,6 @@ def build_telegram_app(
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_share_link))
 
-    logger.info("telegram_app_configured", handlers=10)
+    logger.info("telegram_app_configured", handlers=9)
 
     return app

@@ -3,7 +3,6 @@
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from config.settings import Settings
 from src.gridbot.ai.gemini import GeminiAnalyzer
 from src.gridbot.binance.client import BinanceFuturesClient
 from src.gridbot.binance.models import FuturesTrade, IncomeRecord, MarketSnapshot, PositionInfo
@@ -17,7 +16,6 @@ from src.gridbot.storage.repositories import (
 from src.gridbot.telegram.formatters import (
     format_full_report,
     format_pnl_summary,
-    format_risk_dashboard,
     format_sessions,
 )
 from src.gridbot.utils.logging import get_logger
@@ -40,10 +38,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/help — List all commands."""
     await update.message.reply_text(
         "📋 <b>可用指令</b>\n\n"
-        "/status — 所有交易對即時狀態\n"
-        "/sessions — 網格輪次歷史\n"
+        "/status — 即時狀態（含網格設定）\n"
+        "/sessions — 網格輪次歷史與設定回顧\n"
         "/pnl — 累計損益報表\n"
-        "/risk — 風險儀表板\n"
         "/recommend — Gemini 推薦 ETHUSDC 網格參數\n"
         "/ask <code>問題</code> — 向 Gemini 提問\n"
         "/pause — 暫停定期監控\n"
@@ -75,6 +72,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         all_metrics: dict[str, GridMetrics] = {}
         all_markets: dict[str, MarketSnapshot] = {}
         all_positions: dict[str, PositionInfo | None] = {}
+        all_sessions: dict[str, dict | None] = {}
 
         for symbol in target_symbols:
             result = await binance_client.fetch_symbol_data(symbol)
@@ -104,6 +102,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             )
             all_markets[symbol] = result.market
             all_positions[symbol] = result.position
+            all_sessions[symbol] = active_session
 
         account = await binance_client.get_account_info()
         report = format_full_report(
@@ -112,6 +111,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             positions=all_positions,
             account_balance=account.total_margin_balance,
             margin_ratio=account.margin_ratio,
+            sessions=all_sessions,
         )
         await update.message.reply_text(report, parse_mode="HTML")
 
@@ -119,30 +119,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         logger.error("cmd_status_failed", error=str(exc))
         await update.message.reply_text(f"❌ 取得狀態失敗：{str(exc)[:200]}")
 
-
-async def cmd_risk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/risk — Risk dashboard."""
-    app_data = context.application.bot_data
-    binance_client: BinanceFuturesClient = app_data["binance_client"]
-    settings: Settings = app_data["settings"]
-
-    try:
-        positions: dict[str, PositionInfo | None] = {}
-        for symbol in settings.symbols_list:
-            positions[symbol] = await binance_client.get_position(symbol)
-
-        account = await binance_client.get_account_info()
-        report = format_risk_dashboard(
-            positions=positions,
-            margin_ratio=account.margin_ratio,
-            margin_warning=settings.margin_ratio_warning,
-            margin_critical=settings.margin_ratio_critical,
-        )
-        await update.message.reply_text(report, parse_mode="HTML")
-
-    except Exception as exc:
-        logger.error("cmd_risk_failed", error=str(exc))
-        await update.message.reply_text(f"❌ 取得風險資訊失敗：{str(exc)[:200]}")
 
 
 async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
