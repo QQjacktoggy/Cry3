@@ -55,6 +55,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/risk — 風險儀表板\n"
         "/strategy — 當前策略與參數\n"
         "/analyze — 立即觸發 Gemini 分析\n"
+        "/recommend — Gemini 推薦 ETHUSDC 網格參數\n"
         "/ask <code>問題</code> — 向 Gemini 提問\n"
         "/sessions — 網格輪次歷史\n"
         "/pnl — 累計損益報表\n"
@@ -62,7 +63,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/interval <code>分鐘</code> — 設定抓取間隔\n"
         "/pause — 暫停定期抓取\n"
         "/resume — 恢復定期抓取\n"
-        "/help — 列出所有指令",
+        "/help — 列出所有指令\n\n"
+        "💡 <i>直接傳送幣安網格分享連結，Bot 會自動解析並記錄設定。</i>",
         parse_mode="HTML",
     )
 
@@ -465,3 +467,102 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("▶️ 已恢復定期抓取")
     else:
         await update.message.reply_text("排程器未初始化")
+
+
+async def handle_share_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Auto-detect Binance grid share links and record the config to the active session."""
+    from src.gridbot.telegram.share_link import extract_share_link, parse_share_link, format_config_confirmation
+
+    text = update.message.text or ""
+    url = extract_share_link(text)
+    if not url:
+        return
+
+    cfg = parse_share_link(url)
+    if not cfg:
+        await update.message.reply_text("⚠️ 無法解析分享連結，請確認連結格式正確。")
+        return
+
+    session_repo: GridSessionRepository = context.application.bot_data["session_repo"]
+
+    # Find the active session — match by investment amount (within $0.01 tolerance)
+    active = await session_repo.get_active_session(symbol=cfg.symbol)
+    if not active:
+        # Symbol might not be set yet; try any active session matching investment amount
+        all_active = await session_repo.get_sessions(limit=5)
+        active = next(
+            (s for s in all_active
+             if s.get("is_active") and abs(s["invested_amount"] - cfg.investment_amount) < 0.02),
+            None,
+        )
+
+    if not active:
+        await update.message.reply_text(
+            f"⚠️ 找不到投入金額 ${cfg.investment_amount:.2f} 的 active session。\n"
+            f"請確認網格已啟動且 bot 已同步資料（等下一次 fetch cycle）。"
+        )
+        return
+
+    await session_repo.update_grid_config(
+        create_tran_id=active["create_tran_id"],
+        config={
+            "symbol": cfg.symbol,
+            "direction": cfg.direction,
+            "grid_type": cfg.grid_type,
+            "leverage": cfg.leverage,
+            "grid_count": cfg.grid_count,
+            "lower_price": cfg.lower_price,
+            "upper_price": cfg.upper_price,
+            "stop_loss_price": cfg.stop_loss_price,
+            "take_profit_price": cfg.take_profit_price,
+            "strategy_id": cfg.strategy_id,
+            "share_link": cfg.share_link,
+        },
+    )
+
+    logger.info(
+        "grid_config_recorded",
+        symbol=cfg.symbol, grid_count=cfg.grid_count,
+        lower=cfg.lower_price, upper=cfg.upper_price,
+        session_create_tran_id=active["create_tran_id"],
+    )
+
+    reply = format_config_confirmation(cfg, active.get("id"), active["created_at_ms"])
+    await update.message.reply_text(reply, parse_mode="HTML")
+
+
+async def cmd_recommend(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/recommend — Ask Gemini for optimal grid parameters for ETHUSDC right now."""
+    app_data = context.application.bot_data
+    analyzer: GeminiAnalyzer = app_data["gemini_analyzer"]
+    binance_client: BinanceFuturesClient = app_data["binance_client"]
+    session_repo: GridSessionRepository = app_data["session_repo"]
+
+    await update.message.reply_text("🔍 正在搜尋市況並生成網格建議，請稍候...")
+
+    try:
+        symbol = "ETHUSDC"
+
+        # Gather market data
+        market = await binance_client.fetch_market_snapshot(symbol)
+        klines = await binance_client.get_klines(symbol, interval="1h", limit=48)
+        funding_history = await binance_client.get_funding_rate_history(symbol, limit=10)
+
+        # Session history for context
+        recent_sessions = await session_repo.get_sessions(symbol=symbol, limit=8)
+        total_profit = await session_repo.get_total_profit(symbol=symbol)
+
+        report = await analyzer.recommend_grid(
+            symbol=symbol,
+            market=market,
+            klines=klines,
+            funding_history=funding_history,
+            recent_sessions=recent_sessions,
+            total_closed_profit=total_profit,
+        )
+
+        await update.message.reply_text(report, parse_mode="HTML")
+
+    except Exception as exc:
+        logger.error("cmd_recommend_failed", error=str(exc))
+        await update.message.reply_text(f"❌ 生成建議失敗：{str(exc)[:200]}")

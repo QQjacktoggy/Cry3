@@ -77,7 +77,10 @@ class App:
         try:
             results = await self.fetcher.fetch_all_symbols(self.settings.symbols_list)
 
-            # Send report via Telegram if configured
+            # Notify for any newly closed grid sessions (must run after fetch updates DB)
+            await self._notify_closed_sessions()
+
+            # Send periodic status report via Telegram if configured
             if self.telegram_app and self.settings.telegram_chat_id_int:
                 await self._send_telegram_report(results)
 
@@ -87,51 +90,113 @@ class App:
             logger.error("fetch_cycle_error", error=str(exc))
 
     async def run_analysis_cycle(self) -> None:
-        """Execute a single AI analysis cycle."""
+        """Execute a single AI analysis cycle.
+
+        If any symbol has an active session with grid config (from share link),
+        runs monitor_grid() for that session. Falls back to general analyze()
+        when no configured active sessions exist.
+        """
         try:
             if not self.settings.gemini_api_key:
                 logger.warning("gemini_not_configured")
                 return
 
-            all_metrics, all_markets, all_positions, all_funding = await self._collect_analysis_data()
+            # Prefer monitor_grid for sessions that have config from share link
+            monitored_any = False
+            for symbol in self.settings.symbols_list:
+                active = await self.session_repo.get_active_session(symbol=symbol)
+                if active and active.get("lower_price") and active.get("upper_price"):
+                    await self._run_grid_monitor(symbol, active)
+                    monitored_any = True
 
-            account = await self.binance.get_account_info()
-
-            rec = await self.gemini.analyze(
-                metrics=all_metrics,
-                markets=all_markets,
-                positions=all_positions,
-                funding_rates=all_funding,
-                current_strategy=self.settings.active_strategy_name,
-                account_balance=account.total_margin_balance,
-                margin_ratio=account.margin_ratio,
-            )
-
-            # Save recommendation
-            await self.rec_repo.save({
-                "symbol": ",".join(self.settings.symbols_list),
-                "recommended_strategy": rec.recommended_strategy,
-                "confidence": rec.confidence,
-                "parameter_adjustments": [a.model_dump() for a in rec.parameter_adjustments],
-                "market_summary": rec.market_condition_summary,
-                "reasoning": rec.reasoning,
-                "risk_warnings": rec.risk_warnings,
-                "trigger": "scheduled",
-            })
-
-            # Send via Telegram
-            if self.telegram_app and self.settings.telegram_chat_id_int:
-                report = format_recommendation(rec, self.settings.active_strategy_name)
-                await self.telegram_app.bot.send_message(
-                    chat_id=self.settings.telegram_chat_id_int,
-                    text=report,
-                    parse_mode="HTML",
-                )
-
-            logger.info("analysis_cycle_done", strategy=rec.recommended_strategy)
+            if not monitored_any:
+                # No active configured session — run general strategy analysis
+                await self._run_general_analysis()
 
         except Exception as exc:
             logger.error("analysis_cycle_error", error=str(exc))
+
+    async def _run_grid_monitor(self, symbol: str, session: dict) -> None:
+        """Run monitor_grid() for one active session and send result via Telegram."""
+        try:
+            result = await self.binance.fetch_symbol_data(symbol)
+            market = result.market
+
+            # Realized P&L scoped to this session only
+            income_rows = await self.income_repo.get_records(
+                income_type="REALIZED_PNL",
+                symbol=symbol,
+                since_ms=session["created_at_ms"],
+                grid_only=True,
+            )
+            realized_pnl = sum(float(r["income"]) for r in income_rows)
+
+            funding_history = await self.binance.get_funding_rate_history(symbol, limit=10)
+            klines = await self.binance.get_klines(symbol, interval="1h", limit=48)
+
+            report = await self.gemini.monitor_grid(
+                symbol=symbol,
+                market_price=market.mark_price or market.current_price,
+                lower_price=float(session["lower_price"]),
+                upper_price=float(session["upper_price"]),
+                grid_count=int(session.get("grid_count") or 0),
+                grid_type=session.get("grid_type") or "GEO",
+                leverage=int(session.get("leverage") or 1),
+                direction=session.get("direction") or "NEUTRAL",
+                stop_loss_price=float(session["stop_loss_price"]) if session.get("stop_loss_price") else None,
+                take_profit_price=float(session["take_profit_price"]) if session.get("take_profit_price") else None,
+                invested_amount=float(session["invested_amount"]),
+                session_start_ms=int(session["created_at_ms"]),
+                realized_pnl=realized_pnl,
+                funding_rate=float(market.funding_rate or 0.0),
+                funding_history=funding_history,
+                klines=klines,
+            )
+
+            if self.telegram_app and self.settings.telegram_chat_id_int:
+                await self.telegram_app.bot.send_message(
+                    chat_id=self.settings.telegram_chat_id_int,
+                    text=report,
+                )
+            logger.info("grid_monitor_done", symbol=symbol, session_id=session.get("create_tran_id"))
+
+        except Exception as exc:
+            logger.error("grid_monitor_error", symbol=symbol, error=str(exc))
+
+    async def _run_general_analysis(self) -> None:
+        """Fallback analysis using the original analyze() method (no active grid config)."""
+        all_metrics, all_markets, all_positions, all_funding = await self._collect_analysis_data()
+        account = await self.binance.get_account_info()
+
+        rec = await self.gemini.analyze(
+            metrics=all_metrics,
+            markets=all_markets,
+            positions=all_positions,
+            funding_rates=all_funding,
+            current_strategy=self.settings.active_strategy_name,
+            account_balance=account.total_margin_balance,
+            margin_ratio=account.margin_ratio,
+        )
+
+        await self.rec_repo.save({
+            "symbol": ",".join(self.settings.symbols_list),
+            "recommended_strategy": rec.recommended_strategy,
+            "confidence": rec.confidence,
+            "parameter_adjustments": [a.model_dump() for a in rec.parameter_adjustments],
+            "market_summary": rec.market_condition_summary,
+            "reasoning": rec.reasoning,
+            "risk_warnings": rec.risk_warnings,
+            "trigger": "scheduled",
+        })
+
+        if self.telegram_app and self.settings.telegram_chat_id_int:
+            report = format_recommendation(rec, self.settings.active_strategy_name)
+            await self.telegram_app.bot.send_message(
+                chat_id=self.settings.telegram_chat_id_int,
+                text=report,
+                parse_mode="HTML",
+            )
+        logger.info("general_analysis_done", strategy=rec.recommended_strategy)
 
     async def _collect_analysis_data(self) -> tuple[
         dict[str, GridMetrics],
@@ -180,6 +245,73 @@ class App:
             all_funding[symbol] = await self.binance.get_funding_rate_history(symbol, limit=10)
 
         return all_metrics, all_markets, all_positions, all_funding
+
+    async def _notify_closed_sessions(self) -> None:
+        """Send Telegram notifications for newly closed grid sessions.
+
+        Called after each fetch cycle so users hear about closes promptly.
+        Marks each session notified individually so partial failures retry.
+        """
+        if not self.telegram_app or not self.settings.telegram_chat_id_int:
+            return
+        try:
+            closes = await self.session_repo.get_unnotified_closes()
+            for session in closes:
+                await self._send_close_notification(session)
+                await self.session_repo.mark_close_notified(session["create_tran_id"])
+        except Exception as exc:
+            logger.error("close_notification_error", error=str(exc))
+
+    async def _send_close_notification(self, session: dict) -> None:
+        """Format and send a close notification for one grid session."""
+        from datetime import datetime, timezone
+
+        symbol = session.get("symbol") or "未知"
+        net_profit = float(session.get("net_profit") or 0)
+        pnl_emoji = "🟢" if net_profit >= 0 else "🔴"
+        invested = float(session.get("invested_amount") or 0)
+        returned = float(session.get("returned_amount") or 0)
+        roi_pct = (net_profit / invested * 100) if invested > 0 else 0
+
+        open_str = datetime.fromtimestamp(
+            session["created_at_ms"] / 1000, tz=timezone.utc
+        ).strftime("%m/%d %H:%M UTC")
+
+        close_str = "N/A"
+        duration_h = 0.0
+        if session.get("closed_at_ms"):
+            close_str = datetime.fromtimestamp(
+                session["closed_at_ms"] / 1000, tz=timezone.utc
+            ).strftime("%m/%d %H:%M UTC")
+            duration_h = (session["closed_at_ms"] - session["created_at_ms"]) / 3_600_000
+
+        lines = [
+            f"{pnl_emoji} <b>網格已關閉</b>",
+            "",
+            f"交易對: <b>{symbol}</b>",
+            f"開倉: {open_str}",
+            f"關倉: {close_str} (運行 {duration_h:.1f}h)",
+            f"投入: ${invested:,.2f} → 回收: ${returned:,.2f}",
+            f"淨損益: <b>{pnl_emoji} ${net_profit:+,.4f} ({roi_pct:+.2f}%)</b>",
+        ]
+        if session.get("lower_price") and session.get("upper_price"):
+            gt = "等比" if session.get("grid_type") == "GEO" else "等差"
+            gc = session.get("grid_count") or "?"
+            lp = session["lower_price"]
+            up = session["upper_price"]
+            lines.append(f"設定: {gt} {gc}格 ${lp:,.2f}~${up:,.2f}")
+
+        await self.telegram_app.bot.send_message(
+            chat_id=self.settings.telegram_chat_id_int,
+            text="\n".join(lines),
+            parse_mode="HTML",
+        )
+        logger.info(
+            "close_notification_sent",
+            symbol=symbol,
+            net_profit=net_profit,
+            duration_h=round(duration_h, 1),
+        )
 
     async def _send_telegram_report(self, results: dict) -> None:
         """Send periodic status report via Telegram.
@@ -266,7 +398,7 @@ class App:
             if self.settings.gemini_api_key:
                 self.scheduler.add_analysis_job(
                     self.run_analysis_cycle,
-                    interval_minutes=60,  # analyze hourly
+                    interval_minutes=30,  # monitor every 30 min
                 )
             self.scheduler.start()
 

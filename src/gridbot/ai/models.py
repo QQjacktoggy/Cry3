@@ -13,6 +13,31 @@ class ParameterAdjustment(BaseModel):
     reason: str = Field(description="調整原因（繁體中文）")
 
 
+class FinalGridParameters(BaseModel):
+    """Final Binance futures grid parameters to display to user."""
+
+    symbol: str | None = Field(default=None, description="交易對，例如 ETHUSDC")
+    lower_price: float | None = Field(default=None, description="最低價格")
+    upper_price: float | None = Field(default=None, description="最高價格")
+    grid_count: int | None = Field(default=None, description="網格數")
+    grid_type: Literal["ARITHMETIC", "GEOMETRIC"] | None = Field(
+        default=None, description="網格類型：等差或等比"
+    )
+    investment_usdc: float | None = Field(default=None, description="保證金投入（USDC）")
+    leverage: int | None = Field(default=None, ge=1, le=10, description="槓桿倍數")
+    direction: Literal["LONG", "SHORT", "NEUTRAL"] | None = Field(
+        default=None, description="方向偏好"
+    )
+    margin_mode: Literal["CROSS", "ISOLATED"] | None = Field(
+        default=None, description="保證金模式"
+    )
+    stop_loss_price: float | None = Field(default=None, description="止損價格")
+    take_profit_price: float | None = Field(default=None, description="止盈價格")
+    close_all_on_stop: bool | None = Field(
+        default=True, description="終止時是否全部平倉"
+    )
+
+
 class GeminiRecommendation(BaseModel):
     """Structured response from Gemini AI analysis.
 
@@ -32,6 +57,10 @@ class GeminiRecommendation(BaseModel):
     parameter_adjustments: list[ParameterAdjustment] = Field(
         default_factory=list,
         description="具體的參數調整建議列表"
+    )
+    final_parameters: FinalGridParameters = Field(
+        default_factory=FinalGridParameters,
+        description="最終可直接填入幣安合約網格的建議參數"
     )
 
     leverage_suggestion: int = Field(

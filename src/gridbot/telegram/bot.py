@@ -3,7 +3,7 @@
 Registers all command handlers and builds the Application.
 """
 
-from telegram.ext import Application, CommandHandler
+from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
 from config.settings import Settings
 from src.gridbot.ai.gemini import GeminiAnalyzer
@@ -27,12 +27,14 @@ from src.gridbot.telegram.handlers import (
     cmd_metrics,
     cmd_pause,
     cmd_pnl,
+    cmd_recommend,
     cmd_resume,
     cmd_risk,
     cmd_sessions,
     cmd_start,
     cmd_status,
     cmd_strategy,
+    handle_share_link,
 )
 from src.gridbot.utils.logging import get_logger
 
@@ -85,7 +87,11 @@ def build_telegram_app(
     app.add_handler(CommandHandler("interval", cmd_interval))
     app.add_handler(CommandHandler("pause", cmd_pause))
     app.add_handler(CommandHandler("resume", cmd_resume))
+    app.add_handler(CommandHandler("recommend", cmd_recommend))
 
-    logger.info("telegram_app_configured", handlers=14)
+    # Auto-detect Binance share links in any non-command text message
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_share_link))
+
+    logger.info("telegram_app_configured", handlers=16)
 
     return app

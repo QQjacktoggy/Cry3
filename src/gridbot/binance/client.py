@@ -128,7 +128,7 @@ class BinanceFuturesClient:
         self,
         symbol: str,
         start_time: int | None = None,
-        limit: int = 100,
+        limit: int = 1000,
     ) -> list[dict]:
         """GET /fapi/v1/allOrders — order history (for clientOrderId filtering)."""
         params: dict = {"symbol": symbol, "limit": limit}

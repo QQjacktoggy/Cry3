@@ -218,8 +218,10 @@ class GridSessionRepository:
         await self._db.execute(
             """INSERT INTO grid_sessions
             (symbol, created_at_ms, closed_at_ms, invested_amount, returned_amount,
-             net_profit, asset, create_tran_id, close_tran_id, is_active)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             net_profit, asset, create_tran_id, close_tran_id, is_active,
+             direction, grid_type, leverage, grid_count, lower_price, upper_price,
+             stop_loss_price, take_profit_price, strategy_id, share_link, notified_close)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(create_tran_id) DO UPDATE SET
                 symbol=excluded.symbol,
                 closed_at_ms=excluded.closed_at_ms,
@@ -234,7 +236,47 @@ class GridSessionRepository:
                 session["asset"], session["create_tran_id"],
                 session.get("close_tran_id"),
                 1 if session.get("is_active", True) else 0,
+                session.get("direction"), session.get("grid_type"),
+                session.get("leverage"), session.get("grid_count"),
+                session.get("lower_price"), session.get("upper_price"),
+                session.get("stop_loss_price"), session.get("take_profit_price"),
+                session.get("strategy_id"), session.get("share_link"),
+                1 if session.get("notified_close", False) else 0,
             ),
+        )
+
+    async def update_grid_config(self, create_tran_id: int, config: dict) -> None:
+        """Update grid configuration fields parsed from a Binance share link."""
+        await self._db.execute(
+            """UPDATE grid_sessions SET
+                symbol=COALESCE(?, symbol),
+                direction=?, grid_type=?, leverage=?, grid_count=?,
+                lower_price=?, upper_price=?, stop_loss_price=?,
+                take_profit_price=?, strategy_id=?, share_link=?
+            WHERE create_tran_id=?""",
+            (
+                config.get("symbol"), config.get("direction"),
+                config.get("grid_type"), config.get("leverage"),
+                config.get("grid_count"), config.get("lower_price"),
+                config.get("upper_price"), config.get("stop_loss_price"),
+                config.get("take_profit_price"), config.get("strategy_id"),
+                config.get("share_link"), create_tran_id,
+            ),
+        )
+
+    async def mark_close_notified(self, create_tran_id: int) -> None:
+        """Mark a closed session as having its close notification sent."""
+        await self._db.execute(
+            "UPDATE grid_sessions SET notified_close=1 WHERE create_tran_id=?",
+            (create_tran_id,),
+        )
+
+    async def get_unnotified_closes(self) -> list[dict]:
+        """Get closed sessions that haven't had a close notification sent yet."""
+        return await self._db.fetchall(
+            """SELECT * FROM grid_sessions
+            WHERE is_active=0 AND notified_close=0
+            ORDER BY closed_at_ms DESC""",
         )
 
     async def get_active_session(self, symbol: str | None = None) -> dict | None:

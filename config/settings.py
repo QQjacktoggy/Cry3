@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     fetch_interval_minutes: int = 30
 
     gemini_api_key: str = ""
-    gemini_model: str = "gemini-2.0-flash"
+    gemini_model: str = "gemini-3.1-flash-preview"
 
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
