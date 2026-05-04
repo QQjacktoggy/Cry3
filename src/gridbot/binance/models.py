@@ -143,6 +143,7 @@ class GridSession:
     """A grid bot lifecycle from CREATE to CLOSE.
 
     Built by pairing STRATEGY_UMFUTURES_TRANSFER records.
+    Grid config fields are populated later from the Binance share link.
     """
 
     create_time_ms: int
@@ -153,8 +154,20 @@ class GridSession:
     asset: str
     create_tran_id: int
     close_tran_id: int | None
-    symbol: str | None = None  # inferred from trades in the time window
+    symbol: str | None = None          # inferred from trades in the time window
     is_active: bool = True
+    # Grid configuration — populated from Binance share link
+    direction: str | None = None       # NEUTRAL / LONG / SHORT
+    grid_type: str | None = None       # GEO / ARITHMETIC
+    leverage: int | None = None
+    grid_count: int | None = None
+    lower_price: float | None = None
+    upper_price: float | None = None
+    stop_loss_price: float | None = None
+    take_profit_price: float | None = None
+    strategy_id: str | None = None    # csi from share link
+    share_link: str | None = None
+    notified_close: bool = False       # True after close notification sent
 
     @classmethod
     def from_create(cls, income: IncomeRecord) -> "GridSession":
@@ -189,6 +202,17 @@ class GridSession:
             "close_tran_id": self.close_tran_id,
             "symbol": self.symbol,
             "is_active": self.is_active,
+            "direction": self.direction,
+            "grid_type": self.grid_type,
+            "leverage": self.leverage,
+            "grid_count": self.grid_count,
+            "lower_price": self.lower_price,
+            "upper_price": self.upper_price,
+            "stop_loss_price": self.stop_loss_price,
+            "take_profit_price": self.take_profit_price,
+            "strategy_id": self.strategy_id,
+            "share_link": self.share_link,
+            "notified_close": self.notified_close,
         }
 
 

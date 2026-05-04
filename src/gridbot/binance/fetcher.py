@@ -189,9 +189,9 @@ class BinanceFetcher:
 
         # Fetch order details to check clientOrderId
         try:
-            # Use the earliest trade time as start
+            # Look back 24h before the earliest trade to catch orders placed well before execution
             earliest = min(t.time_ms for t in result.trades)
-            orders = await self._client.get_all_orders(symbol, start_time=earliest - 60000)
+            orders = await self._client.get_all_orders(symbol, start_time=earliest - 86_400_000)
 
             grid_order_ids = set()
             for order in orders:

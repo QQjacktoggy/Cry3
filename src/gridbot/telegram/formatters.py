@@ -104,6 +104,13 @@ def format_full_report(
 
 def format_recommendation(rec: GeminiRecommendation, current_strategy: str) -> str:
     """Format a Gemini recommendation for Telegram."""
+    def _fmt_num(value: float | int | None, digits: int = 2) -> str:
+        if value is None:
+            return "未提供"
+        if isinstance(value, int):
+            return str(value)
+        return f"{value:.{digits}f}"
+
     lines = ["🤖 <b>Gemini AI 分析建議</b>", ""]
 
     # Strategy change
@@ -123,6 +130,25 @@ def format_recommendation(rec: GeminiRecommendation, current_strategy: str) -> s
             current = f"{adj.current_value}" if adj.current_value is not None else "?"
             lines.append(f"  • {adj.parameter}: {current} → <b>{adj.suggested_value}</b>")
             lines.append(f"    {adj.reason}")
+
+    # Final parameter block (always present)
+    fp = rec.final_parameters
+    lines.append("")
+    lines.append("🧩 <b>最終建議參數（填入幣安）</b>")
+    lines.append(f"  • 幣對: <b>{fp.symbol or '未提供'}</b>")
+    lines.append(f"  • 價格範圍: <b>{_fmt_num(fp.lower_price)} - {_fmt_num(fp.upper_price)}</b>")
+    lines.append(f"  • 網格數: <b>{_fmt_num(fp.grid_count, 0)}</b>")
+    grid_type = {"ARITHMETIC": "等差", "GEOMETRIC": "等比"}.get(fp.grid_type or "", "未提供")
+    lines.append(f"  • 網格類型: <b>{grid_type}</b>")
+    lines.append(f"  • 投資額(USDC): <b>{_fmt_num(fp.investment_usdc)}</b>")
+    lines.append(f"  • 槓桿: <b>{fp.leverage or rec.leverage_suggestion}x</b>")
+    lines.append(f"  • 方向: <b>{fp.direction or rec.direction_suggestion}</b>")
+    margin_mode = {"CROSS": "全倉", "ISOLATED": "逐倉"}.get(fp.margin_mode or "", "未提供")
+    lines.append(f"  • 保證金模式: <b>{margin_mode}</b>")
+    lines.append(f"  • 止盈價: <b>{_fmt_num(fp.take_profit_price)}</b>")
+    lines.append(f"  • 止損價: <b>{_fmt_num(fp.stop_loss_price)}</b>")
+    close_all = "是" if fp.close_all_on_stop else "否"
+    lines.append(f"  • 終止時全部平倉: <b>{close_all}</b>")
 
     # Market summary
     lines.append("")
