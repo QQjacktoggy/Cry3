@@ -279,6 +279,12 @@ class GridSessionRepository:
             ORDER BY closed_at_ms DESC""",
         )
 
+    async def get_all_active_sessions(self) -> list[dict]:
+        """Get every currently active (running) grid session, newest first."""
+        return await self._db.fetchall(
+            "SELECT * FROM grid_sessions WHERE is_active = 1 ORDER BY created_at_ms DESC"
+        )
+
     async def get_active_session(self, symbol: str | None = None) -> dict | None:
         """Get the currently active (running) grid session.
 

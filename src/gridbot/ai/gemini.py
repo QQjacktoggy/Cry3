@@ -185,8 +185,9 @@ class GeminiAnalyzer:
             if adj.parameter in clamped and isinstance(clamped[adj.parameter], (int, float)):
                 adj.suggested_value = clamped[adj.parameter]
 
-        # Ensure final grid parameters are always available for Telegram output
-        rec.final_parameters = self._build_final_parameters(rec, adjustments)
+        # Derive final parameters from post-clamp values so the Telegram output
+        # cannot show out-of-bounds figures that disagree with the validated rec.
+        rec.final_parameters = self._build_final_parameters(rec, {**adjustments, **clamped})
 
         return rec
 

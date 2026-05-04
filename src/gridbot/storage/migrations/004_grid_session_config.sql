@@ -13,3 +13,7 @@ ALTER TABLE grid_sessions ADD COLUMN take_profit_price REAL;   -- stp
 ALTER TABLE grid_sessions ADD COLUMN strategy_id     TEXT;     -- csi from share link
 ALTER TABLE grid_sessions ADD COLUMN share_link      TEXT;     -- original URL
 ALTER TABLE grid_sessions ADD COLUMN notified_close  INTEGER NOT NULL DEFAULT 0; -- 1 after close notification sent
+
+-- Backfill: mark all pre-existing closed sessions as already notified so the
+-- first deploy after this migration does not spam historical close notifications.
+UPDATE grid_sessions SET notified_close = 1 WHERE is_active = 0;

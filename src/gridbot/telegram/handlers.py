@@ -488,11 +488,13 @@ async def handle_share_link(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     # Find the active session — match by investment amount (within $0.01 tolerance)
     active = await session_repo.get_active_session(symbol=cfg.symbol)
     if not active:
-        # Symbol might not be set yet; try any active session matching investment amount
-        all_active = await session_repo.get_sessions(limit=5)
+        # Symbol might not be set yet on the session — search all active sessions by amount.
+        # Using get_all_active_sessions() avoids the truncation bug that get_sessions(limit=N)
+        # would introduce when there are many historical closed sessions.
+        all_active = await session_repo.get_all_active_sessions()
         active = next(
             (s for s in all_active
-             if s.get("is_active") and abs(s["invested_amount"] - cfg.investment_amount) < 0.02),
+             if abs(s["invested_amount"] - cfg.investment_amount) < 0.02),
             None,
         )
 
