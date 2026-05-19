@@ -28,6 +28,7 @@ from src.gridbot.telegram.formatters import (
     format_recommendation,
     format_risk_dashboard,
     format_sessions,
+    format_testnet_dashboard,
 )
 from src.gridbot.utils.logging import get_logger
 
@@ -37,10 +38,9 @@ logger = get_logger(__name__)
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/start — Welcome message."""
     await update.message.reply_text(
-        "🤖 <b>Binance 合約網格監控 Bot</b>\n\n"
-        "我會定期監控你的網格機器人表現，\n"
-        "並透過 Gemini AI 提供策略建議。\n\n"
-        "輸入 /help 查看所有可用指令。",
+        "🧪 <b>Cry3 Binance Testnet Bot</b>\n\n"
+        "用途：查看 testnet 狀態與策略風控，不透過 Telegram 下單。\n\n"
+        "輸入 /help 查看指令。",
         parse_mode="HTML",
     )
 
@@ -49,24 +49,65 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/help — List all commands."""
     await update.message.reply_text(
         "📋 <b>可用指令</b>\n\n"
-        "/status — 所有交易對即時狀態\n"
-        "/status <code>BTCUSDC</code> — 特定交易對狀態\n"
-        "/metrics — 詳細表現報告\n"
-        "/risk — 風險儀表板\n"
-        "/strategy — 當前策略與參數\n"
-        "/analyze — 立即觸發 Gemini 分析\n"
+        "/testnet — testnet 策略/持倉/今日損益\n"
         "/recommend — Gemini 推薦 ETHUSDC 網格參數\n"
-        "/ask <code>問題</code> — 向 Gemini 提問\n"
-        "/sessions — 網格輪次歷史\n"
-        "/pnl — 累計損益報表\n"
-        "/history — 最近建議紀錄\n"
-        "/interval <code>分鐘</code> — 設定抓取間隔\n"
-        "/pause — 暫停定期抓取\n"
-        "/resume — 恢復定期抓取\n"
+        "/pause — 暫停狀態抓取排程\n"
+        "/resume — 恢復狀態抓取排程\n"
         "/help — 列出所有指令\n\n"
-        "💡 <i>直接傳送幣安網格分享連結，Bot 會自動解析並記錄設定。</i>",
+        "💡 <i>Telegram 不下單；策略自動下單後只在這裡回報。直接傳送幣安網格分享連結，Bot 會自動解析並記錄設定。</i>",
         parse_mode="HTML",
     )
+
+
+async def cmd_testnet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/testnet — Testnet trader status and guardrails."""
+    app_data = context.application.bot_data
+    binance_client: BinanceFuturesClient = app_data["binance_client"]
+    settings: Settings = app_data["settings"]
+
+    await update.message.reply_text("⏳ 正在取得 testnet 狀態...")
+
+    try:
+        from datetime import datetime, timezone
+
+        day_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        day_start_ms = int(day_start.timestamp() * 1000)
+
+        account = await binance_client.get_account_info()
+        positions: dict[str, PositionInfo | None] = {}
+        open_orders: dict[str, list[dict]] = {}
+        today_income: dict[str, list[IncomeRecord]] = {}
+        commission_rates: dict[str, dict] = {}
+
+        for symbol in settings.symbols_list:
+            positions[symbol] = await binance_client.get_position(symbol)
+            open_orders[symbol] = await binance_client.get_open_orders(symbol)
+            commission_rates[symbol] = await binance_client.get_commission_rate(symbol)
+            records: list[IncomeRecord] = []
+            for income_type in ("REALIZED_PNL", "COMMISSION", "FUNDING_FEE"):
+                records.extend(
+                    await binance_client.get_income_history(
+                        income_type=income_type,
+                        symbol=symbol,
+                        start_time=day_start_ms,
+                        limit=100,
+                    )
+                )
+            today_income[symbol] = records
+
+        report = format_testnet_dashboard(
+            settings=settings,
+            account=account,
+            positions=positions,
+            open_orders=open_orders,
+            today_income=today_income,
+            commission_rates=commission_rates,
+        )
+        await update.message.reply_text(report, parse_mode="HTML")
+
+    except Exception as exc:
+        logger.error("cmd_testnet_failed", error=str(exc))
+        await update.message.reply_text(f"❌ 取得 testnet 狀態失敗：{str(exc)[:300]}")
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

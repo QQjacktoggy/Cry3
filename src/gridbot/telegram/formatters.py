@@ -5,9 +5,11 @@ Uses HTML parse mode for styling.
 """
 
 from datetime import datetime, timezone
+from html import escape
 
 from src.gridbot.ai.models import GeminiRecommendation
-from src.gridbot.binance.models import MarketSnapshot, PositionInfo
+from config.settings import Settings
+from src.gridbot.binance.models import AccountInfo, IncomeRecord, MarketSnapshot, PositionInfo
 from src.gridbot.grid.models import GridMetrics
 
 
@@ -100,6 +102,97 @@ def format_full_report(
     lines.append(f"{total_emoji} 總淨損益: ${total_pnl:.4f}")
 
     return "\n".join(lines)
+
+
+def format_testnet_dashboard(
+    settings: Settings,
+    account: AccountInfo,
+    positions: dict[str, PositionInfo | None],
+    open_orders: dict[str, list[dict]],
+    today_income: dict[str, list[IncomeRecord]],
+    commission_rates: dict[str, dict],
+) -> str:
+    """Format the testnet trader status dashboard."""
+    now = datetime.now(timezone.utc).strftime("%Y/%m/%d %H:%M UTC")
+    mode = escape(settings.trading_mode)
+    strategy = escape(settings.testnet_strategy_label)
+    env = "TESTNET" if settings.binance_testnet else "MAINNET"
+    env_icon = "🧪" if settings.binance_testnet else "⚠️"
+    lines = [
+        f"{env_icon} <b>{env} 交易機器人狀態</b> — {now}",
+        "",
+        f"模式: <b>{mode}</b>",
+        f"策略: <b>{strategy}</b>",
+        f"交易對: <code>{escape(','.join(settings.symbols_list))}</code>",
+        f"策略資金上限: ${settings.testnet_equity_usdc:.2f} USDC",
+        f"日目標: {settings.testnet_daily_target_pct:.2f}%",
+        f"Trend aggressive scale: {settings.trend_aggressive_scale:.2f}",
+        f"最大有效槓桿: {settings.max_effective_leverage:.1f}x",
+        f"Soft / Hard daily loss: {settings.daily_soft_loss_pct:.1f}% / {settings.max_daily_loss_pct:.1f}%",
+        "",
+        "━━ 帳戶 ━━",
+        f"Wallet: ${account.total_wallet_balance:.4f}",
+        f"Margin balance: ${account.total_margin_balance:.4f}",
+        f"Available: ${account.available_balance:.4f}",
+        f"Unrealized PnL: ${account.total_unrealized_profit:.4f}",
+    ]
+
+    if account.margin_ratio is not None:
+        lines.append(f"Margin ratio: {account.margin_ratio * 100:.2f}%")
+    lines.append("")
+
+    total_realized = 0.0
+    total_commission = 0.0
+    total_funding = 0.0
+
+    for symbol in settings.symbols_list:
+        symbol_income = today_income.get(symbol, [])
+        realized = sum(r.income for r in symbol_income if r.income_type == "REALIZED_PNL")
+        commission = sum(r.income for r in symbol_income if r.income_type == "COMMISSION")
+        funding = sum(r.income for r in symbol_income if r.income_type == "FUNDING_FEE")
+        total_realized += realized
+        total_commission += commission
+        total_funding += funding
+
+        pos = positions.get(symbol)
+        orders = open_orders.get(symbol, [])
+        rates = commission_rates.get(symbol, {})
+        maker = _parse_float(rates.get("makerCommissionRate"))
+        taker = _parse_float(rates.get("takerCommissionRate"))
+
+        lines.append(f"━━ {escape(symbol)} ━━")
+        if pos:
+            lines.append(f"持倉: {pos.position_direction} {abs(pos.position_amt):.6f} @ ${pos.entry_price:,.2f}")
+            lines.append(f"Mark: ${pos.mark_price:,.2f} | U-PnL: ${pos.unrealized_pnl:.4f}")
+            lines.append(f"Leverage: {pos.leverage}x | Margin: {escape(pos.margin_type)}")
+            if pos.distance_to_liquidation_pct is not None:
+                lines.append(f"距清算: {pos.distance_to_liquidation_pct:.2f}%")
+        else:
+            lines.append("持倉: 無")
+        lines.append(f"Open orders: {len(orders)}")
+        lines.append(f"今日 realized / fee / funding: ${realized:.4f} / ${commission:.4f} / ${funding:.4f}")
+        if maker is not None and taker is not None:
+            lines.append(f"Fee rate maker/taker: {maker * 100:.4f}% / {taker * 100:.4f}%")
+        lines.append("")
+
+    net_today = total_realized + total_commission + total_funding
+    lines.append("━━ 今日合計 ━━")
+    lines.append(f"Realized PnL: ${total_realized:.4f}")
+    lines.append(f"Commission: ${total_commission:.4f}")
+    lines.append(f"Funding: ${total_funding:.4f}")
+    lines.append(f"<b>Net: ${net_today:.4f}</b>")
+    lines.append("")
+    lines.append("<i>此報告只做 testnet 監控，不代表下單指令。</i>")
+    return "\n".join(lines)
+
+
+def _parse_float(value: object) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def format_recommendation(rec: GeminiRecommendation, current_strategy: str) -> str:

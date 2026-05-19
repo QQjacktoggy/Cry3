@@ -23,6 +23,7 @@ from src.gridbot.storage.repositories import (
 )
 from src.gridbot.telegram.bot import build_telegram_app
 from src.gridbot.telegram.formatters import format_full_report, format_recommendation
+from src.gridbot.testnet.auto_trader import TestnetAutoTrader
 from src.gridbot.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -58,6 +59,7 @@ class App:
         )
 
         self.telegram_app = None
+        self.testnet_auto_trader = None
 
     async def initialize(self) -> None:
         """Initialize all components."""
@@ -77,12 +79,13 @@ class App:
         try:
             results = await self.fetcher.fetch_all_symbols(self.settings.symbols_list)
 
-            # Notify for any newly closed grid sessions (must run after fetch updates DB)
-            await self._notify_closed_sessions()
+            if self.settings.trading_mode == "legacy_monitor":
+                # Notify for any newly closed grid sessions (must run after fetch updates DB)
+                await self._notify_closed_sessions()
 
-            # Send periodic status report via Telegram if configured
-            if self.telegram_app and self.settings.telegram_chat_id_int:
-                await self._send_telegram_report(results)
+                # Send periodic status report via Telegram if configured
+                if self.telegram_app and self.settings.telegram_chat_id_int:
+                    await self._send_telegram_report(results)
 
             logger.info("fetch_cycle_done", symbols=len(results))
 
@@ -381,24 +384,39 @@ class App:
         async def _run():
             await self.initialize()
 
-            # Build Telegram app
-            self.telegram_app = build_telegram_app(
+            # Build Telegram app only when configured. Testnet signal-only runs
+            # should still stay alive when Telegram credentials are not present.
+            if self.settings.telegram_bot_token:
+                self.telegram_app = build_telegram_app(
+                    settings=self.settings,
+                    binance_client=self.binance,
+                    gemini_analyzer=self.gemini,
+                    db=self.db,
+                )
+                self.telegram_app.bot_data["scheduler"] = self.scheduler
+            else:
+                logger.warning("telegram_disabled", msg="TELEGRAM_BOT_TOKEN not configured")
+
+            self.testnet_auto_trader = TestnetAutoTrader(
                 settings=self.settings,
-                binance_client=self.binance,
-                gemini_analyzer=self.gemini,
-                db=self.db,
+                client=self.binance,
+                telegram_app=self.telegram_app,
             )
-            self.telegram_app.bot_data["scheduler"] = self.scheduler
 
             # Schedule periodic tasks
             self.scheduler.add_fetch_job(
                 self.run_fetch_cycle,
                 interval_minutes=self.settings.fetch_interval_minutes,
             )
-            if self.settings.gemini_api_key:
+            if self.settings.gemini_api_key and self.settings.trading_mode == "legacy_monitor":
                 self.scheduler.add_analysis_job(
                     self.run_analysis_cycle,
                     interval_minutes=30,  # monitor every 30 min
+                )
+            if self.settings.trading_mode == "testnet_live":
+                self.scheduler.add_testnet_trade_job(
+                    self.testnet_auto_trader.run_cycle,
+                    interval_minutes=self.settings.testnet_auto_trade_interval_minutes,
                 )
             self.scheduler.start()
 
@@ -407,10 +425,17 @@ class App:
             await self.run_fetch_cycle()
 
             # Start Telegram polling
-            logger.info("starting_telegram_bot")
-            await self.telegram_app.initialize()
-            await self.telegram_app.start()
-            await self.telegram_app.updater.start_polling(drop_pending_updates=True)
+            if self.telegram_app:
+                logger.info("starting_telegram_bot")
+                await self.telegram_app.initialize()
+                await self.telegram_app.start()
+                await self.telegram_app.updater.start_polling(drop_pending_updates=True)
+            else:
+                logger.info("telegram_bot_skipped")
+
+            if self.settings.trading_mode == "testnet_live":
+                logger.info("running_initial_testnet_trade_cycle")
+                await self.testnet_auto_trader.run_cycle()
 
             # Keep running
             try:
@@ -418,9 +443,10 @@ class App:
             except (KeyboardInterrupt, SystemExit):
                 pass
             finally:
-                await self.telegram_app.updater.stop()
-                await self.telegram_app.stop()
-                await self.telegram_app.shutdown()
+                if self.telegram_app:
+                    await self.telegram_app.updater.stop()
+                    await self.telegram_app.stop()
+                    await self.telegram_app.shutdown()
                 await self.shutdown()
 
         asyncio.run(_run())

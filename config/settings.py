@@ -38,6 +38,25 @@ class Settings(BaseSettings):
     active_strategy_name: str = "moderate"
     log_level: str = "INFO"
 
+    # Testnet trader guardrails and candidate strategy metadata.
+    trading_mode: str = "signal_only"
+    testnet_strategy_label: str = "router_allocator_v13_trend350"
+    testnet_equity_usdc: float = 150.0
+    testnet_daily_target_pct: float = 2.7
+    testnet_auto_trade_interval_minutes: int = 5
+    testnet_kline_interval: str = "5m"
+    testnet_kline_limit: int = 300
+    testnet_min_signal_score: int = 58
+    testnet_max_position_margin_pct: float = 35.0
+    max_effective_leverage: float = 70.0
+    max_daily_loss_pct: float = 36.0
+    daily_soft_loss_pct: float = 16.0
+    max_trade_risk_pct: float = 100.0
+    trend_aggressive_scale: float = 3.5
+    testnet_order_notional_usdc: float = 10.0
+    testnet_order_leverage: int = 5
+    testnet_max_order_notional_usdc: float = 150.0
+
     # Risk management
     margin_ratio_warning: float = 0.6    # 60% → send warning
     margin_ratio_critical: float = 0.8   # 80% → urgent alert

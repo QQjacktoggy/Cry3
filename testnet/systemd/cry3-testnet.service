@@ -1,0 +1,18 @@
+[Unit]
+Description=Cry3 Binance Futures Testnet Monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jack_shih
+WorkingDirectory=/home/jack_shih/cry3
+ExecStart=/bin/bash /home/jack_shih/cry3/testnet/run_testnet.sh
+Restart=on-failure
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+StandardOutput=append:/home/jack_shih/cry3/testnet/logs/service.log
+StandardError=append:/home/jack_shih/cry3/testnet/logs/service.log
+
+[Install]
+WantedBy=multi-user.target

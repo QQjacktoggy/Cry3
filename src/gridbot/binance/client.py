@@ -105,6 +105,37 @@ class BinanceFuturesClient:
 
     # ── Trades & Orders ──────────────────────────────────────────────
 
+    @async_retry(max_attempts=3, base_delay=1.0, exceptions=(BinanceAPIException, Exception))
+    async def get_exchange_info(self) -> dict:
+        """GET /fapi/v1/exchangeInfo."""
+        return await self.client.futures_exchange_info()
+
+    @async_retry(max_attempts=3, base_delay=1.0, exceptions=(BinanceAPIException, Exception))
+    async def set_leverage(self, symbol: str, leverage: int) -> dict:
+        """POST /fapi/v1/leverage."""
+        return await self.client.futures_change_leverage(symbol=symbol, leverage=leverage)
+
+    @async_retry(max_attempts=3, base_delay=2.0, exceptions=(BinanceAPIException, Exception))
+    async def create_market_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: float | str,
+        reduce_only: bool = False,
+        client_order_id: str | None = None,
+    ) -> dict:
+        """POST /fapi/v1/order — market order."""
+        params = {
+            "symbol": symbol,
+            "side": side,
+            "type": "MARKET",
+            "quantity": quantity,
+            "reduceOnly": reduce_only,
+        }
+        if client_order_id:
+            params["newClientOrderId"] = client_order_id
+        return await self.client.futures_create_order(**params)
+
     @async_retry(max_attempts=3, base_delay=2.0, exceptions=(BinanceAPIException, Exception))
     async def get_user_trades(
         self,

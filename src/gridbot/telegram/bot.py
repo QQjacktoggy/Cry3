@@ -19,21 +19,12 @@ from src.gridbot.storage.repositories import (
     RecommendationRepository,
 )
 from src.gridbot.telegram.handlers import (
-    cmd_analyze,
-    cmd_ask,
     cmd_help,
-    cmd_history,
-    cmd_interval,
-    cmd_metrics,
     cmd_pause,
-    cmd_pnl,
     cmd_recommend,
     cmd_resume,
-    cmd_risk,
-    cmd_sessions,
     cmd_start,
-    cmd_status,
-    cmd_strategy,
+    cmd_testnet,
     handle_share_link,
 )
 from src.gridbot.utils.logging import get_logger
@@ -75,16 +66,7 @@ def build_telegram_app(
     # Register command handlers
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("metrics", cmd_metrics))
-    app.add_handler(CommandHandler("risk", cmd_risk))
-    app.add_handler(CommandHandler("strategy", cmd_strategy))
-    app.add_handler(CommandHandler("analyze", cmd_analyze))
-    app.add_handler(CommandHandler("ask", cmd_ask))
-    app.add_handler(CommandHandler("sessions", cmd_sessions))
-    app.add_handler(CommandHandler("pnl", cmd_pnl))
-    app.add_handler(CommandHandler("history", cmd_history))
-    app.add_handler(CommandHandler("interval", cmd_interval))
+    app.add_handler(CommandHandler("testnet", cmd_testnet))
     app.add_handler(CommandHandler("pause", cmd_pause))
     app.add_handler(CommandHandler("resume", cmd_resume))
     app.add_handler(CommandHandler("recommend", cmd_recommend))
@@ -92,6 +74,6 @@ def build_telegram_app(
     # Auto-detect Binance share links in any non-command text message
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_share_link))
 
-    logger.info("telegram_app_configured", handlers=16)
+    logger.info("telegram_app_configured", handlers=7)
 
     return app

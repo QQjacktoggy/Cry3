@@ -38,6 +38,18 @@ class Scheduler:
         )
         logger.info("scheduler_job_added", job="analysis_cycle", interval_minutes=interval_minutes)
 
+    def add_testnet_trade_job(self, func, interval_minutes: int, **kwargs) -> None:
+        """Add a periodic testnet strategy execution job."""
+        self._scheduler.add_job(
+            func,
+            "interval",
+            minutes=interval_minutes,
+            id="testnet_trade_cycle",
+            replace_existing=True,
+            **kwargs,
+        )
+        logger.info("scheduler_job_added", job="testnet_trade_cycle", interval_minutes=interval_minutes)
+
     def start(self) -> None:
         self._scheduler.start()
         logger.info("scheduler_started")
