@@ -266,14 +266,16 @@ class PositionInfo:
 
     @classmethod
     def from_api(cls, data: dict) -> "PositionInfo":
+        leverage_raw = data.get("leverage")
+        leverage = int(float(leverage_raw)) if leverage_raw not in (None, "") else 1
         return cls(
             symbol=data["symbol"],
-            position_amt=float(data["positionAmt"]),
-            entry_price=float(data["entryPrice"]),
-            mark_price=float(data["markPrice"]),
-            unrealized_pnl=float(data["unRealizedProfit"]),
+            position_amt=float(data.get("positionAmt", 0)),
+            entry_price=float(data.get("entryPrice", 0)),
+            mark_price=float(data.get("markPrice", 0)),
+            unrealized_pnl=float(data.get("unRealizedProfit", data.get("unrealizedProfit", 0))),
             liquidation_price=float(data.get("liquidationPrice", 0)),
-            leverage=int(data["leverage"]),
+            leverage=leverage,
             margin_type=data.get("marginType", "cross"),
             isolated_margin=float(data["isolatedMargin"]) if data.get("isolatedMargin") else None,
             initial_margin=float(data["initialMargin"]) if data.get("initialMargin") else None,

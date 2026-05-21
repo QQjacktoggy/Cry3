@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     testnet_equity_usdc: float = 150.0
     testnet_daily_target_pct: float = 2.7
     testnet_auto_trade_interval_minutes: int = 5
+    testnet_manage_interval_seconds: int = 15
     testnet_kline_interval: str = "5m"
     testnet_kline_limit: int = 300
     testnet_min_signal_score: int = 58
@@ -56,6 +57,11 @@ class Settings(BaseSettings):
     testnet_order_notional_usdc: float = 10.0
     testnet_order_leverage: int = 5
     testnet_max_order_notional_usdc: float = 150.0
+    testnet_exchange_protection_enabled: bool = True
+    testnet_daily_report_enabled: bool = True
+    testnet_daily_report_hour: int = 21
+    testnet_daily_report_minute: int = 0
+    testnet_daily_report_timezone: str = "Asia/Taipei"
 
     # Risk management
     margin_ratio_warning: float = 0.6    # 60% → send warning

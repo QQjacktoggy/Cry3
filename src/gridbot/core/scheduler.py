@@ -1,5 +1,7 @@
 """APScheduler wrapper for periodic fetch + analysis cycles."""
 
+from zoneinfo import ZoneInfo
+
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from src.gridbot.utils.logging import get_logger
@@ -49,6 +51,45 @@ class Scheduler:
             **kwargs,
         )
         logger.info("scheduler_job_added", job="testnet_trade_cycle", interval_minutes=interval_minutes)
+
+    def add_testnet_manage_job(self, func, interval_seconds: int, **kwargs) -> None:
+        """Add a fast periodic testnet position-management job."""
+        self._scheduler.add_job(
+            func,
+            "interval",
+            seconds=interval_seconds,
+            id="testnet_manage_cycle",
+            replace_existing=True,
+            **kwargs,
+        )
+        logger.info("scheduler_job_added", job="testnet_manage_cycle", interval_seconds=interval_seconds)
+
+    def add_testnet_daily_report_job(
+        self,
+        func,
+        hour: int,
+        minute: int,
+        timezone: str,
+        **kwargs,
+    ) -> None:
+        """Add a daily testnet Telegram report job."""
+        self._scheduler.add_job(
+            func,
+            "cron",
+            hour=hour,
+            minute=minute,
+            timezone=ZoneInfo(timezone),
+            id="testnet_daily_report",
+            replace_existing=True,
+            **kwargs,
+        )
+        logger.info(
+            "scheduler_job_added",
+            job="testnet_daily_report",
+            hour=hour,
+            minute=minute,
+            timezone=timezone,
+        )
 
     def start(self) -> None:
         self._scheduler.start()

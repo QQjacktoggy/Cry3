@@ -97,6 +97,177 @@ class LocalAiRiskReview:
     reason_codes: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class LiveRouterDecision:
+    signal: SignalPlan
+    strategy: str
+    regime: str
+    risk_mode: str
+    market_playbook: str
+    allocator_state: str
+    allocator_profile: str
+    allocator_scale: float
+    max_holding_bars: int
+
+
+def generate_router_allocator_v13_trend350_live_decision(
+    candles: list[Candle],
+    base: StrategyConfig,
+    day_pnl: float = 0.0,
+) -> LiveRouterDecision | None:
+    """Generate the current live decision for the validated trend350 router profile.
+
+    This mirrors the local signal_journal router flow closely enough for live
+    testnet execution while staying strictly causal: it uses only candles up to
+    the current bar and local reviewer logic.
+    """
+    if not candles:
+        return None
+
+    config = OrbConfig(
+        base=base,
+        session_start_bar=0,
+        opening_range_bars=9,
+        min_volume_ratio=0.8,
+        stop_atr=0.6,
+    )
+    context = build_orb_context(candles, config)
+    regime_context = build_regime_context(candles, config.base)
+    market_context = build_market_state_context(candles, config.base)
+
+    index = len(candles) - 1
+    equity_base = _equity_base(base, base.equity_usdc)
+    if _daily_guard_reason(equity_base, day_pnl):
+        return None
+
+    runtime_base = _risk_adjusted_config(equity_base, day_pnl)
+    decision = classify_regime(candles, index, regime_context, runtime_base)
+    runtime_config = config if runtime_base is base else _replace_base(config, runtime_base)
+    market_decision = classify_market_state(candles, index, market_context, runtime_base)
+
+    signal, strategy = _select_journal_signal(candles, index, runtime_config, context, decision, "router")
+    if signal.action != _expected_action(strategy):
+        return None
+
+    routed_base = _regime_router_adjusted_base(
+        runtime_base,
+        strategy,
+        decision,
+        market_decision,
+        0.70,
+        0.35,
+    )
+    if routed_base is None:
+        return None
+    if routed_base is not runtime_base:
+        runtime_base = routed_base
+        runtime_config = _replace_base(runtime_config, runtime_base)
+        signal, strategy = _select_journal_signal(candles, index, runtime_config, context, decision, "router")
+        if signal.action != _expected_action(strategy):
+            return None
+
+    nim_review = _local_nim_policy_review("auto", strategy, signal, market_decision)
+    if nim_review is not None:
+        if _nim_review_rejected_by_market_state(strategy, decision, market_decision, nim_review):
+            return None
+        scaled_base = _nim_scaled_base(runtime_base, nim_review)
+        if scaled_base is None:
+            return None
+        if scaled_base is not runtime_base:
+            runtime_base = scaled_base
+            runtime_config = _replace_base(runtime_config, runtime_base)
+            signal, strategy = _select_journal_signal(candles, index, runtime_config, context, decision, "router")
+            if signal.action != _expected_action(strategy):
+                return None
+
+    allocated_base, allocation = _regime_allocator_adjusted_base(
+        runtime_base,
+        strategy,
+        decision,
+        market_decision,
+        nim_review,
+        day_pnl,
+        2.0,
+        1.5,
+        0.45,
+        1.00,
+        3.50,
+        1.00,
+        0.35,
+        0.35,
+        0.55,
+        0.25,
+        0.05,
+        0.30,
+        None,
+        1.25,
+        0.45,
+        0.05,
+        0.30,
+        0.20,
+        0.05,
+        0.0,
+        100.0,
+        signal_score=signal.score,
+    )
+    if allocated_base is None:
+        return None
+    allocator_state = allocation["state"]
+    allocator_profile = allocation["profile"]
+    allocator_scale = allocation["scale"]
+
+    if allocated_base is not runtime_base:
+        runtime_base = allocated_base
+        runtime_config = _replace_base(runtime_config, runtime_base)
+        signal, strategy = _select_journal_signal(candles, index, runtime_config, context, decision, "router")
+        if signal.action != _expected_action(strategy):
+            return None
+
+    ai_risk_review = _local_ai_risk_review(
+        strategy,
+        decision,
+        market_decision,
+        signal,
+        allocator_state,
+        allocator_profile,
+        runtime_base,
+    )
+    if ai_risk_review is not None:
+        if ai_risk_review.decision == "reject" or ai_risk_review.risk_scale <= 0:
+            return None
+        if ai_risk_review.decision == "reduce" and ai_risk_review.risk_scale < 1.0:
+            runtime_base = _scaled_base(runtime_base, ai_risk_review.risk_scale)
+            runtime_config = _replace_base(runtime_config, runtime_base)
+            signal, strategy = _select_journal_signal(candles, index, runtime_config, context, decision, "router")
+            if signal.action != _expected_action(strategy):
+                return None
+
+    trade_config = _strategy_trade_config(
+        runtime_config,
+        strategy,
+        decision,
+        0,
+        0,
+        True,
+        (0.25, 0.35, 0.40),
+        0,
+        0.0,
+        24,
+        "short_reversion",
+    )
+    return LiveRouterDecision(
+        signal=signal,
+        strategy=strategy,
+        regime=decision.regime if decision is not None else "unknown",
+        risk_mode=decision.risk_mode if decision is not None else "unknown",
+        market_playbook=market_decision.playbook if market_decision is not None else "unknown",
+        allocator_state=allocator_state,
+        allocator_profile=allocator_profile,
+        allocator_scale=allocator_scale,
+        max_holding_bars=trade_config.base.max_holding_bars,
+    )
+
+
 def run_orb_signal_journal(
     candles: list[Candle],
     config: OrbConfig | None = None,
@@ -563,6 +734,8 @@ def _journal_throttle_update(
 
 def _local_nim_policy_review(policy: str, strategy: str, signal: SignalPlan, market_decision) -> LocalNimReview | None:
     if policy == "all":
+        return None
+    if market_decision is None:
         return None
     features = market_decision.features
     signal_playbook = _strategy_playbook(strategy)

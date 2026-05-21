@@ -12,6 +12,23 @@ from config.settings import Settings
 from src.gridbot.binance.models import AccountInfo, IncomeRecord, MarketSnapshot, PositionInfo
 from src.gridbot.grid.models import GridMetrics
 
+MODE_LABELS = {
+    "signal_only": "只產生訊號",
+    "testnet_live": "Testnet 自動交易",
+    "legacy_monitor": "舊版監控",
+}
+
+MARGIN_TYPE_LABELS = {
+    "isolated": "逐倉",
+    "cross": "全倉",
+}
+
+POSITION_DIRECTION_LABELS = {
+    "LONG": "做多",
+    "SHORT": "做空",
+    "FLAT": "空倉",
+}
+
 
 def format_symbol_report(
     symbol: str,
@@ -114,7 +131,7 @@ def format_testnet_dashboard(
 ) -> str:
     """Format the testnet trader status dashboard."""
     now = datetime.now(timezone.utc).strftime("%Y/%m/%d %H:%M UTC")
-    mode = escape(settings.trading_mode)
+    mode = escape(MODE_LABELS.get(settings.trading_mode, settings.trading_mode))
     strategy = escape(settings.testnet_strategy_label)
     env = "TESTNET" if settings.binance_testnet else "MAINNET"
     env_icon = "🧪" if settings.binance_testnet else "⚠️"
@@ -126,19 +143,19 @@ def format_testnet_dashboard(
         f"交易對: <code>{escape(','.join(settings.symbols_list))}</code>",
         f"策略資金上限: ${settings.testnet_equity_usdc:.2f} USDC",
         f"日目標: {settings.testnet_daily_target_pct:.2f}%",
-        f"Trend aggressive scale: {settings.trend_aggressive_scale:.2f}",
+        f"趨勢激進倍率: {settings.trend_aggressive_scale:.2f}",
         f"最大有效槓桿: {settings.max_effective_leverage:.1f}x",
-        f"Soft / Hard daily loss: {settings.daily_soft_loss_pct:.1f}% / {settings.max_daily_loss_pct:.1f}%",
+        f"單日軟停損 / 硬停損: {settings.daily_soft_loss_pct:.1f}% / {settings.max_daily_loss_pct:.1f}%",
         "",
         "━━ 帳戶 ━━",
-        f"Wallet: ${account.total_wallet_balance:.4f}",
-        f"Margin balance: ${account.total_margin_balance:.4f}",
-        f"Available: ${account.available_balance:.4f}",
-        f"Unrealized PnL: ${account.total_unrealized_profit:.4f}",
+        f"錢包餘額: ${account.total_wallet_balance:.4f}",
+        f"保證金餘額: ${account.total_margin_balance:.4f}",
+        f"可用餘額: ${account.available_balance:.4f}",
+        f"未實現損益: ${account.total_unrealized_profit:.4f}",
     ]
 
     if account.margin_ratio is not None:
-        lines.append(f"Margin ratio: {account.margin_ratio * 100:.2f}%")
+        lines.append(f"保證金率: {account.margin_ratio * 100:.2f}%")
     lines.append("")
 
     total_realized = 0.0
@@ -162,27 +179,98 @@ def format_testnet_dashboard(
 
         lines.append(f"━━ {escape(symbol)} ━━")
         if pos:
-            lines.append(f"持倉: {pos.position_direction} {abs(pos.position_amt):.6f} @ ${pos.entry_price:,.2f}")
-            lines.append(f"Mark: ${pos.mark_price:,.2f} | U-PnL: ${pos.unrealized_pnl:.4f}")
-            lines.append(f"Leverage: {pos.leverage}x | Margin: {escape(pos.margin_type)}")
+            side = POSITION_DIRECTION_LABELS.get(pos.position_direction, pos.position_direction)
+            margin_type = MARGIN_TYPE_LABELS.get(pos.margin_type, pos.margin_type)
+            lines.append(f"持倉: {side} {abs(pos.position_amt):.6f} @ ${pos.entry_price:,.2f}")
+            lines.append(f"標記價: ${pos.mark_price:,.2f} | 未實現損益: ${pos.unrealized_pnl:.4f}")
+            lines.append(f"槓桿: {pos.leverage}x | 保證金模式: {escape(margin_type)}")
             if pos.distance_to_liquidation_pct is not None:
                 lines.append(f"距清算: {pos.distance_to_liquidation_pct:.2f}%")
         else:
             lines.append("持倉: 無")
-        lines.append(f"Open orders: {len(orders)}")
-        lines.append(f"今日 realized / fee / funding: ${realized:.4f} / ${commission:.4f} / ${funding:.4f}")
+        lines.append(f"未成交掛單: {len(orders)}")
+        lines.append(f"今日 已實現 / 手續費 / Funding: ${realized:.4f} / ${commission:.4f} / ${funding:.4f}")
         if maker is not None and taker is not None:
-            lines.append(f"Fee rate maker/taker: {maker * 100:.4f}% / {taker * 100:.4f}%")
+            lines.append(f"費率 Maker / Taker: {maker * 100:.4f}% / {taker * 100:.4f}%")
         lines.append("")
 
     net_today = total_realized + total_commission + total_funding
     lines.append("━━ 今日合計 ━━")
-    lines.append(f"Realized PnL: ${total_realized:.4f}")
-    lines.append(f"Commission: ${total_commission:.4f}")
+    lines.append(f"已實現損益: ${total_realized:.4f}")
+    lines.append(f"手續費: ${total_commission:.4f}")
     lines.append(f"Funding: ${total_funding:.4f}")
-    lines.append(f"<b>Net: ${net_today:.4f}</b>")
+    lines.append(f"<b>今日淨損益: ${net_today:.4f}</b>")
     lines.append("")
     lines.append("<i>此報告只做 testnet 監控，不代表下單指令。</i>")
+    return "\n".join(lines)
+
+
+def format_testnet_daily_report(
+    settings: Settings,
+    positions: dict[str, PositionInfo | None],
+    open_algo_orders: dict[str, list[dict]],
+    today_income: dict[str, list[IncomeRecord]],
+    report_timezone: str,
+) -> str:
+    """Format the scheduled daily testnet P&L report."""
+    now = datetime.now(timezone.utc)
+    total_realized = 0.0
+    total_commission = 0.0
+    total_funding = 0.0
+    total_unrealized = 0.0
+
+    lines = [
+        f"📊 <b>Testnet 每日獲利匯報</b> — {now.strftime('%Y/%m/%d %H:%M UTC')}",
+        f"統計日界線: <b>{escape(report_timezone)}</b>",
+        f"策略: <b>{escape(settings.testnet_strategy_label)}</b>",
+        f"策略資金上限: ${settings.testnet_equity_usdc:.2f} USDC",
+        f"日目標: {settings.testnet_daily_target_pct:.2f}% (${settings.testnet_equity_usdc * settings.testnet_daily_target_pct / 100:.4f})",
+        "",
+    ]
+
+    for symbol in settings.symbols_list:
+        symbol_income = today_income.get(symbol, [])
+        realized = sum(r.income for r in symbol_income if r.income_type == "REALIZED_PNL")
+        commission = sum(r.income for r in symbol_income if r.income_type == "COMMISSION")
+        funding = sum(r.income for r in symbol_income if r.income_type == "FUNDING_FEE")
+        net_realized = realized + commission + funding
+        pos = positions.get(symbol)
+        unrealized = pos.unrealized_pnl if pos else 0.0
+        algo_orders = open_algo_orders.get(symbol, [])
+
+        total_realized += realized
+        total_commission += commission
+        total_funding += funding
+        total_unrealized += unrealized
+
+        lines.append(f"━━ {escape(symbol)} ━━")
+        lines.append(f"已實現 / 手續費 / Funding: ${realized:.4f} / ${commission:.4f} / ${funding:.4f}")
+        lines.append(f"已實現淨額: ${net_realized:.4f}")
+        if pos:
+            side = POSITION_DIRECTION_LABELS.get(pos.position_direction, pos.position_direction)
+            lines.append(f"持倉: {side} {abs(pos.position_amt):.6f} @ ${pos.entry_price:,.2f}")
+            lines.append(f"標記價: ${pos.mark_price:,.2f} | 未實現: ${unrealized:.4f}")
+        else:
+            lines.append("持倉: 無")
+        lines.append(f"交易所保護單: {len(algo_orders)}")
+        lines.append("")
+
+    net_today = total_realized + total_commission + total_funding
+    combined = net_today + total_unrealized
+    target = settings.testnet_equity_usdc * settings.testnet_daily_target_pct / 100
+    target_progress = (combined / target * 100) if target else 0.0
+    emoji = "🟢" if combined >= 0 else "🔴"
+
+    lines.append("━━ 今日合計 ━━")
+    lines.append(f"已實現損益: ${total_realized:.4f}")
+    lines.append(f"手續費: ${total_commission:.4f}")
+    lines.append(f"Funding: ${total_funding:.4f}")
+    lines.append(f"已實現淨額: ${net_today:.4f}")
+    lines.append(f"未實現損益: ${total_unrealized:.4f}")
+    lines.append(f"{emoji} <b>含未實現合計: ${combined:.4f}</b>")
+    lines.append(f"目標進度: {target_progress:.1f}%")
+    lines.append("")
+    lines.append("<i>每日 21:00 台灣時間自動發送；此報告只做 testnet 監控。</i>")
     return "\n".join(lines)
 
 

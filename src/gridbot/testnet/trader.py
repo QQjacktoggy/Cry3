@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass
+from decimal import Decimal, ROUND_HALF_UP
 
 from config.settings import Settings
 from src.gridbot.binance.client import BinanceFuturesClient
@@ -109,7 +110,15 @@ class TestnetTrader:
 
     async def _quantity_for_position(self, symbol: str, position: PositionInfo) -> str:
         step_size = await self._quantity_step(symbol)
-        return _format_step_quantity(abs(position.position_amt), step_size)
+        qty = Decimal(str(abs(position.position_amt)))
+        step = Decimal(str(step_size))
+        if qty <= 0 or step <= 0:
+            raise ValueError("position quantity and step_size must be positive.")
+        rounded = qty.quantize(step, rounding=ROUND_HALF_UP)
+        if rounded <= 0:
+            raise ValueError("Position quantity is below symbol minimum step size.")
+        decimals = max(0, min(12, _decimal_places(step_size)))
+        return f"{rounded:.{decimals}f}".rstrip("0").rstrip(".")
 
     async def _quantity_step(self, symbol: str) -> float:
         info = await self._client.get_exchange_info()

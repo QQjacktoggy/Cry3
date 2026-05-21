@@ -102,7 +102,44 @@ async def test_close_position_uses_reduce_only_opposite_side():
 
 
 @pytest.mark.asyncio
+async def test_close_position_preserves_exact_step_quantity():
+    client = FakeClient()
+    client.position = PositionInfo(
+        symbol="ETHUSDC",
+        position_amt=0.071,
+        entry_price=2000,
+        mark_price=2010,
+        unrealized_pnl=0.1,
+        liquidation_price=1500,
+        leverage=5,
+        margin_type="isolated",
+    )
+    trader = TestnetTrader(_settings(trading_mode="signal_only"), client)
+
+    result = await trader.close_position("ETHUSDC")
+
+    assert result.quantity == "0.071"
+    assert client.orders[0]["quantity"] == "0.071"
+
+
+@pytest.mark.asyncio
 async def test_close_position_returns_none_when_flat():
     trader = TestnetTrader(_settings(), FakeClient())
 
     assert await trader.close_position("ETHUSDC") is None
+
+
+def test_position_info_from_api_defaults_missing_leverage():
+    position = PositionInfo.from_api(
+        {
+            "symbol": "ETHUSDC",
+            "positionAmt": "0.1",
+            "entryPrice": "2000",
+            "markPrice": "2010",
+            "unRealizedProfit": "1.5",
+            "marginType": "isolated",
+        }
+    )
+
+    assert position.leverage == 1
+    assert position.unrealized_pnl == 1.5

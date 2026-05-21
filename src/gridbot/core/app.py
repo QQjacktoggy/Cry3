@@ -4,6 +4,8 @@ Handles initialization, scheduled tasks, and graceful shutdown.
 """
 
 from config.settings import Settings
+from datetime import datetime, time, timezone
+from zoneinfo import ZoneInfo
 from src.gridbot.ai.gemini import GeminiAnalyzer
 from src.gridbot.binance.client import BinanceFuturesClient
 from src.gridbot.binance.fetcher import BinanceFetcher
@@ -22,7 +24,11 @@ from src.gridbot.storage.repositories import (
     RecommendationRepository,
 )
 from src.gridbot.telegram.bot import build_telegram_app
-from src.gridbot.telegram.formatters import format_full_report, format_recommendation
+from src.gridbot.telegram.formatters import (
+    format_full_report,
+    format_recommendation,
+    format_testnet_daily_report,
+)
 from src.gridbot.testnet.auto_trader import TestnetAutoTrader
 from src.gridbot.utils.logging import get_logger
 
@@ -377,6 +383,52 @@ class App:
         except Exception as exc:
             logger.error("telegram_report_failed", error=str(exc))
 
+    async def send_testnet_daily_report(self) -> None:
+        """Send scheduled daily testnet P&L report via Telegram."""
+        if not self.telegram_app or not self.settings.telegram_chat_id_int:
+            logger.info("testnet_daily_report_skipped", reason="telegram_not_configured")
+            return
+        try:
+            report_tz = ZoneInfo(self.settings.testnet_daily_report_timezone)
+            local_today = datetime.now(report_tz).date()
+            day_start = datetime.combine(local_today, time.min, tzinfo=report_tz)
+            day_start_ms = int(day_start.astimezone(timezone.utc).timestamp() * 1000)
+
+            positions: dict[str, PositionInfo | None] = {}
+            open_algo_orders: dict[str, list[dict]] = {}
+            today_income: dict[str, list[IncomeRecord]] = {}
+
+            for symbol in self.settings.symbols_list:
+                positions[symbol] = await self.binance.get_position(symbol)
+                open_algo_orders[symbol] = await self.binance.get_open_algo_orders(symbol)
+                records: list[IncomeRecord] = []
+                for income_type in ("REALIZED_PNL", "COMMISSION", "FUNDING_FEE"):
+                    records.extend(
+                        await self.binance.get_income_history(
+                            income_type=income_type,
+                            symbol=symbol,
+                            start_time=day_start_ms,
+                            limit=1000,
+                        )
+                    )
+                today_income[symbol] = records
+
+            report = format_testnet_daily_report(
+                settings=self.settings,
+                positions=positions,
+                open_algo_orders=open_algo_orders,
+                today_income=today_income,
+                report_timezone=self.settings.testnet_daily_report_timezone,
+            )
+            await self.telegram_app.bot.send_message(
+                chat_id=self.settings.telegram_chat_id_int,
+                text=report,
+                parse_mode="HTML",
+            )
+            logger.info("testnet_daily_report_sent", timezone=self.settings.testnet_daily_report_timezone)
+        except Exception as exc:
+            logger.error("testnet_daily_report_failed", error=str(exc))
+
     def start(self) -> None:
         """Start the application with Telegram bot and scheduler."""
         import asyncio
@@ -415,9 +467,20 @@ class App:
                 )
             if self.settings.trading_mode == "testnet_live":
                 self.scheduler.add_testnet_trade_job(
-                    self.testnet_auto_trader.run_cycle,
+                    self.testnet_auto_trader.run_entry_cycle,
                     interval_minutes=self.settings.testnet_auto_trade_interval_minutes,
                 )
+                self.scheduler.add_testnet_manage_job(
+                    self.testnet_auto_trader.run_manage_cycle,
+                    interval_seconds=self.settings.testnet_manage_interval_seconds,
+                )
+                if self.settings.testnet_daily_report_enabled:
+                    self.scheduler.add_testnet_daily_report_job(
+                        self.send_testnet_daily_report,
+                        hour=self.settings.testnet_daily_report_hour,
+                        minute=self.settings.testnet_daily_report_minute,
+                        timezone=self.settings.testnet_daily_report_timezone,
+                    )
             self.scheduler.start()
 
             # Run initial fetch

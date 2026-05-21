@@ -5,6 +5,8 @@ and aiohttp with HMAC signing for SAPI fallback (if ever needed).
 All endpoints verified against live Binance API (2026-05-02).
 """
 
+from decimal import Decimal, ROUND_HALF_UP
+
 from binance import AsyncClient, BinanceAPIException
 
 from config.settings import Settings
@@ -30,12 +32,22 @@ def is_grid_order(client_order_id: str) -> bool:
     return client_order_id.startswith(GRID_ORDER_PREFIX)
 
 
+def _format_tick_price(price: float, tick_size: Decimal) -> str:
+    if tick_size <= 0:
+        return f"{price:.4f}"
+    raw = Decimal(str(price))
+    ticks = (raw / tick_size).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    quantized = ticks * tick_size
+    return format(quantized.normalize(), "f")
+
+
 class BinanceFuturesClient:
     """Async client for Binance USD-M Futures API (FAPI endpoints)."""
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._client: AsyncClient | None = None
+        self._price_tick_sizes: dict[str, Decimal] = {}
 
     async def connect(self) -> None:
         self._client = await AsyncClient.create(
@@ -137,6 +149,50 @@ class BinanceFuturesClient:
         return await self.client.futures_create_order(**params)
 
     @async_retry(max_attempts=3, base_delay=2.0, exceptions=(BinanceAPIException, Exception))
+    async def create_conditional_close_order(
+        self,
+        symbol: str,
+        side: str,
+        order_type: str,
+        trigger_price: float,
+        quantity: str | None = None,
+        client_algo_id: str | None = None,
+        working_type: str = "MARK_PRICE",
+    ) -> dict:
+        """POST /fapi/v1/order — close-position conditional order."""
+        tick_size = await self._price_tick_size(symbol)
+        params = {
+            "symbol": symbol,
+            "side": side,
+            "type": order_type,
+            "stopPrice": _format_tick_price(trigger_price, tick_size),
+            "workingType": working_type,
+            "priceProtect": "TRUE",
+        }
+        if quantity:
+            params["quantity"] = quantity
+            params["reduceOnly"] = "true"
+        else:
+            params["closePosition"] = "true"
+        if client_algo_id:
+            params["clientAlgoId"] = client_algo_id
+        return await self.client.futures_create_order(**params)
+
+    async def _price_tick_size(self, symbol: str) -> Decimal:
+        if symbol in self._price_tick_sizes:
+            return self._price_tick_sizes[symbol]
+        info = await self.get_exchange_info()
+        for item in info.get("symbols", []):
+            if item.get("symbol") != symbol:
+                continue
+            for flt in item.get("filters", []):
+                if flt.get("filterType") == "PRICE_FILTER":
+                    tick_size = Decimal(str(flt.get("tickSize", "0.0001")))
+                    self._price_tick_sizes[symbol] = tick_size
+                    return tick_size
+        return Decimal("0.0001")
+
+    @async_retry(max_attempts=3, base_delay=2.0, exceptions=(BinanceAPIException, Exception))
     async def get_user_trades(
         self,
         symbol: str,
@@ -171,6 +227,37 @@ class BinanceFuturesClient:
     async def get_open_orders(self, symbol: str) -> list[dict]:
         """GET /fapi/v1/openOrders — currently open orders."""
         return await self.client.futures_get_open_orders(symbol=symbol)
+
+    @async_retry(max_attempts=3, base_delay=2.0, exceptions=(BinanceAPIException, Exception))
+    async def cancel_order(self, symbol: str, order_id: int) -> dict:
+        """DELETE /fapi/v1/order — cancel one open order."""
+        return await self.client.futures_cancel_order(symbol=symbol, orderId=order_id)
+
+    @async_retry(max_attempts=3, base_delay=2.0, exceptions=(BinanceAPIException, Exception))
+    async def get_open_algo_orders(self, symbol: str) -> list[dict]:
+        """GET /fapi/v1/openAlgoOrders — currently open algo/conditional orders."""
+        return await self.client.futures_get_open_algo_orders(symbol=symbol)
+
+    @async_retry(max_attempts=3, base_delay=2.0, exceptions=(BinanceAPIException, Exception))
+    async def cancel_algo_order(
+        self,
+        symbol: str,
+        algo_id: int | None = None,
+        client_algo_id: str | None = None,
+    ) -> dict:
+        """Cancel one conditional close order."""
+        params: dict = {"symbol": symbol}
+        if algo_id is not None:
+            params["algoId"] = algo_id
+        if client_algo_id:
+            params["clientAlgoId"] = client_algo_id
+        try:
+            return await self.client.futures_cancel_algo_order(**params)
+        except BinanceAPIException as exc:
+            if exc.code == -2011:
+                logger.info("algo_order_already_closed", symbol=symbol, algo_id=algo_id, client_algo_id=client_algo_id)
+                return {"symbol": symbol, "status": "ALREADY_CLOSED", **params}
+            raise
 
     # ── Income History ───────────────────────────────────────────────
 
