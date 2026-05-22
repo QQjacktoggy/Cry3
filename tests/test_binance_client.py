@@ -69,3 +69,25 @@ async def test_cancel_algo_order_treats_unknown_order_as_already_closed():
 
     assert fake.cancel_params == {"symbol": "ETHUSDC", "algoId": 123}
     assert result["status"] == "ALREADY_CLOSED"
+
+
+@pytest.mark.asyncio
+async def test_reduce_only_limit_order_uses_tick_price_and_client_id():
+    client = BinanceFuturesClient(Settings(binance_api_key="key", binance_api_secret="secret"))
+    fake = FakeAsyncBinanceClient()
+    client._client = fake
+
+    result = await client.create_reduce_only_limit_order(
+        symbol="ETHUSDC",
+        side="SELL",
+        quantity="0.069",
+        price=2135.116,
+        client_order_id="cry3tp_test",
+    )
+
+    assert result["type"] == "LIMIT"
+    assert result["timeInForce"] == "GTC"
+    assert result["quantity"] == "0.069"
+    assert result["price"] == "2135.12"
+    assert result["reduceOnly"] == "true"
+    assert result["newClientOrderId"] == "cry3tp_test"

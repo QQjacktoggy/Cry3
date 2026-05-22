@@ -14,10 +14,12 @@ class FakeClient:
         self.leverage_calls = []
         self.position = None
         self.open_orders = []
+        self.open_algo_orders = []
         self.all_orders = []
         self.income_history = []
         self.cancelled_orders = []
         self.conditional_orders = []
+        self.limit_orders = []
 
     async def get_position(self, symbol):
         return self.position
@@ -75,12 +77,12 @@ class FakeClient:
         return {"symbol": symbol, "orderId": order_id, "status": "CANCELED"}
 
     async def get_open_algo_orders(self, symbol):
-        return list(self.open_orders)
+        return list(self.open_algo_orders)
 
     async def cancel_algo_order(self, symbol, algo_id=None, client_algo_id=None):
         self.cancelled_orders.append((symbol, algo_id or client_algo_id))
-        self.open_orders = [
-            o for o in self.open_orders
+        self.open_algo_orders = [
+            o for o in self.open_algo_orders
             if o.get("algoId") != algo_id
             and o.get("orderId") != algo_id
             and o.get("clientAlgoId") != client_algo_id
@@ -94,6 +96,14 @@ class FakeClient:
         if "client_algo_id" in kwargs:
             order["clientAlgoId"] = kwargs["client_algo_id"]
             order["clientOrderId"] = kwargs["client_algo_id"]
+        self.open_algo_orders.append(order)
+        return order
+
+    async def create_reduce_only_limit_order(self, **kwargs):
+        self.limit_orders.append(kwargs)
+        order = {"orderId": 700 + len(self.limit_orders), "status": "NEW", "type": "LIMIT", **kwargs}
+        if "client_order_id" in kwargs:
+            order["clientOrderId"] = kwargs["client_order_id"]
         self.open_orders.append(order)
         return order
 
@@ -175,7 +185,8 @@ async def test_auto_trader_opens_and_notifies(monkeypatch):
     assert "方向：<b>買入 / 回補</b>" in telegram.bot.messages[0]["text"]
     assert "趨勢判定：<b>上升趨勢</b> | 風險模式：<b>積極</b>" in telegram.bot.messages[0]["text"]
     assert "資金配置：<b>趨勢強攻</b> (啟用) x3.50" in telegram.bot.messages[0]["text"]
-    assert len(client.conditional_orders) == 2
+    assert len(client.conditional_orders) == 1
+    assert len(client.limit_orders) == 1
 
 
 @pytest.mark.asyncio
@@ -346,7 +357,8 @@ async def test_auto_trader_opens_short_from_router_signal(monkeypatch):
     assert client.leverage_calls == [("ETHUSDC", 8)]
     assert client.orders[0]["side"] == "SELL"
     assert client.orders[0]["reduce_only"] is False
-    assert len(client.conditional_orders) == 2
+    assert len(client.conditional_orders) == 1
+    assert len(client.limit_orders) == 1
 
 
 @pytest.mark.asyncio
@@ -549,9 +561,11 @@ async def test_auto_trader_daily_loss_stop_closes_with_plan_notification():
 @pytest.mark.asyncio
 async def test_manage_cycle_cleans_stale_protection_orders_when_flat():
     client = FakeClient()
-    client.open_orders = [
+    client.open_algo_orders = [
         {"algoId": 901, "clientAlgoId": "cry3sl_1"},
-        {"algoId": 902, "clientAlgoId": "cry3tp_1"},
+    ]
+    client.open_orders = [
+        {"orderId": 902, "clientOrderId": "cry3tp_1"},
     ]
     trader = TestnetAutoTrader(_settings(), client, FakeTelegramApp())
 
@@ -573,7 +587,7 @@ async def test_manage_cycle_replaces_mismatched_protection_order():
         leverage=10,
         margin_type="isolated",
     )
-    client.open_orders = [
+    client.open_algo_orders = [
         {
             "orderId": 801,
             "clientOrderId": "cry3sl_old",
@@ -581,12 +595,14 @@ async def test_manage_cycle_replaces_mismatched_protection_order():
             "orderType": "STOP_MARKET",
             "stopPrice": "2060",
         },
+    ]
+    client.open_orders = [
         {
             "orderId": 802,
             "clientOrderId": "cry3tp_ok",
             "side": "SELL",
-            "orderType": "TAKE_PROFIT_MARKET",
-            "stopPrice": "2130",
+            "orderType": "LIMIT",
+            "price": "2130",
         },
     ]
     trader = TestnetAutoTrader(_settings(), client, FakeTelegramApp())
@@ -613,6 +629,7 @@ async def test_manage_cycle_replaces_mismatched_protection_order():
 
     assert client.cancelled_orders == [("ETHUSDC", 801)]
     assert len(client.conditional_orders) == 1
+    assert client.limit_orders == []
     assert client.conditional_orders[0]["order_type"] == "STOP_MARKET"
     assert client.conditional_orders[0]["trigger_price"] == 2070
 
@@ -685,4 +702,5 @@ async def test_manage_cycle_recovers_plan_for_existing_position(monkeypatch):
     assert plan.opened_at_ms == entry_time_ms
     assert plan.strategy == "orb_short"
     assert "已重新接管既有持倉" in telegram.bot.messages[0]["text"]
-    assert len(client.conditional_orders) == 2
+    assert len(client.conditional_orders) == 1
+    assert len(client.limit_orders) == 1

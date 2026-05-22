@@ -178,6 +178,30 @@ class BinanceFuturesClient:
             params["clientAlgoId"] = client_algo_id
         return await self.client.futures_create_order(**params)
 
+    @async_retry(max_attempts=3, base_delay=2.0, exceptions=(BinanceAPIException, Exception))
+    async def create_reduce_only_limit_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: float | str,
+        price: float,
+        client_order_id: str | None = None,
+    ) -> dict:
+        """POST /fapi/v1/order — reduce-only limit order."""
+        tick_size = await self._price_tick_size(symbol)
+        params = {
+            "symbol": symbol,
+            "side": side,
+            "type": "LIMIT",
+            "timeInForce": "GTC",
+            "quantity": quantity,
+            "price": _format_tick_price(price, tick_size),
+            "reduceOnly": "true",
+        }
+        if client_order_id:
+            params["newClientOrderId"] = client_order_id
+        return await self.client.futures_create_order(**params)
+
     async def _price_tick_size(self, symbol: str) -> Decimal:
         if symbol in self._price_tick_sizes:
             return self._price_tick_sizes[symbol]

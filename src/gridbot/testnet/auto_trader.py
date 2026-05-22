@@ -214,7 +214,13 @@ class TestnetAutoTrader:
             await self._manage_position(symbol, position, today_net)
             return
 
-        await self._cleanup_stale_protection_orders(symbol)
+        plan = self._plans.pop(symbol, None)
+        if plan is not None:
+            exit_order = await self._recent_exit_order(symbol, plan)
+            await self._cleanup_stale_protection_orders(symbol)
+            await self._notify_exchange_exit(symbol, plan, exit_order, today_net=today_net)
+        else:
+            await self._cleanup_stale_protection_orders(symbol)
 
         if not allow_new_entries:
             return
@@ -512,24 +518,31 @@ class TestnetAutoTrader:
     async def _sync_protection_orders(self, symbol: str, plan: ActivePlan, quantity: str | None = None) -> None:
         if not self._settings.testnet_exchange_protection_enabled:
             return
-        open_orders = await self._client.get_open_algo_orders(symbol)
+        open_algo_orders = await self._client.get_open_algo_orders(symbol)
+        open_orders = await self._client.get_open_orders(symbol)
         has_stop = False
         has_tp = False
         exit_side = "BUY" if plan.side == "short" else "SELL"
-        for order in open_orders:
+        for order in open_algo_orders:
             client_order_id = self._protection_client_order_id(order)
             stop_matches = self._protection_order_matches(order, exit_side, "STOP_MARKET", plan.stop_loss)
-            tp_matches = self._protection_order_matches(order, exit_side, "TAKE_PROFIT_MARKET", plan.take_profit)
             if client_order_id.startswith(STOP_ORDER_PREFIX) or stop_matches:
                 if self._protection_order_matches(order, exit_side, "STOP_MARKET", plan.stop_loss):
                     has_stop = True
                 elif client_order_id.startswith(STOP_ORDER_PREFIX):
                     await self._cancel_algo_order(symbol, order)
-            elif client_order_id.startswith(TAKE_PROFIT_ORDER_PREFIX) or tp_matches:
+            elif client_order_id.startswith(TAKE_PROFIT_ORDER_PREFIX):
+                await self._cancel_algo_order(symbol, order)
+        for order in open_orders:
+            client_order_id = self._protection_client_order_id(order)
+            tp_matches = self._limit_order_matches(order, exit_side, plan.take_profit)
+            if client_order_id.startswith(TAKE_PROFIT_ORDER_PREFIX) or tp_matches:
                 if tp_matches:
                     has_tp = True
                 elif client_order_id.startswith(TAKE_PROFIT_ORDER_PREFIX):
-                    await self._cancel_algo_order(symbol, order)
+                    await self._cancel_plain_order(symbol, order)
+            elif client_order_id.startswith(STOP_ORDER_PREFIX):
+                await self._cancel_plain_order(symbol, order)
 
         if not has_stop:
             await self._client.create_conditional_close_order(
@@ -541,18 +554,20 @@ class TestnetAutoTrader:
                 client_algo_id=f"{STOP_ORDER_PREFIX}{self._now_ms()}",
             )
         if not has_tp:
-            await self._client.create_conditional_close_order(
+            if not quantity:
+                logger.warning("testnet_tp_limit_missing_quantity", symbol=symbol, strategy=plan.strategy)
+                return
+            await self._client.create_reduce_only_limit_order(
                 symbol=symbol,
                 side=exit_side,
-                order_type="TAKE_PROFIT_MARKET",
-                trigger_price=plan.take_profit,
                 quantity=quantity,
-                client_algo_id=f"{TAKE_PROFIT_ORDER_PREFIX}{self._now_ms()}",
+                price=plan.take_profit,
+                client_order_id=f"{TAKE_PROFIT_ORDER_PREFIX}{self._now_ms()}",
             )
 
     async def _cleanup_stale_protection_orders(self, symbol: str) -> None:
-        open_orders = await self._client.get_open_algo_orders(symbol)
-        for order in open_orders:
+        open_algo_orders = await self._client.get_open_algo_orders(symbol)
+        for order in open_algo_orders:
             client_order_id = self._protection_client_order_id(order)
             if not (
                 client_order_id.startswith(STOP_ORDER_PREFIX)
@@ -560,6 +575,15 @@ class TestnetAutoTrader:
             ):
                 continue
             await self._cancel_algo_order(symbol, order)
+        open_orders = await self._client.get_open_orders(symbol)
+        for order in open_orders:
+            client_order_id = self._protection_client_order_id(order)
+            if not (
+                client_order_id.startswith(STOP_ORDER_PREFIX)
+                or client_order_id.startswith(TAKE_PROFIT_ORDER_PREFIX)
+            ):
+                continue
+            await self._cancel_plain_order(symbol, order)
 
     async def _cancel_algo_order(self, symbol: str, order: dict) -> None:
         algo_id = order.get("algoId")
@@ -573,6 +597,11 @@ class TestnetAutoTrader:
             client_algo_id = order.get("clientOrderId")
         if client_algo_id:
             await self._client.cancel_algo_order(symbol, client_algo_id=str(client_algo_id))
+
+    async def _cancel_plain_order(self, symbol: str, order: dict) -> None:
+        order_id = order.get("orderId")
+        if order_id is not None:
+            await self._client.cancel_order(symbol, order_id=int(order_id))
 
     @staticmethod
     def _protection_client_order_id(order: dict) -> str:
@@ -599,6 +628,23 @@ class TestnetAutoTrader:
         if trigger_price is None:
             return False
         return abs(trigger_price - expected_trigger_price) <= 0.0001
+
+    def _limit_order_matches(
+        self,
+        order: dict,
+        expected_side: str,
+        expected_price: float,
+    ) -> bool:
+        side = self._order_value(order, "side")
+        order_type = self._order_value(order, "orderType", "type", "origType", "order_type")
+        price = self._order_float(order, "price", "stopPrice", "triggerPrice")
+        if side is None or str(side).upper() != expected_side:
+            return False
+        if order_type is None or str(order_type).upper() != "LIMIT":
+            return False
+        if price is None:
+            return False
+        return abs(price - expected_price) <= 0.0001
 
     @staticmethod
     def _order_value(order: dict, *keys: str):
@@ -677,6 +723,29 @@ class TestnetAutoTrader:
             score=signal.score,
             reasons=[f"strategy={decision.strategy}"] + signal.reasons,
         )
+
+    async def _recent_exit_order(self, symbol: str, plan: ActivePlan) -> dict | None:
+        exit_side = "BUY" if plan.side == "short" else "SELL"
+        candidates = []
+        for order in await self._client.get_all_orders(symbol, limit=100):
+            client_order_id = self._protection_client_order_id(order)
+            if not (
+                client_order_id.startswith(STOP_ORDER_PREFIX)
+                or client_order_id.startswith(TAKE_PROFIT_ORDER_PREFIX)
+                or client_order_id.startswith("cry3close_")
+            ):
+                continue
+            if str(order.get("status", "")).upper() != "FILLED":
+                continue
+            if str(order.get("side", "")).upper() != exit_side:
+                continue
+            order_time = self._order_time_ms(order) or 0
+            if order_time and order_time < plan.opened_at_ms - 1_000:
+                continue
+            candidates.append((order_time, order))
+        if not candidates:
+            return None
+        return max(candidates, key=lambda item: item[0])[1]
 
     def _exit_reason(self, plan: ActivePlan, price: float) -> str | None:
         max_hold_ms = plan.max_holding_bars * self._interval_ms()
@@ -788,6 +857,64 @@ class TestnetAutoTrader:
             f"標記價：${position.mark_price:.4f} | 未實現損益：${position.unrealized_pnl:.4f}\n"
             f"平倉前今日淨損益：${today_net:.4f}\n"
             f"訂單 ID：<code>{escape(str(result.order.get('orderId', 'N/A')))}</code>"
+        )
+
+    async def _notify_exchange_exit(
+        self,
+        symbol: str,
+        plan: ActivePlan,
+        exit_order: dict | None,
+        today_net: float,
+    ) -> None:
+        client_order_id = self._protection_client_order_id(exit_order or {})
+        reason = "交易所端已無持倉"
+        if client_order_id.startswith(TAKE_PROFIT_ORDER_PREFIX):
+            reason = "交易所停利單成交"
+        elif client_order_id.startswith(STOP_ORDER_PREFIX):
+            reason = "交易所停損單成交"
+        elif client_order_id.startswith("cry3close_"):
+            reason = "市價平倉單成交"
+
+        avg_price = self._order_float(exit_order or {}, "avgPrice", "price")
+        qty = self._order_float(exit_order or {}, "executedQty", "origQty")
+        gross_pnl = None
+        if avg_price is not None and qty is not None:
+            if plan.side == "short":
+                gross_pnl = (plan.entry_price - avg_price) * qty
+            else:
+                gross_pnl = (avg_price - plan.entry_price) * qty
+
+        logger.info(
+            "testnet_exchange_position_closed",
+            symbol=symbol,
+            reason=reason,
+            client_order_id=client_order_id,
+            strategy=plan.strategy,
+            side=plan.side,
+            entry_price=plan.entry_price,
+            exit_price=avg_price,
+            quantity=qty,
+            gross_pnl=gross_pnl,
+            today_net=today_net,
+            order_id=(exit_order or {}).get("orderId"),
+        )
+        exit_line = (
+            f"進場：${plan.entry_price:.4f} | 出場：${avg_price:.4f}\n"
+            if avg_price is not None
+            else f"進場：${plan.entry_price:.4f} | 出場：未知\n"
+        )
+        gross_line = f"粗估損益：${gross_pnl:.4f}（未扣手續費）\n" if gross_pnl is not None else ""
+        await self._notify_text(
+            "🏁 <b>Testnet 交易所平倉</b>\n"
+            f"原因：{escape(reason)}\n"
+            f"交易對：<code>{escape(symbol)}</code>\n"
+            f"方向：<b>{escape(_label_side(plan.side))}</b>\n"
+            f"策略：<b>{escape(plan.strategy)}</b>\n"
+            f"{exit_line}"
+            f"{gross_line}"
+            f"停損：${plan.stop_loss:.4f} | TP1：${plan.take_profit:.4f}\n"
+            f"目前今日淨損益：${today_net:.4f}\n"
+            f"訂單 ID：<code>{escape(str((exit_order or {}).get('orderId', 'N/A')))}</code>"
         )
 
     async def _notify_text(self, text: str) -> None:
