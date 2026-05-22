@@ -253,6 +253,25 @@ class TestnetAutoTrader:
         notional = self._bounded_signal_notional(signal)
         leverage = self._bounded_signal_leverage(signal)
         direction = "short" if signal.action == "PLAN_SHORT" else "long"
+        reward_pct = self._planned_reward_pct(signal, direction)
+        if reward_pct < self._settings.testnet_min_reward_pct:
+            logger.info(
+                "testnet_signal_wait_fee_buffer",
+                symbol=symbol,
+                strategy=decision.strategy,
+                regime=decision.regime,
+                risk_mode=decision.risk_mode,
+                market_playbook=decision.market_playbook,
+                allocator_profile=decision.allocator_profile,
+                allocator_state=decision.allocator_state,
+                allocator_scale=decision.allocator_scale,
+                action=signal.action,
+                score=signal.score,
+                reward_pct=reward_pct,
+                min_reward_pct=self._settings.testnet_min_reward_pct,
+                reasons=signal.reasons[:3],
+            )
+            return
         result = await self._trader.open_position(symbol, direction, notional, leverage=leverage)
         executed_entry = self._executed_entry_price(result, signal)
         stop_loss, take_profit = self._live_exit_levels(signal, direction, executed_entry)
@@ -478,6 +497,17 @@ class TestnetAutoTrader:
             take_profit = executed_entry + reward_distance if reward_distance > 0 else executed_entry * 1.01
 
         return round(stop_loss, 4), round(take_profit, 4)
+
+    def _planned_reward_pct(self, signal: SignalPlan, direction: str) -> float:
+        planned_entry = float(signal.entries[0]) if signal.entries else float(signal.price)
+        planned_tp = float(signal.take_profits[0]) if signal.take_profits else 0.0
+        if planned_entry <= 0 or planned_tp <= 0:
+            return 0.0
+        if direction == "short":
+            reward_distance = planned_entry - planned_tp
+        else:
+            reward_distance = planned_tp - planned_entry
+        return max(reward_distance, 0.0) / planned_entry * 100
 
     async def _sync_protection_orders(self, symbol: str, plan: ActivePlan, quantity: str | None = None) -> None:
         if not self._settings.testnet_exchange_protection_enabled:

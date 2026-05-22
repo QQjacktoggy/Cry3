@@ -263,6 +263,48 @@ def test_executed_entry_price_ignores_zero_avg_price():
 
 
 @pytest.mark.asyncio
+async def test_auto_trader_skips_tight_reward_signal(monkeypatch):
+    client = FakeClient()
+    trader = TestnetAutoTrader(_settings(testnet_min_reward_pct=0.12), client, FakeTelegramApp())
+
+    def fake_signal(candles, base, day_pnl=0.0):
+        class FakeDecision:
+            signal = SignalPlan(
+                action="PLAN_SHORT",
+                confidence=92,
+                score=92,
+                symbol="ETHUSDC",
+                price=2126.44,
+                rsi=42,
+                atr=18,
+                support=2134,
+                vwap=2128,
+                entries=[2126.44],
+                stop_loss=2133.14,
+                take_profits=[2126.13],
+                planned_notional_usdc=150,
+                leverage_cap=8,
+                reasons=["tight target"],
+            )
+            strategy = "orb_short"
+            regime = "trend_down"
+            risk_mode = "off"
+            market_playbook = "no_trade"
+            allocator_state = "normal"
+            allocator_profile = "short"
+            allocator_scale = 0.55
+            max_holding_bars = 24
+        return FakeDecision()
+
+    monkeypatch.setattr("src.gridbot.testnet.auto_trader.generate_router_allocator_v13_trend350_live_decision", fake_signal)
+
+    await trader.run_cycle()
+
+    assert client.orders == []
+    assert client.conditional_orders == []
+
+
+@pytest.mark.asyncio
 async def test_auto_trader_opens_short_from_router_signal(monkeypatch):
     client = FakeClient()
     telegram = FakeTelegramApp()
