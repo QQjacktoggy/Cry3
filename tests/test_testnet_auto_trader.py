@@ -20,6 +20,7 @@ class FakeClient:
         self.cancelled_orders = []
         self.conditional_orders = []
         self.limit_orders = []
+        self.mark_price = 2100
 
     async def get_position(self, symbol):
         return self.position
@@ -45,7 +46,7 @@ class FakeClient:
         return rows
 
     async def get_mark_price(self, symbol):
-        return {"markPrice": "2100"}
+        return {"markPrice": str(self.mark_price)}
 
     async def get_exchange_info(self):
         return {
@@ -187,6 +188,52 @@ async def test_auto_trader_opens_and_notifies(monkeypatch):
     assert "資金配置：<b>趨勢強攻</b> (啟用) x3.50" in telegram.bot.messages[0]["text"]
     assert len(client.conditional_orders) == 1
     assert len(client.limit_orders) == 1
+
+
+@pytest.mark.asyncio
+async def test_auto_trader_skips_entry_when_mark_already_breached_exit_level(monkeypatch):
+    client = FakeClient()
+    client.mark_price = 2136.8
+    trader = TestnetAutoTrader(_settings(), client, FakeTelegramApp())
+
+    def fake_signal(candles, base, day_pnl=0.0):
+        class FakeDecision:
+            signal = SignalPlan(
+                action="PLAN_LONG",
+                confidence=82,
+                score=82,
+                symbol="ETHUSDC",
+                price=2100,
+                rsi=55,
+                atr=20,
+                support=2050,
+                vwap=2080,
+                entries=[2100],
+                stop_loss=2070,
+                take_profits=[2130],
+                planned_notional_usdc=300,
+                leverage_cap=10,
+                reasons=["stale breakout"],
+            )
+            strategy = "orb_long"
+            regime = "trend_up"
+            risk_mode = "aggressive"
+            market_playbook = "breakout"
+            allocator_state = "active"
+            allocator_profile = "trend_aggressive"
+            allocator_scale = 3.5
+            max_holding_bars = 24
+        return FakeDecision()
+
+    monkeypatch.setattr("src.gridbot.testnet.auto_trader.generate_router_allocator_v13_trend350_live_decision", fake_signal)
+
+    await trader.run_cycle()
+
+    assert client.leverage_calls == []
+    assert client.orders == []
+    assert client.conditional_orders == []
+    assert client.limit_orders == []
+    assert trader._plans == {}
 
 
 @pytest.mark.asyncio

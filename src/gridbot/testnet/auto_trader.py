@@ -278,6 +278,31 @@ class TestnetAutoTrader:
                 reasons=signal.reasons[:3],
             )
             return
+        planned_entry = self._planned_entry_price(signal)
+        planned_stop, planned_take_profit = self._live_exit_levels(signal, direction, planned_entry)
+        mark_price = await self._current_mark_price(symbol)
+        preflight_reason = self._exit_level_reason(direction, mark_price, planned_stop, planned_take_profit)
+        if preflight_reason is not None:
+            logger.info(
+                "testnet_signal_skip_entry_exit_level",
+                symbol=symbol,
+                strategy=decision.strategy,
+                regime=decision.regime,
+                risk_mode=decision.risk_mode,
+                market_playbook=decision.market_playbook,
+                allocator_profile=decision.allocator_profile,
+                allocator_state=decision.allocator_state,
+                allocator_scale=decision.allocator_scale,
+                action=signal.action,
+                score=signal.score,
+                mark=mark_price,
+                planned_entry=planned_entry,
+                stop=planned_stop,
+                take_profit=planned_take_profit,
+                reason=preflight_reason,
+                reasons=signal.reasons[:3],
+            )
+            return
         result = await self._trader.open_position(symbol, direction, notional, leverage=leverage)
         executed_entry = self._executed_entry_price(result, signal)
         stop_loss, take_profit = self._live_exit_levels(signal, direction, executed_entry)
@@ -487,7 +512,7 @@ class TestnetAutoTrader:
         return float(signal.price)
 
     def _live_exit_levels(self, signal: SignalPlan, direction: str, executed_entry: float) -> tuple[float, float]:
-        planned_entry = float(signal.entries[0]) if signal.entries else float(signal.price)
+        planned_entry = self._planned_entry_price(signal)
         planned_stop = float(signal.stop_loss) if signal.stop_loss is not None else 0.0
         planned_tp = float(signal.take_profits[0]) if signal.take_profits else 0.0
 
@@ -504,8 +529,11 @@ class TestnetAutoTrader:
 
         return round(stop_loss, 4), round(take_profit, 4)
 
+    def _planned_entry_price(self, signal: SignalPlan) -> float:
+        return float(signal.entries[0]) if signal.entries else float(signal.price)
+
     def _planned_reward_pct(self, signal: SignalPlan, direction: str) -> float:
-        planned_entry = float(signal.entries[0]) if signal.entries else float(signal.price)
+        planned_entry = self._planned_entry_price(signal)
         planned_tp = float(signal.take_profits[0]) if signal.take_profits else 0.0
         if planned_entry <= 0 or planned_tp <= 0:
             return 0.0
@@ -751,17 +779,27 @@ class TestnetAutoTrader:
         max_hold_ms = plan.max_holding_bars * self._interval_ms()
         if max_hold_ms > 0 and self._now_ms() - plan.opened_at_ms >= max_hold_ms:
             return "strategy max holding"
-        if plan.side == "short":
-            if price >= plan.stop_loss:
+        return self._exit_level_reason(plan.side, price, plan.stop_loss, plan.take_profit)
+
+    def _exit_level_reason(self, side: str, price: float, stop_loss: float, take_profit: float) -> str | None:
+        if side == "short":
+            if price >= stop_loss:
                 return "strategy stop loss"
-            if price <= plan.take_profit:
+            if price <= take_profit:
                 return "strategy take profit"
         else:
-            if price <= plan.stop_loss:
+            if price <= stop_loss:
                 return "strategy stop loss"
-            if price >= plan.take_profit:
+            if price >= take_profit:
                 return "strategy take profit"
         return None
+
+    async def _current_mark_price(self, symbol: str) -> float:
+        mark = await self._client.get_mark_price(symbol)
+        price = float(mark.get("markPrice") or 0)
+        if price <= 0:
+            raise RuntimeError(f"Invalid mark price for {symbol}.")
+        return price
 
     async def _today_net_pnl(self, symbol: str) -> float:
         day_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
