@@ -165,7 +165,7 @@ class BinanceFuturesClient:
             "symbol": symbol,
             "side": side,
             "type": order_type,
-            "stopPrice": _format_tick_price(trigger_price, tick_size),
+            "triggerPrice": _format_tick_price(trigger_price, tick_size),
             "workingType": working_type,
             "priceProtect": "TRUE",
         }

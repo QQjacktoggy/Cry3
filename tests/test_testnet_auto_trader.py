@@ -5,6 +5,7 @@ from config.settings import Settings
 from src.gridbot.binance.models import IncomeRecord, PositionInfo
 from src.gridbot.strategy.long_pullback import SignalPlan
 from src.gridbot.testnet.auto_trader import ActivePlan, TestnetAutoTrader
+from src.gridbot.testnet.trader import TestnetOrderResult
 
 
 class FakeClient:
@@ -185,7 +186,7 @@ async def test_auto_trader_reanchors_short_exit_levels_to_fill_price(monkeypatch
 
     async def fake_create_market_order(**kwargs):
         client.orders.append(kwargs)
-        return {"orderId": 321, "status": "FILLED", "avgPrice": "2106.94", **kwargs}
+        return {"orderId": 321, "status": "FILLED", "avgPrice": "2106.94", "updateTime": 1234567890, **kwargs}
 
     client.create_market_order = fake_create_market_order
 
@@ -224,8 +225,41 @@ async def test_auto_trader_reanchors_short_exit_levels_to_fill_price(monkeypatch
 
     plan = trader._plans["ETHUSDC"]
     assert plan.entry_price == 2106.94
+    assert plan.opened_at_ms == 1234567890
     assert plan.stop_loss == pytest.approx(2131.6017)
     assert plan.take_profit == pytest.approx(2092.6958)
+
+
+def test_executed_entry_price_ignores_zero_avg_price():
+    trader = TestnetAutoTrader(_settings(), FakeClient(), FakeTelegramApp())
+    signal = SignalPlan(
+        action="PLAN_SHORT",
+        confidence=92,
+        score=92,
+        symbol="ETHUSDC",
+        price=2108,
+        rsi=42,
+        atr=18,
+        support=2120,
+        vwap=2105,
+        entries=[2113.95],
+        stop_loss=2138.6117,
+        take_profits=[2099.7058],
+        planned_notional_usdc=120,
+        leverage_cap=8,
+        reasons=["router short"],
+    )
+    result = TestnetOrderResult(
+        symbol="ETHUSDC",
+        side="SELL",
+        quantity="0.071",
+        notional_usdc=150,
+        leverage=8,
+        reduce_only=False,
+        order={"avgPrice": "0.00000", "executedQty": "0", "cumQuote": "0"},
+    )
+
+    assert trader._executed_entry_price(result, signal) == pytest.approx(2113.95)
 
 
 @pytest.mark.asyncio
@@ -311,6 +345,72 @@ async def test_auto_trader_closes_short_take_profit():
 
     assert client.orders[0]["side"] == "BUY"
     assert client.orders[0]["reduce_only"] is True
+
+
+@pytest.mark.asyncio
+async def test_auto_trader_closes_short_stop_before_syncing_protection_orders():
+    client = FakeClient()
+    client.position = PositionInfo(
+        symbol="ETHUSDC",
+        position_amt=-0.043,
+        entry_price=2125.98,
+        mark_price=2135.95,
+        unrealized_pnl=-0.43,
+        liquidation_price=117856,
+        leverage=1,
+        margin_type="isolated",
+    )
+    trader = TestnetAutoTrader(_settings(), client, FakeTelegramApp())
+    trader._plans["ETHUSDC"] = ActivePlan(
+        symbol="ETHUSDC",
+        side="short",
+        strategy="orb_short",
+        regime="trend_down",
+        risk_mode="normal",
+        market_playbook="breakdown",
+        allocator_state="active",
+        allocator_profile="short_breakdown",
+        allocator_scale=1.25,
+        opened_at_ms=int(datetime.now(timezone.utc).timestamp() * 1000),
+        entry_price=2125.98,
+        stop_loss=2131.0,
+        take_profit=2118.0,
+        max_holding_bars=24,
+        score=78,
+        reasons=["test"],
+    )
+
+    await trader.run_manage_cycle()
+
+    assert client.orders[0]["side"] == "BUY"
+    assert client.orders[0]["reduce_only"] is True
+    assert client.conditional_orders == []
+    assert "ETHUSDC" not in trader._plans
+
+
+@pytest.mark.asyncio
+async def test_manage_cycle_closes_unrecoverable_position():
+    client = FakeClient()
+    client.position = PositionInfo(
+        symbol="ETHUSDC",
+        position_amt=-0.043,
+        entry_price=2125.98,
+        mark_price=2134.88,
+        unrealized_pnl=-0.38,
+        liquidation_price=117856,
+        leverage=1,
+        margin_type="isolated",
+    )
+    telegram = FakeTelegramApp()
+    trader = TestnetAutoTrader(_settings(), client, telegram)
+
+    await trader.run_manage_cycle()
+
+    assert client.orders[0]["side"] == "BUY"
+    assert client.orders[0]["reduce_only"] is True
+    assert "Testnet 保護性平倉" in telegram.bot.messages[0]["text"]
+    assert "無法復原策略 plan" in telegram.bot.messages[0]["text"]
+    assert "ETHUSDC" not in trader._plans
 
 
 @pytest.mark.asyncio
@@ -540,6 +640,7 @@ async def test_manage_cycle_recovers_plan_for_existing_position(monkeypatch):
     plan = trader._plans["ETHUSDC"]
     assert plan.side == "short"
     assert plan.entry_price == 2106.94
+    assert plan.opened_at_ms == entry_time_ms
     assert plan.strategy == "orb_short"
     assert "已重新接管既有持倉" in telegram.bot.messages[0]["text"]
     assert len(client.conditional_orders) == 2

@@ -46,11 +46,11 @@ async def test_conditional_close_order_uses_quantity_reduce_only_and_tick_price(
 
     assert result["quantity"] == "0.069"
     assert result["reduceOnly"] == "true"
-    assert result["stopPrice"] == "2070.12"
+    assert result["triggerPrice"] == "2070.12"
     assert result["clientAlgoId"] == "cry3sl_test"
     assert "newClientOrderId" not in fake.order_params
     assert "closePosition" not in fake.order_params
-    assert "triggerPrice" not in fake.order_params
+    assert "stopPrice" not in fake.order_params
 
 
 @pytest.mark.asyncio

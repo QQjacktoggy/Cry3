@@ -79,6 +79,7 @@ REASON_LABELS = {
     "strategy max holding": "達到最長持有時間",
     "strategy stop loss": "觸發策略停損",
     "strategy take profit": "觸發策略停利",
+    "entry exit level breached": "開倉後已觸發策略出場線",
 }
 
 
@@ -207,6 +208,9 @@ class TestnetAutoTrader:
                         f"趨勢判定：<b>{escape(_label_regime(recovered.regime))}</b> | 風險模式：<b>{escape(_label_risk_mode(recovered.risk_mode))}</b>\n"
                         f"停損：${recovered.stop_loss:.4f} | TP1：${recovered.take_profit:.4f}"
                     )
+                else:
+                    await self._close_unmanaged_position(symbol, position, today_net)
+                    return
             await self._manage_position(symbol, position, today_net)
             return
 
@@ -252,7 +256,7 @@ class TestnetAutoTrader:
         result = await self._trader.open_position(symbol, direction, notional, leverage=leverage)
         executed_entry = self._executed_entry_price(result, signal)
         stop_loss, take_profit = self._live_exit_levels(signal, direction, executed_entry)
-        self._plans[symbol] = ActivePlan(
+        plan = ActivePlan(
             symbol=symbol,
             side=direction,
             strategy=decision.strategy,
@@ -262,7 +266,7 @@ class TestnetAutoTrader:
             allocator_state=decision.allocator_state,
             allocator_profile=decision.allocator_profile,
             allocator_scale=decision.allocator_scale,
-            opened_at_ms=candles[-1].open_time_ms,
+            opened_at_ms=self._order_time_ms(result.order) or self._now_ms(),
             entry_price=executed_entry,
             stop_loss=stop_loss,
             take_profit=take_profit,
@@ -270,40 +274,31 @@ class TestnetAutoTrader:
             score=signal.score,
             reasons=[f"strategy={decision.strategy}"] + signal.reasons,
         )
-        await self._sync_protection_orders(symbol, self._plans[symbol], quantity=result.quantity)
+        self._plans[symbol] = plan
+        current_position = await self._client.get_position(symbol)
+        if current_position:
+            immediate_reason = self._exit_reason(plan, current_position.mark_price)
+            if immediate_reason is not None:
+                close_result = await self._trader.close_position(symbol)
+                if close_result:
+                    await self._cleanup_stale_protection_orders(symbol)
+                    self._plans.pop(symbol, None)
+                    await self._notify_order("entry exit level breached", close_result, current_position, plan, today_net=today_net)
+                return
+        await self._sync_protection_orders(symbol, plan, quantity=result.quantity)
         await self._notify_entry(result, decision)
 
     async def _manage_position(self, symbol: str, position: PositionInfo, today_net: float) -> None:
         plan = self._plans.get(symbol)
         if plan is None:
-            if symbol not in self._notified_unmanaged:
-                self._notified_unmanaged.add(symbol)
-                await self._notify_text(
-                    "ℹ️ <b>偵測到既有 Testnet 持倉</b>\n"
-                    f"交易對：<code>{escape(symbol)}</code>\n"
-                    f"持倉：{_label_side(position.position_direction)} {abs(position.position_amt):.6f}\n"
-                    "由於重啟後沒有接續到本地策略 plan，這筆倉位暫不自動平倉。"
-                )
+            await self._close_unmanaged_position(symbol, position, today_net)
             return
 
-        await self._sync_protection_orders(symbol, plan, quantity=self._position_quantity(position))
         price = position.mark_price
-        reason = None
-        max_hold_ms = plan.max_holding_bars * self._interval_ms()
-        if max_hold_ms > 0 and self._now_ms() - plan.opened_at_ms >= max_hold_ms:
-            reason = "strategy max holding"
-        elif plan.side == "short":
-            if price >= plan.stop_loss:
-                reason = "strategy stop loss"
-            elif price <= plan.take_profit:
-                reason = "strategy take profit"
-        else:
-            if price <= plan.stop_loss:
-                reason = "strategy stop loss"
-            elif price >= plan.take_profit:
-                reason = "strategy take profit"
+        reason = self._exit_reason(plan, price)
 
         if reason is None:
+            await self._sync_protection_orders(symbol, plan, quantity=self._position_quantity(position))
             logger.info(
                 "testnet_position_held",
                 symbol=symbol,
@@ -319,6 +314,24 @@ class TestnetAutoTrader:
             await self._cleanup_stale_protection_orders(symbol)
             self._plans.pop(symbol, None)
             await self._notify_order(reason, result, position, plan, today_net=today_net)
+
+    async def _close_unmanaged_position(self, symbol: str, position: PositionInfo, today_net: float) -> None:
+        result = await self._trader.close_position(symbol)
+        if not result:
+            return
+        await self._cleanup_stale_protection_orders(symbol)
+        self._plans.pop(symbol, None)
+        self._notified_unmanaged.add(symbol)
+        await self._notify_text(
+            "🏁 <b>Testnet 保護性平倉</b>\n"
+            "原因：無法復原策略 plan，避免 unmanaged 持倉失控\n"
+            f"交易對：<code>{escape(result.symbol)}</code>\n"
+            f"方向：<b>{escape(_label_side(result.side))}</b>\n"
+            f"原持倉：{escape(_label_side(position.position_direction))} {abs(position.position_amt):.6f}\n"
+            f"標記價：${position.mark_price:.4f} | 未實現損益：${position.unrealized_pnl:.4f}\n"
+            f"平倉前今日淨損益：${today_net:.4f}\n"
+            f"訂單 ID：<code>{escape(str(result.order.get('orderId', 'N/A')))}</code>"
+        )
 
     async def _load_candles(self, symbol: str) -> list[Candle]:
         rows = await self._client.get_klines(
@@ -437,9 +450,13 @@ class TestnetAutoTrader:
         return max(1, min(int(leverage), int(self._settings.max_effective_leverage)))
 
     def _executed_entry_price(self, result: TestnetOrderResult, signal: SignalPlan) -> float:
-        order_avg = result.order.get("avgPrice")
-        if order_avg not in (None, "", "0", 0):
-            return float(order_avg)
+        order_avg = self._order_float(result.order, "avgPrice", "averagePrice")
+        if order_avg is not None and order_avg > 0:
+            return order_avg
+        executed_qty = self._order_float(result.order, "executedQty", "origQty")
+        cumulative_quote = self._order_float(result.order, "cumQuote", "cumQuoteQty", "cummulativeQuoteQty")
+        if executed_qty is not None and executed_qty > 0 and cumulative_quote is not None and cumulative_quote > 0:
+            return cumulative_quote / executed_qty
         if signal.entries:
             return float(signal.entries[0])
         return float(signal.price)
@@ -608,8 +625,9 @@ class TestnetAutoTrader:
             )
             return None
 
-        fallback_entry = signal.entries[0] if signal.entries else signal.price
-        executed_entry = float(entry_order.get("avgPrice") or fallback_entry)
+        fallback_entry = float(signal.entries[0] if signal.entries else signal.price)
+        order_avg = self._order_float(entry_order, "avgPrice", "averagePrice")
+        executed_entry = order_avg if order_avg is not None and order_avg > 0 else fallback_entry
         stop_loss, take_profit = self._live_exit_levels(signal, direction, executed_entry)
         return ActivePlan(
             symbol=symbol,
@@ -621,7 +639,7 @@ class TestnetAutoTrader:
             allocator_state=decision.allocator_state,
             allocator_profile=decision.allocator_profile,
             allocator_scale=decision.allocator_scale,
-            opened_at_ms=(entry_time // self._interval_ms()) * self._interval_ms(),
+            opened_at_ms=entry_time,
             entry_price=executed_entry,
             stop_loss=stop_loss,
             take_profit=take_profit,
@@ -629,6 +647,22 @@ class TestnetAutoTrader:
             score=signal.score,
             reasons=[f"strategy={decision.strategy}"] + signal.reasons,
         )
+
+    def _exit_reason(self, plan: ActivePlan, price: float) -> str | None:
+        max_hold_ms = plan.max_holding_bars * self._interval_ms()
+        if max_hold_ms > 0 and self._now_ms() - plan.opened_at_ms >= max_hold_ms:
+            return "strategy max holding"
+        if plan.side == "short":
+            if price >= plan.stop_loss:
+                return "strategy stop loss"
+            if price <= plan.take_profit:
+                return "strategy take profit"
+        else:
+            if price <= plan.stop_loss:
+                return "strategy stop loss"
+            if price >= plan.take_profit:
+                return "strategy take profit"
+        return None
 
     async def _today_net_pnl(self, symbol: str) -> float:
         day_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -651,6 +685,22 @@ class TestnetAutoTrader:
         entry = signal.entries[0] if signal.entries else signal.price
         stop = signal.stop_loss if signal.stop_loss is not None else 0.0
         take_profit = signal.take_profits[0] if signal.take_profits else 0.0
+        logger.info(
+            "testnet_position_opened",
+            symbol=result.symbol,
+            side=result.side,
+            strategy=decision.strategy,
+            regime=decision.regime,
+            risk_mode=decision.risk_mode,
+            market_playbook=decision.market_playbook,
+            allocator_profile=decision.allocator_profile,
+            allocator_state=decision.allocator_state,
+            allocator_scale=decision.allocator_scale,
+            quantity=result.quantity,
+            stop=stop,
+            take_profit=take_profit,
+            order_id=result.order.get("orderId"),
+        )
         await self._notify_text(
             "🚀 <b>Testnet 自動開倉</b>\n"
             f"交易對：<code>{escape(result.symbol)}</code>\n"
@@ -676,6 +726,25 @@ class TestnetAutoTrader:
         plan: ActivePlan,
         today_net: float,
     ) -> None:
+        logger.info(
+            "testnet_position_closed",
+            symbol=result.symbol,
+            side=result.side,
+            reason=reason,
+            strategy=plan.strategy,
+            regime=plan.regime,
+            risk_mode=plan.risk_mode,
+            market_playbook=plan.market_playbook,
+            allocator_profile=plan.allocator_profile,
+            allocator_state=plan.allocator_state,
+            allocator_scale=plan.allocator_scale,
+            quantity=result.quantity,
+            mark=position.mark_price,
+            stop=plan.stop_loss,
+            take_profit=plan.take_profit,
+            today_net=today_net,
+            order_id=result.order.get("orderId"),
+        )
         await self._notify_text(
             "🏁 <b>Testnet 自動平倉</b>\n"
             f"原因：{escape(_label_reason(reason))}\n"
@@ -711,6 +780,20 @@ class TestnetAutoTrader:
 
     def _now_ms(self) -> int:
         return int(datetime.now(timezone.utc).timestamp() * 1000)
+
+    @staticmethod
+    def _order_time_ms(order: dict) -> int | None:
+        for key in ("updateTime", "time", "transactTime"):
+            value = order.get(key)
+            if value in (None, ""):
+                continue
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                continue
+            if parsed > 0:
+                return parsed
+        return None
 
 
 def _label_side(value: str) -> str:
