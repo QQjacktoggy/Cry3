@@ -134,6 +134,7 @@ class TestnetAutoTrader:
         self._notified_unmanaged: set[str] = set()
         self._target_stop_notified = False
         self._loss_stop_notified = False
+        self._last_flat_manage_check_ms: dict[str, int] = {}
 
     async def run_cycle(self) -> None:
         await self.run_manage_cycle()
@@ -155,6 +156,13 @@ class TestnetAutoTrader:
         if not self._settings.binance_testnet:
             raise RuntimeError("Refusing auto trading unless BINANCE_TESTNET=true.")
         for symbol in self._settings.symbols_list:
+            if self._should_throttle_flat_manage(symbol):
+                logger.info(
+                    "testnet_manage_cycle_throttled",
+                    symbol=symbol,
+                    flat_interval_seconds=self._settings.testnet_manage_flat_interval_seconds,
+                )
+                continue
             await self._run_symbol(symbol, allow_new_entries=False)
 
     async def _run_symbol(self, symbol: str, allow_new_entries: bool) -> None:
@@ -195,6 +203,7 @@ class TestnetAutoTrader:
             return
 
         if position:
+            self._last_flat_manage_check_ms.pop(symbol, None)
             if symbol not in self._plans:
                 recovered = await self._recover_plan(symbol, position, today_net)
                 if recovered is not None:
@@ -222,6 +231,7 @@ class TestnetAutoTrader:
             await self._notify_exchange_exit(symbol, plan, exit_order, today_net=today_net)
         else:
             await self._cleanup_stale_protection_orders(symbol)
+        self._last_flat_manage_check_ms[symbol] = self._now_ms()
 
         if not allow_new_entries:
             return
@@ -1000,6 +1010,18 @@ class TestnetAutoTrader:
         if interval.endswith("h"):
             return int(interval[:-1]) * 3_600_000
         return 300_000
+
+    def _should_throttle_flat_manage(self, symbol: str) -> bool:
+        if symbol in self._plans:
+            return False
+        last_check_ms = self._last_flat_manage_check_ms.get(symbol)
+        if last_check_ms is None:
+            return False
+        flat_interval_ms = max(
+            int(self._settings.testnet_manage_interval_seconds),
+            int(self._settings.testnet_manage_flat_interval_seconds),
+        ) * 1000
+        return self._now_ms() - last_check_ms < flat_interval_ms
 
     def _now_ms(self) -> int:
         return int(datetime.now(timezone.utc).timestamp() * 1000)

@@ -685,6 +685,58 @@ async def test_manage_cycle_cleans_stale_protection_orders_when_flat():
 
 
 @pytest.mark.asyncio
+async def test_manage_cycle_throttles_flat_symbol_with_recent_flat_check(monkeypatch):
+    trader = TestnetAutoTrader(_settings(testnet_manage_flat_interval_seconds=60), FakeClient(), FakeTelegramApp())
+    calls: list[tuple[str, bool]] = []
+
+    async def fake_run_symbol(symbol: str, allow_new_entries: bool) -> None:
+        calls.append((symbol, allow_new_entries))
+
+    monkeypatch.setattr(trader, "_run_symbol", fake_run_symbol)
+    monkeypatch.setattr(trader, "_now_ms", lambda: 100_000)
+    trader._last_flat_manage_check_ms["ETHUSDC"] = 70_000
+
+    await trader.run_manage_cycle()
+
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_manage_cycle_does_not_throttle_symbol_with_active_plan(monkeypatch):
+    trader = TestnetAutoTrader(_settings(testnet_manage_flat_interval_seconds=60), FakeClient(), FakeTelegramApp())
+    calls: list[tuple[str, bool]] = []
+
+    async def fake_run_symbol(symbol: str, allow_new_entries: bool) -> None:
+        calls.append((symbol, allow_new_entries))
+
+    monkeypatch.setattr(trader, "_run_symbol", fake_run_symbol)
+    monkeypatch.setattr(trader, "_now_ms", lambda: 100_000)
+    trader._last_flat_manage_check_ms["ETHUSDC"] = 70_000
+    trader._plans["ETHUSDC"] = ActivePlan(
+        symbol="ETHUSDC",
+        side="long",
+        strategy="orb_long",
+        regime="trend_up",
+        risk_mode="normal",
+        market_playbook="long_pullback",
+        allocator_state="normal",
+        allocator_profile="trend_up_normal",
+        allocator_scale=1.0,
+        opened_at_ms=1,
+        entry_price=2100.0,
+        stop_loss=2070.0,
+        take_profit=2130.0,
+        max_holding_bars=24,
+        score=80,
+        reasons=["test"],
+    )
+
+    await trader.run_manage_cycle()
+
+    assert calls == [("ETHUSDC", False)]
+
+
+@pytest.mark.asyncio
 async def test_manage_cycle_replaces_mismatched_protection_order():
     client = FakeClient()
     client.position = PositionInfo(

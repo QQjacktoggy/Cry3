@@ -45,6 +45,7 @@ class Settings(BaseSettings):
     testnet_daily_target_pct: float = 2.7
     testnet_auto_trade_interval_minutes: int = 5
     testnet_manage_interval_seconds: int = 15
+    testnet_manage_flat_interval_seconds: int = 60
     testnet_kline_interval: str = "5m"
     testnet_kline_limit: int = 300
     testnet_min_signal_score: int = 58
