@@ -191,6 +191,69 @@ async def test_auto_trader_opens_and_notifies(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_auto_trader_reanchors_exit_levels_to_live_position_entry(monkeypatch):
+    client = FakeClient()
+    telegram = FakeTelegramApp()
+    trader = TestnetAutoTrader(_settings(), client, telegram)
+
+    async def fake_create_market_order(**kwargs):
+        client.orders.append(kwargs)
+        client.position = PositionInfo(
+            symbol="ETHUSDC",
+            position_amt=0.071,
+            entry_price=2105,
+            mark_price=2105.5,
+            unrealized_pnl=0.03,
+            liquidation_price=1800,
+            leverage=10,
+            margin_type="isolated",
+        )
+        return {"orderId": 321, "status": "FILLED", "avgPrice": "0.00000", "executedQty": "0", **kwargs}
+
+    client.create_market_order = fake_create_market_order
+
+    def fake_signal(candles, base, day_pnl=0.0):
+        class FakeDecision:
+            signal = SignalPlan(
+                action="PLAN_LONG",
+                confidence=82,
+                score=82,
+                symbol="ETHUSDC",
+                price=2100,
+                rsi=55,
+                atr=20,
+                support=2050,
+                vwap=2080,
+                entries=[2100],
+                stop_loss=2070,
+                take_profits=[2130],
+                planned_notional_usdc=300,
+                leverage_cap=10,
+                reasons=["test signal"],
+            )
+            strategy = "orb_long"
+            regime = "trend_up"
+            risk_mode = "aggressive"
+            market_playbook = "breakout"
+            allocator_state = "active"
+            allocator_profile = "trend_aggressive"
+            allocator_scale = 3.5
+            max_holding_bars = 24
+        return FakeDecision()
+
+    monkeypatch.setattr("src.gridbot.testnet.auto_trader.generate_router_allocator_v13_trend350_live_decision", fake_signal)
+
+    await trader.run_cycle()
+
+    plan = trader._plans["ETHUSDC"]
+    assert plan.entry_price == pytest.approx(2105)
+    assert plan.stop_loss == pytest.approx(2075)
+    assert plan.take_profit == pytest.approx(2135)
+    assert client.limit_orders[0]["price"] == pytest.approx(2135)
+    assert "進場基準：$2105.0000" in telegram.bot.messages[0]["text"]
+
+
+@pytest.mark.asyncio
 async def test_auto_trader_skips_entry_when_mark_already_breached_exit_level(monkeypatch):
     client = FakeClient()
     client.mark_price = 2136.8
@@ -682,6 +745,64 @@ async def test_manage_cycle_replaces_mismatched_protection_order():
 
 
 @pytest.mark.asyncio
+async def test_manage_cycle_keeps_tick_rounded_protection_orders():
+    client = FakeClient()
+    client.position = PositionInfo(
+        symbol="ETHUSDC",
+        position_amt=0.07,
+        entry_price=2135.69,
+        mark_price=2135.1,
+        unrealized_pnl=-0.0413,
+        liquidation_price=1800,
+        leverage=70,
+        margin_type="isolated",
+    )
+    client.open_algo_orders = [
+        {
+            "algoId": 801,
+            "clientAlgoId": "cry3sl_ok",
+            "side": "SELL",
+            "orderType": "STOP_MARKET",
+            "stopPrice": "2127.55",
+        },
+    ]
+    client.open_orders = [
+        {
+            "orderId": 802,
+            "clientOrderId": "cry3tp_ok",
+            "side": "SELL",
+            "orderType": "LIMIT",
+            "price": "2135.55",
+        },
+    ]
+    trader = TestnetAutoTrader(_settings(), client, FakeTelegramApp())
+    trader._plans["ETHUSDC"] = ActivePlan(
+        symbol="ETHUSDC",
+        side="long",
+        strategy="orb_long",
+        regime="trend_up",
+        risk_mode="normal",
+        market_playbook="long_pullback",
+        allocator_state="normal",
+        allocator_profile="trend_up_normal",
+        allocator_scale=1.0,
+        opened_at_ms=int(datetime.now(timezone.utc).timestamp() * 1000),
+        entry_price=2135.69,
+        stop_loss=2127.5533,
+        take_profit=2135.5454,
+        max_holding_bars=24,
+        score=98,
+        reasons=["test"],
+    )
+
+    await trader.run_manage_cycle()
+
+    assert client.cancelled_orders == []
+    assert client.conditional_orders == []
+    assert client.limit_orders == []
+
+
+@pytest.mark.asyncio
 async def test_manage_cycle_recovers_plan_for_existing_position(monkeypatch):
     client = FakeClient()
     entry_time_ms = int(datetime.now(timezone.utc).timestamp() * 1000) - 300_000
@@ -700,7 +821,7 @@ async def test_manage_cycle_recovers_plan_for_existing_position(monkeypatch):
             "time": entry_time_ms,
             "side": "SELL",
             "status": "FILLED",
-            "avgPrice": "2106.94000",
+            "avgPrice": "0.00000",
             "origQty": "0.071",
             "clientOrderId": "cry3tn_1779206810846",
             "orderId": 305010414,

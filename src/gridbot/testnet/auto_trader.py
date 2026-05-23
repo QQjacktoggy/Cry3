@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from html import escape
 
 from config.settings import Settings
@@ -304,7 +305,13 @@ class TestnetAutoTrader:
             )
             return
         result = await self._trader.open_position(symbol, direction, notional, leverage=leverage)
-        executed_entry = self._executed_entry_price(result, signal)
+        current_position = await self._client.get_position(symbol)
+        position_entry = self._position_entry_price(current_position) if current_position else 0.0
+        executed_entry = (
+            position_entry
+            if position_entry > 0
+            else self._executed_entry_price(result, signal)
+        )
         stop_loss, take_profit = self._live_exit_levels(signal, direction, executed_entry)
         plan = ActivePlan(
             symbol=symbol,
@@ -325,7 +332,6 @@ class TestnetAutoTrader:
             reasons=[f"strategy={decision.strategy}"] + signal.reasons,
         )
         self._plans[symbol] = plan
-        current_position = await self._client.get_position(symbol)
         if current_position:
             immediate_reason = self._exit_reason(plan, current_position.mark_price)
             if immediate_reason is not None:
@@ -336,7 +342,7 @@ class TestnetAutoTrader:
                     await self._notify_order("entry exit level breached", close_result, current_position, plan, today_net=today_net)
                 return
         await self._sync_protection_orders(symbol, plan, quantity=result.quantity)
-        await self._notify_entry(result, decision)
+        await self._notify_entry(result, decision, plan)
 
     async def _manage_position(self, symbol: str, position: PositionInfo, today_net: float) -> None:
         plan = self._plans.get(symbol)
@@ -639,6 +645,13 @@ class TestnetAutoTrader:
     def _position_quantity(position: PositionInfo) -> str:
         return f"{abs(position.position_amt):.8f}".rstrip("0").rstrip(".")
 
+    @staticmethod
+    def _position_entry_price(position: PositionInfo) -> float:
+        try:
+            return abs(float(position.entry_price))
+        except (TypeError, ValueError):
+            return 0.0
+
     def _protection_order_matches(
         self,
         order: dict,
@@ -648,14 +661,11 @@ class TestnetAutoTrader:
     ) -> bool:
         side = self._order_value(order, "side")
         order_type = self._order_value(order, "orderType", "type", "origType", "order_type")
-        trigger_price = self._order_float(order, "triggerPrice", "stopPrice", "trigger_price")
         if side is None or str(side).upper() != expected_side:
             return False
         if order_type is None or str(order_type).upper() != expected_type:
             return False
-        if trigger_price is None:
-            return False
-        return abs(trigger_price - expected_trigger_price) <= 0.0001
+        return self._order_price_matches(order, expected_trigger_price, "triggerPrice", "stopPrice", "trigger_price")
 
     def _limit_order_matches(
         self,
@@ -665,14 +675,28 @@ class TestnetAutoTrader:
     ) -> bool:
         side = self._order_value(order, "side")
         order_type = self._order_value(order, "orderType", "type", "origType", "order_type")
-        price = self._order_float(order, "price", "stopPrice", "triggerPrice")
         if side is None or str(side).upper() != expected_side:
             return False
         if order_type is None or str(order_type).upper() != "LIMIT":
             return False
-        if price is None:
+        return self._order_price_matches(order, expected_price, "price", "stopPrice", "triggerPrice")
+
+    @classmethod
+    def _order_price_matches(cls, order: dict, expected_price: float, *keys: str) -> bool:
+        value = cls._order_value(order, *keys)
+        if value is None:
             return False
-        return abs(price - expected_price) <= 0.0001
+        try:
+            actual = Decimal(str(value))
+            if actual <= 0:
+                return False
+            normalized = actual.normalize()
+            decimals = max(0, -normalized.as_tuple().exponent)
+            quant = Decimal("1").scaleb(-decimals)
+            expected = Decimal(str(expected_price)).quantize(quant, rounding=ROUND_HALF_UP)
+        except (InvalidOperation, TypeError, ValueError):
+            return False
+        return actual == expected
 
     @staticmethod
     def _order_value(order: dict, *keys: str):
@@ -731,7 +755,13 @@ class TestnetAutoTrader:
 
         fallback_entry = float(signal.entries[0] if signal.entries else signal.price)
         order_avg = self._order_float(entry_order, "avgPrice", "averagePrice")
-        executed_entry = order_avg if order_avg is not None and order_avg > 0 else fallback_entry
+        position_entry = self._position_entry_price(position)
+        executed_entry = (
+            order_avg
+            if order_avg is not None and order_avg > 0
+            else position_entry if position_entry > 0
+            else fallback_entry
+        )
         stop_loss, take_profit = self._live_exit_levels(signal, direction, executed_entry)
         return ActivePlan(
             symbol=symbol,
@@ -816,12 +846,9 @@ class TestnetAutoTrader:
             )
         return sum(item.income for item in records)
 
-    async def _notify_entry(self, result: TestnetOrderResult, decision: LiveDecisionContext) -> None:
+    async def _notify_entry(self, result: TestnetOrderResult, decision: LiveDecisionContext, plan: ActivePlan) -> None:
         signal = decision.signal
         reasons = "\n".join(f"- {escape(reason)}" for reason in signal.reasons[:4])
-        entry = signal.entries[0] if signal.entries else signal.price
-        stop = signal.stop_loss if signal.stop_loss is not None else 0.0
-        take_profit = signal.take_profits[0] if signal.take_profits else 0.0
         logger.info(
             "testnet_position_opened",
             symbol=result.symbol,
@@ -834,8 +861,9 @@ class TestnetAutoTrader:
             allocator_state=decision.allocator_state,
             allocator_scale=decision.allocator_scale,
             quantity=result.quantity,
-            stop=stop,
-            take_profit=take_profit,
+            entry=plan.entry_price,
+            stop=plan.stop_loss,
+            take_profit=plan.take_profit,
             order_id=result.order.get("orderId"),
         )
         await self._notify_text(
@@ -849,8 +877,8 @@ class TestnetAutoTrader:
             f"市況劇本：<b>{escape(_label_playbook(decision.market_playbook))}</b>\n"
             f"資金配置：<b>{escape(_label_allocator_profile(decision.allocator_profile))}</b> ({escape(_label_allocator_state(decision.allocator_state))}) x{decision.allocator_scale:.2f}\n"
             f"訊號分數：{signal.score} | 信心度：{signal.confidence}\n"
-            f"參考進場：${entry:.4f}\n"
-            f"停損：${stop:.4f} | TP1：${take_profit:.4f}\n"
+            f"進場基準：${plan.entry_price:.4f}\n"
+            f"停損：${plan.stop_loss:.4f} | TP1：${plan.take_profit:.4f}\n"
             f"訂單 ID：<code>{escape(str(result.order.get('orderId', 'N/A')))}</code>\n"
             f"{reasons}"
         )
