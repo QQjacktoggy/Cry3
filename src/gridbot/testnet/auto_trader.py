@@ -17,6 +17,7 @@ from src.gridbot.testnet.trader import TestnetOrderResult, TestnetTrader
 from src.gridbot.utils.logging import get_logger
 
 logger = get_logger(__name__)
+ENTRY_ORDER_PREFIX = "cry3en_"
 STOP_ORDER_PREFIX = "cry3sl_"
 TAKE_PROFIT_ORDER_PREFIX = "cry3tp_"
 
@@ -83,6 +84,11 @@ REASON_LABELS = {
     "entry exit level breached": "開倉後已觸發策略出場線",
 }
 
+ENTRY_MODE_LABELS = {
+    "trend350_limit": "Trend350 原始 Entry 掛單",
+    "trend350_filled": "Trend350 Entry 成交",
+}
+
 
 @dataclass
 class ActivePlan:
@@ -117,6 +123,25 @@ class LiveDecisionContext:
     max_holding_bars: int
 
 
+@dataclass(frozen=True)
+class PendingEntry:
+    symbol: str
+    decision: LiveDecisionContext
+    direction: str
+    notional: float
+    leverage: int
+    planned_entry: float
+    order_entry_price: float
+    planned_stop: float
+    planned_take_profit: float
+    order_id: int | None
+    client_order_id: str
+    quantity: str
+    created_at_ms: int
+    expires_at_ms: int
+    reason: str
+
+
 class TestnetAutoTrader:
     """Run the live testnet signal loop and emit Telegram event reports."""
 
@@ -131,6 +156,7 @@ class TestnetAutoTrader:
         self._trader = TestnetTrader(settings, client)
         self._telegram_app = telegram_app
         self._plans: dict[str, ActivePlan] = {}
+        self._pending_entries: dict[str, PendingEntry] = {}
         self._notified_unmanaged: set[str] = set()
         self._target_stop_notified = False
         self._loss_stop_notified = False
@@ -200,10 +226,29 @@ class TestnetAutoTrader:
                     f"原因：觸發單日虧損上限\n交易對：<code>{escape(symbol)}</code>\n"
                     f"今日淨損益：${today_net:.4f} / 停止線：${loss_stop:.4f}"
                 )
+            pending = self._pending_entries.get(symbol)
+            if pending is not None:
+                await self._cancel_pending_entry(symbol, pending, reason="daily loss stop")
             return
 
         if position:
             self._last_flat_manage_check_ms.pop(symbol, None)
+            pending = self._pending_entries.pop(symbol, None)
+            if pending is not None:
+                plan = self._plan_from_pending_fill(symbol, pending, position)
+                self._plans[symbol] = plan
+                self._notified_unmanaged.discard(symbol)
+                await self._sync_protection_orders(symbol, plan, quantity=self._position_quantity(position))
+                result = TestnetOrderResult(
+                    symbol=symbol,
+                    side="SELL" if pending.direction == "short" else "BUY",
+                    quantity=pending.quantity,
+                    notional_usdc=pending.notional,
+                    leverage=pending.leverage,
+                    reduce_only=False,
+                    order={"orderId": pending.order_id, "clientOrderId": pending.client_order_id},
+                )
+                await self._notify_entry(result, pending.decision, plan, entry_mode="trend350_filled")
             if symbol not in self._plans:
                 recovered = await self._recover_plan(symbol, position, today_net)
                 if recovered is not None:
@@ -233,9 +278,6 @@ class TestnetAutoTrader:
             await self._cleanup_stale_protection_orders(symbol)
         self._last_flat_manage_check_ms[symbol] = self._now_ms()
 
-        if not allow_new_entries:
-            return
-
         if today_net >= target_stop:
             if not self._target_stop_notified:
                 self._target_stop_notified = True
@@ -245,6 +287,17 @@ class TestnetAutoTrader:
                     f"今日淨損益：${today_net:.4f} / 目標：${target_stop:.4f}\n"
                     "今天不再開新倉。"
                 )
+            pending = self._pending_entries.get(symbol)
+            if pending is not None:
+                await self._cancel_pending_entry(symbol, pending, reason="daily target reached")
+            return
+
+        pending = self._pending_entries.get(symbol)
+        if pending is not None:
+            await self._manage_pending_entry(symbol, pending)
+            return
+
+        if not allow_new_entries:
             return
 
         candles = await self._load_candles(symbol)
@@ -291,11 +344,11 @@ class TestnetAutoTrader:
             return
         planned_entry = self._planned_entry_price(signal)
         planned_stop, planned_take_profit = self._live_exit_levels(signal, direction, planned_entry)
-        mark_price = await self._current_mark_price(symbol)
-        preflight_reason = self._exit_level_reason(direction, mark_price, planned_stop, planned_take_profit)
-        if preflight_reason is not None:
+        order_entry_price = self._entry_limit_price(direction, planned_entry, planned_stop, planned_take_profit)
+        tolerated_reward_pct = self._reward_pct_for_entry(order_entry_price, planned_take_profit, direction)
+        if tolerated_reward_pct < self._settings.testnet_min_reward_pct:
             logger.info(
-                "testnet_signal_skip_entry_exit_level",
+                "testnet_signal_wait_entry_tolerance_fee_buffer",
                 symbol=symbol,
                 strategy=decision.strategy,
                 regime=decision.regime,
@@ -306,53 +359,149 @@ class TestnetAutoTrader:
                 allocator_scale=decision.allocator_scale,
                 action=signal.action,
                 score=signal.score,
-                mark=mark_price,
                 planned_entry=planned_entry,
-                stop=planned_stop,
+                order_entry_price=order_entry_price,
                 take_profit=planned_take_profit,
-                reason=preflight_reason,
+                reward_pct=tolerated_reward_pct,
+                min_reward_pct=self._settings.testnet_min_reward_pct,
+                tolerance_bps=self._settings.testnet_entry_tolerance_bps,
                 reasons=signal.reasons[:3],
             )
             return
-        result = await self._trader.open_position(symbol, direction, notional, leverage=leverage)
-        current_position = await self._client.get_position(symbol)
-        position_entry = self._position_entry_price(current_position) if current_position else 0.0
-        executed_entry = (
-            position_entry
-            if position_entry > 0
-            else self._executed_entry_price(result, signal)
-        )
-        stop_loss, take_profit = self._live_exit_levels(signal, direction, executed_entry)
-        plan = ActivePlan(
+        await self._place_pending_entry_limit(
             symbol=symbol,
-            side=direction,
+            decision=decision,
+            direction=direction,
+            notional=notional,
+            leverage=leverage,
+            planned_entry=planned_entry,
+            order_entry_price=order_entry_price,
+            planned_stop=planned_stop,
+            planned_take_profit=planned_take_profit,
+        )
+
+    async def _place_pending_entry_limit(
+        self,
+        symbol: str,
+        decision: LiveDecisionContext,
+        direction: str,
+        notional: float,
+        leverage: int,
+        planned_entry: float,
+        order_entry_price: float,
+        planned_stop: float,
+        planned_take_profit: float,
+    ) -> None:
+        result = await self._trader.place_entry_limit(
+            symbol,
+            direction,
+            order_entry_price,
+            notional,
+            leverage=leverage,
+        )
+        now_ms = self._now_ms()
+        client_order_id = str(result.order.get("clientOrderId") or result.order.get("clientOrderId".lower()) or "")
+        if not client_order_id:
+            client_order_id = str(result.order.get("newClientOrderId") or "")
+        self._pending_entries[symbol] = PendingEntry(
+            symbol=symbol,
+            decision=decision,
+            direction=direction,
+            notional=notional,
+            leverage=leverage,
+            planned_entry=planned_entry,
+            order_entry_price=order_entry_price,
+            planned_stop=planned_stop,
+            planned_take_profit=planned_take_profit,
+            order_id=self._order_int(result.order, "orderId"),
+            client_order_id=client_order_id,
+            quantity=result.quantity,
+            created_at_ms=now_ms,
+            expires_at_ms=now_ms + self._settings.testnet_entry_order_ttl_bars * self._interval_ms(),
+            reason="trend350 entry limit",
+        )
+        logger.info(
+            "testnet_trend350_entry_limit_placed",
+            symbol=symbol,
             strategy=decision.strategy,
             regime=decision.regime,
             risk_mode=decision.risk_mode,
             market_playbook=decision.market_playbook,
-            allocator_state=decision.allocator_state,
             allocator_profile=decision.allocator_profile,
+            allocator_state=decision.allocator_state,
             allocator_scale=decision.allocator_scale,
-            opened_at_ms=self._order_time_ms(result.order) or self._now_ms(),
-            entry_price=executed_entry,
-            stop_loss=stop_loss,
-            take_profit=take_profit,
-            max_holding_bars=decision.max_holding_bars,
-            score=signal.score,
-            reasons=[f"strategy={decision.strategy}"] + signal.reasons,
+            action=decision.signal.action,
+            score=decision.signal.score,
+            entry=planned_entry,
+            order_entry_price=order_entry_price,
+            stop=planned_stop,
+            take_profit=planned_take_profit,
+            ttl_bars=self._settings.testnet_entry_order_ttl_bars,
+            tolerance_bps=self._settings.testnet_entry_tolerance_bps,
+            order_id=result.order.get("orderId"),
+            client_order_id=client_order_id,
         )
-        self._plans[symbol] = plan
-        if current_position:
-            immediate_reason = self._exit_reason(plan, current_position.mark_price)
-            if immediate_reason is not None:
-                close_result = await self._trader.close_position(symbol)
-                if close_result:
-                    await self._cleanup_stale_protection_orders(symbol)
-                    self._plans.pop(symbol, None)
-                    await self._notify_order("entry exit level breached", close_result, current_position, plan, today_net=today_net)
-                return
-        await self._sync_protection_orders(symbol, plan, quantity=result.quantity)
-        await self._notify_entry(result, decision, plan)
+        await self._notify_pending_entry(result, decision, self._pending_entries[symbol])
+
+    async def _manage_pending_entry(self, symbol: str, pending: PendingEntry) -> None:
+        open_orders = await self._client.get_open_orders(symbol)
+        order_open = any(self._entry_order_matches(order, pending) for order in open_orders)
+        if not order_open:
+            self._pending_entries.pop(symbol, None)
+            logger.info(
+                "testnet_trend350_entry_order_missing",
+                symbol=symbol,
+                strategy=pending.decision.strategy,
+                order_id=pending.order_id,
+                client_order_id=pending.client_order_id,
+            )
+            return
+        if self._now_ms() < pending.expires_at_ms:
+            logger.info(
+                "testnet_trend350_entry_limit_wait",
+                symbol=symbol,
+                strategy=pending.decision.strategy,
+                action=pending.decision.signal.action,
+                entry=pending.order_entry_price,
+                planned_entry=pending.planned_entry,
+                expires_in_seconds=max(0, (pending.expires_at_ms - self._now_ms()) // 1000),
+            )
+            return
+        await self._cancel_pending_entry(symbol, pending, reason="entry expired")
+
+    async def _cancel_pending_entry(self, symbol: str, pending: PendingEntry, reason: str) -> None:
+        if pending.order_id is not None:
+            await self._client.cancel_order(symbol, order_id=pending.order_id)
+        self._pending_entries.pop(symbol, None)
+        logger.info(
+            "testnet_trend350_entry_limit_cancelled",
+            symbol=symbol,
+            strategy=pending.decision.strategy,
+            order_id=pending.order_id,
+            client_order_id=pending.client_order_id,
+            reason=reason,
+        )
+
+    def _plan_from_pending_fill(self, symbol: str, pending: PendingEntry, position: PositionInfo) -> ActivePlan:
+        executed_entry = self._position_entry_price(position) or pending.planned_entry
+        return ActivePlan(
+            symbol=symbol,
+            side=pending.direction,
+            strategy=pending.decision.strategy,
+            regime=pending.decision.regime,
+            risk_mode=pending.decision.risk_mode,
+            market_playbook=pending.decision.market_playbook,
+            allocator_state=pending.decision.allocator_state,
+            allocator_profile=pending.decision.allocator_profile,
+            allocator_scale=pending.decision.allocator_scale,
+            opened_at_ms=pending.created_at_ms,
+            entry_price=executed_entry,
+            stop_loss=pending.planned_stop,
+            take_profit=pending.planned_take_profit,
+            max_holding_bars=pending.decision.max_holding_bars,
+            score=pending.decision.signal.score,
+            reasons=[f"strategy={pending.decision.strategy}", "trend350_entry_limit_fill"] + pending.decision.signal.reasons,
+        )
 
     async def _manage_position(self, symbol: str, position: PositionInfo, today_net: float) -> None:
         plan = self._plans.get(symbol)
@@ -551,13 +700,43 @@ class TestnetAutoTrader:
     def _planned_reward_pct(self, signal: SignalPlan, direction: str) -> float:
         planned_entry = self._planned_entry_price(signal)
         planned_tp = float(signal.take_profits[0]) if signal.take_profits else 0.0
-        if planned_entry <= 0 or planned_tp <= 0:
+        return self._reward_pct_for_entry(planned_entry, planned_tp, direction)
+
+    def _reward_pct_for_entry(self, entry: float, take_profit: float, direction: str) -> float:
+        if entry <= 0 or take_profit <= 0:
             return 0.0
         if direction == "short":
-            reward_distance = planned_entry - planned_tp
+            reward_distance = entry - take_profit
         else:
-            reward_distance = planned_tp - planned_entry
-        return max(reward_distance, 0.0) / planned_entry * 100
+            reward_distance = take_profit - entry
+        return max(reward_distance, 0.0) / entry * 100
+
+    def _entry_limit_price(
+        self,
+        direction: str,
+        planned_entry: float,
+        planned_stop: float,
+        planned_take_profit: float,
+    ) -> float:
+        tolerance_bps = max(0.0, float(self._settings.testnet_entry_tolerance_bps))
+        if tolerance_bps <= 0 or planned_entry <= 0:
+            return planned_entry
+
+        shift = planned_entry * tolerance_bps / 10_000
+        epsilon = max(planned_entry * 0.000001, 0.0001)
+        if direction == "short":
+            candidate = planned_entry - shift
+            if planned_take_profit > 0:
+                candidate = max(candidate, planned_take_profit + epsilon)
+            if planned_stop > 0:
+                candidate = min(candidate, planned_stop - epsilon)
+        else:
+            candidate = planned_entry + shift
+            if planned_take_profit > 0:
+                candidate = min(candidate, planned_take_profit - epsilon)
+            if planned_stop > 0:
+                candidate = max(candidate, planned_stop + epsilon)
+        return round(max(candidate, 0.0), 8)
 
     async def _sync_protection_orders(self, symbol: str, plan: ActivePlan, quantity: str | None = None) -> None:
         if not self._settings.testnet_exchange_protection_enabled:
@@ -725,6 +904,24 @@ class TestnetAutoTrader:
         except (TypeError, ValueError):
             return None
 
+    @classmethod
+    def _order_int(cls, order: dict, *keys: str) -> int | None:
+        value = cls._order_value(order, *keys)
+        if value is None:
+            return None
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed > 0 else None
+
+    def _entry_order_matches(self, order: dict, pending: PendingEntry) -> bool:
+        order_id = self._order_int(order, "orderId")
+        if pending.order_id is not None and order_id == pending.order_id:
+            return True
+        client_order_id = self._protection_client_order_id(order)
+        return bool(pending.client_order_id and client_order_id == pending.client_order_id)
+
     async def _recover_plan(self, symbol: str, position: PositionInfo, today_net: float) -> ActivePlan | None:
         direction = "short" if position.position_amt < 0 else "long"
         entry_side = "SELL" if direction == "short" else "BUY"
@@ -856,7 +1053,13 @@ class TestnetAutoTrader:
             )
         return sum(item.income for item in records)
 
-    async def _notify_entry(self, result: TestnetOrderResult, decision: LiveDecisionContext, plan: ActivePlan) -> None:
+    async def _notify_entry(
+        self,
+        result: TestnetOrderResult,
+        decision: LiveDecisionContext,
+        plan: ActivePlan,
+        entry_mode: str = "trend350_filled",
+    ) -> None:
         signal = decision.signal
         reasons = "\n".join(f"- {escape(reason)}" for reason in signal.reasons[:4])
         logger.info(
@@ -874,6 +1077,7 @@ class TestnetAutoTrader:
             entry=plan.entry_price,
             stop=plan.stop_loss,
             take_profit=plan.take_profit,
+            entry_mode=entry_mode,
             order_id=result.order.get("orderId"),
         )
         await self._notify_text(
@@ -887,8 +1091,35 @@ class TestnetAutoTrader:
             f"市況劇本：<b>{escape(_label_playbook(decision.market_playbook))}</b>\n"
             f"資金配置：<b>{escape(_label_allocator_profile(decision.allocator_profile))}</b> ({escape(_label_allocator_state(decision.allocator_state))}) x{decision.allocator_scale:.2f}\n"
             f"訊號分數：{signal.score} | 信心度：{signal.confidence}\n"
+            f"執行模式：<b>{escape(_label_entry_mode(entry_mode))}</b>\n"
             f"進場基準：${plan.entry_price:.4f}\n"
             f"停損：${plan.stop_loss:.4f} | TP1：${plan.take_profit:.4f}\n"
+            f"訂單 ID：<code>{escape(str(result.order.get('orderId', 'N/A')))}</code>\n"
+            f"{reasons}"
+        )
+
+    async def _notify_pending_entry(
+        self,
+        result: TestnetOrderResult,
+        decision: LiveDecisionContext,
+        pending: PendingEntry,
+    ) -> None:
+        signal = decision.signal
+        reasons = "\n".join(f"- {escape(reason)}" for reason in signal.reasons[:4])
+        await self._notify_text(
+            "🧾 <b>Testnet Trend350 Entry 掛單</b>\n"
+            f"交易對：<code>{escape(result.symbol)}</code>\n"
+            f"方向：<b>{escape(_label_side(result.side))}</b>\n"
+            f"數量：<code>{escape(result.quantity)}</code>\n"
+            f"名目金額：${result.notional_usdc:.2f} | 槓桿：{result.leverage}x\n"
+            f"策略：<b>{escape(decision.strategy)}</b>\n"
+            f"趨勢判定：<b>{escape(_label_regime(decision.regime))}</b> | 風險模式：<b>{escape(_label_risk_mode(decision.risk_mode))}</b>\n"
+            f"市況劇本：<b>{escape(_label_playbook(decision.market_playbook))}</b>\n"
+            f"訊號分數：{signal.score} | 信心度：{signal.confidence}\n"
+            f"Entry Limit：${pending.order_entry_price:.4f}\n"
+            f"原始 Entry：${pending.planned_entry:.4f} | 容忍：{self._settings.testnet_entry_tolerance_bps:.2f} bps\n"
+            f"停損：${pending.planned_stop:.4f} | TP1：${pending.planned_take_profit:.4f}\n"
+            f"有效：{self._settings.testnet_entry_order_ttl_bars} 根 K 線\n"
             f"訂單 ID：<code>{escape(str(result.order.get('orderId', 'N/A')))}</code>\n"
             f"{reasons}"
         )
@@ -1014,6 +1245,8 @@ class TestnetAutoTrader:
     def _should_throttle_flat_manage(self, symbol: str) -> bool:
         if symbol in self._plans:
             return False
+        if symbol in self._pending_entries:
+            return False
         last_check_ms = self._last_flat_manage_check_ms.get(symbol)
         if last_check_ms is None:
             return False
@@ -1067,3 +1300,7 @@ def _label_allocator_state(value: str) -> str:
 
 def _label_reason(value: str) -> str:
     return REASON_LABELS.get(value, value)
+
+
+def _label_entry_mode(value: str) -> str:
+    return ENTRY_MODE_LABELS.get(value, value)

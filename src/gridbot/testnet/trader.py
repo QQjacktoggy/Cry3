@@ -54,6 +54,32 @@ class TestnetTrader:
         )
         return TestnetOrderResult(symbol, side, qty, notional, leverage, False, order)
 
+    async def place_entry_limit(
+        self,
+        symbol: str,
+        direction: str,
+        entry_price: float,
+        notional_usdc: float | None = None,
+        leverage: int | None = None,
+    ) -> TestnetOrderResult:
+        self._assert_can_open()
+        symbol = symbol.upper()
+        side = _side_for_direction(direction)
+        notional = self._bounded_notional(notional_usdc)
+        leverage = self._bounded_leverage(leverage)
+        qty = await self._quantity_for_notional_at_price(symbol, notional, entry_price)
+
+        await self._client.set_leverage(symbol, leverage)
+        order = await self._client.create_limit_order(
+            symbol=symbol,
+            side=side,
+            quantity=qty,
+            price=entry_price,
+            reduce_only=False,
+            client_order_id=_client_order_id("cry3en"),
+        )
+        return TestnetOrderResult(symbol, side, qty, notional, leverage, False, order)
+
     async def close_position(self, symbol: str) -> TestnetOrderResult | None:
         self._assert_testnet()
         symbol = symbol.upper()
@@ -105,6 +131,11 @@ class TestnetTrader:
         price = float(mark.get("markPrice") or 0)
         if price <= 0:
             raise RuntimeError(f"Invalid mark price for {symbol}.")
+        return await self._quantity_for_notional_at_price(symbol, notional, price)
+
+    async def _quantity_for_notional_at_price(self, symbol: str, notional: float, price: float) -> str:
+        if price <= 0:
+            raise ValueError("Entry price must be positive.")
         step_size = await self._quantity_step(symbol)
         return _format_step_quantity(notional / price, step_size)
 

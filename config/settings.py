@@ -60,6 +60,8 @@ class Settings(BaseSettings):
     testnet_max_order_notional_usdc: float = 150.0
     testnet_exchange_protection_enabled: bool = True
     testnet_min_reward_pct: float = 0.12
+    testnet_entry_order_ttl_bars: int = 8
+    testnet_entry_tolerance_bps: float = 0.0
     testnet_daily_report_enabled: bool = True
     testnet_daily_report_hour: int = 21
     testnet_daily_report_minute: int = 0

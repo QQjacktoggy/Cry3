@@ -66,6 +66,14 @@ class FakeClient:
         self.orders.append(kwargs)
         return {"orderId": 321, "status": "NEW", **kwargs}
 
+    async def create_limit_order(self, **kwargs):
+        self.orders.append(kwargs)
+        order = {"orderId": 320 + len(self.orders), "status": "NEW", "type": "LIMIT", **kwargs}
+        if "client_order_id" in kwargs:
+            order["clientOrderId"] = kwargs["client_order_id"]
+        self.open_orders.append(order)
+        return order
+
     async def get_open_orders(self, symbol):
         return list(self.open_orders)
 
@@ -181,36 +189,20 @@ async def test_auto_trader_opens_and_notifies(monkeypatch):
     assert client.orders[0]["side"] == "BUY"
     assert client.orders[0]["reduce_only"] is False
     assert telegram.bot.messages
-    assert "Testnet 自動開倉" in telegram.bot.messages[0]["text"]
+    assert "Testnet Trend350 Entry 掛單" in telegram.bot.messages[0]["text"]
     assert "策略：<b>orb_long</b>" in telegram.bot.messages[0]["text"]
     assert "方向：<b>買入 / 回補</b>" in telegram.bot.messages[0]["text"]
     assert "趨勢判定：<b>上升趨勢</b> | 風險模式：<b>積極</b>" in telegram.bot.messages[0]["text"]
-    assert "資金配置：<b>趨勢強攻</b> (啟用) x3.50" in telegram.bot.messages[0]["text"]
-    assert len(client.conditional_orders) == 1
-    assert len(client.limit_orders) == 1
+    assert "Entry Limit：$2100.0000" in telegram.bot.messages[0]["text"]
+    assert len(client.conditional_orders) == 0
+    assert len(client.limit_orders) == 0
+    assert "ETHUSDC" in trader._pending_entries
 
 
 @pytest.mark.asyncio
-async def test_auto_trader_reanchors_exit_levels_to_live_position_entry(monkeypatch):
+async def test_auto_trader_applies_entry_tolerance_to_limit_price(monkeypatch):
     client = FakeClient()
-    telegram = FakeTelegramApp()
-    trader = TestnetAutoTrader(_settings(), client, telegram)
-
-    async def fake_create_market_order(**kwargs):
-        client.orders.append(kwargs)
-        client.position = PositionInfo(
-            symbol="ETHUSDC",
-            position_amt=0.071,
-            entry_price=2105,
-            mark_price=2105.5,
-            unrealized_pnl=0.03,
-            liquidation_price=1800,
-            leverage=10,
-            margin_type="isolated",
-        )
-        return {"orderId": 321, "status": "FILLED", "avgPrice": "0.00000", "executedQty": "0", **kwargs}
-
-    client.create_market_order = fake_create_market_order
+    trader = TestnetAutoTrader(_settings(testnet_entry_tolerance_bps=5), client, FakeTelegramApp())
 
     def fake_signal(candles, base, day_pnl=0.0):
         class FakeDecision:
@@ -245,18 +237,130 @@ async def test_auto_trader_reanchors_exit_levels_to_live_position_entry(monkeypa
 
     await trader.run_cycle()
 
-    plan = trader._plans["ETHUSDC"]
-    assert plan.entry_price == pytest.approx(2105)
-    assert plan.stop_loss == pytest.approx(2075)
-    assert plan.take_profit == pytest.approx(2135)
-    assert client.limit_orders[0]["price"] == pytest.approx(2135)
-    assert "進場基準：$2105.0000" in telegram.bot.messages[0]["text"]
+    pending = trader._pending_entries["ETHUSDC"]
+    assert client.orders[0]["price"] == pytest.approx(2101.05)
+    assert pending.planned_entry == pytest.approx(2100)
+    assert pending.order_entry_price == pytest.approx(2101.05)
+
+
+def test_entry_tolerance_never_crosses_take_profit():
+    trader = TestnetAutoTrader(_settings(testnet_entry_tolerance_bps=50), FakeClient(), FakeTelegramApp())
+
+    assert trader._entry_limit_price("long", 2100, 2070, 2100.5) == pytest.approx(2100.4979)
+    assert trader._entry_limit_price("short", 2100, 2130, 2099.5) == pytest.approx(2099.5021)
 
 
 @pytest.mark.asyncio
-async def test_auto_trader_skips_entry_when_mark_already_breached_exit_level(monkeypatch):
+async def test_auto_trader_activates_filled_entry_limit_with_original_trend350_levels(monkeypatch):
+    client = FakeClient()
+    telegram = FakeTelegramApp()
+    trader = TestnetAutoTrader(_settings(), client, telegram)
+
+    def fake_signal(candles, base, day_pnl=0.0):
+        class FakeDecision:
+            signal = SignalPlan(
+                action="PLAN_LONG",
+                confidence=82,
+                score=82,
+                symbol="ETHUSDC",
+                price=2100,
+                rsi=55,
+                atr=20,
+                support=2050,
+                vwap=2080,
+                entries=[2100],
+                stop_loss=2070,
+                take_profits=[2130],
+                planned_notional_usdc=300,
+                leverage_cap=10,
+                reasons=["test signal"],
+            )
+            strategy = "orb_long"
+            regime = "trend_up"
+            risk_mode = "aggressive"
+            market_playbook = "breakout"
+            allocator_state = "active"
+            allocator_profile = "trend_aggressive"
+            allocator_scale = 3.5
+            max_holding_bars = 24
+        return FakeDecision()
+
+    monkeypatch.setattr("src.gridbot.testnet.auto_trader.generate_router_allocator_v13_trend350_live_decision", fake_signal)
+
+    await trader.run_cycle()
+    client.position = PositionInfo(
+        symbol="ETHUSDC",
+        position_amt=0.071,
+        entry_price=2105,
+        mark_price=2105.5,
+        unrealized_pnl=0.03,
+        liquidation_price=1800,
+        leverage=10,
+        margin_type="isolated",
+    )
+    client.open_orders = []
+    await trader.run_manage_cycle()
+
+    plan = trader._plans["ETHUSDC"]
+    assert plan.entry_price == pytest.approx(2105)
+    assert plan.stop_loss == pytest.approx(2070)
+    assert plan.take_profit == pytest.approx(2130)
+    assert client.limit_orders[-1]["price"] == pytest.approx(2130)
+    assert "進場基準：$2105.0000" in telegram.bot.messages[-1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_auto_trader_does_not_reanchor_when_mark_breached_take_profit(monkeypatch):
     client = FakeClient()
     client.mark_price = 2136.8
+    telegram = FakeTelegramApp()
+    trader = TestnetAutoTrader(_settings(), client, telegram)
+
+    def fake_signal(candles, base, day_pnl=0.0):
+        class FakeDecision:
+            signal = SignalPlan(
+                action="PLAN_LONG",
+                confidence=82,
+                score=82,
+                symbol="ETHUSDC",
+                price=2100,
+                rsi=55,
+                atr=20,
+                support=2050,
+                vwap=2080,
+                entries=[2100],
+                stop_loss=2070,
+                take_profits=[2130],
+                planned_notional_usdc=300,
+                leverage_cap=10,
+                reasons=["stale breakout"],
+            )
+            strategy = "orb_long"
+            regime = "trend_up"
+            risk_mode = "aggressive"
+            market_playbook = "breakout"
+            allocator_state = "active"
+            allocator_profile = "trend_aggressive"
+            allocator_scale = 3.5
+            max_holding_bars = 24
+        return FakeDecision()
+
+    monkeypatch.setattr("src.gridbot.testnet.auto_trader.generate_router_allocator_v13_trend350_live_decision", fake_signal)
+
+    await trader.run_cycle()
+
+    assert client.leverage_calls == [("ETHUSDC", 10)]
+    assert client.orders[0]["side"] == "BUY"
+    assert client.orders[0]["price"] == pytest.approx(2100)
+    assert trader._plans == {}
+    assert "ETHUSDC" in trader._pending_entries
+    assert "Entry Limit：$2100.0000" in telegram.bot.messages[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_auto_trader_queues_pending_when_mark_is_far_beyond_take_profit(monkeypatch):
+    client = FakeClient()
+    client.mark_price = 2160
     trader = TestnetAutoTrader(_settings(), client, FakeTelegramApp())
 
     def fake_signal(candles, base, day_pnl=0.0):
@@ -292,24 +396,19 @@ async def test_auto_trader_skips_entry_when_mark_already_breached_exit_level(mon
 
     await trader.run_cycle()
 
-    assert client.leverage_calls == []
-    assert client.orders == []
+    assert client.leverage_calls == [("ETHUSDC", 10)]
+    assert client.orders[0]["price"] == pytest.approx(2100)
     assert client.conditional_orders == []
     assert client.limit_orders == []
     assert trader._plans == {}
+    assert "ETHUSDC" in trader._pending_entries
 
 
 @pytest.mark.asyncio
-async def test_auto_trader_reanchors_short_exit_levels_to_fill_price(monkeypatch):
+async def test_auto_trader_activates_short_entry_limit_with_original_trend350_levels(monkeypatch):
     client = FakeClient()
     telegram = FakeTelegramApp()
     trader = TestnetAutoTrader(_settings(), client, telegram)
-
-    async def fake_create_market_order(**kwargs):
-        client.orders.append(kwargs)
-        return {"orderId": 321, "status": "FILLED", "avgPrice": "2106.94", "updateTime": 1234567890, **kwargs}
-
-    client.create_market_order = fake_create_market_order
 
     def fake_signal(candles, base, day_pnl=0.0):
         class FakeDecision:
@@ -343,12 +442,24 @@ async def test_auto_trader_reanchors_short_exit_levels_to_fill_price(monkeypatch
     monkeypatch.setattr("src.gridbot.testnet.auto_trader.generate_router_allocator_v13_trend350_live_decision", fake_signal)
 
     await trader.run_cycle()
+    client.position = PositionInfo(
+        symbol="ETHUSDC",
+        position_amt=-0.057,
+        entry_price=2106.94,
+        mark_price=2106.5,
+        unrealized_pnl=0.02,
+        liquidation_price=2500,
+        leverage=8,
+        margin_type="isolated",
+    )
+    client.open_orders = []
+    await trader.run_manage_cycle()
 
     plan = trader._plans["ETHUSDC"]
     assert plan.entry_price == 2106.94
-    assert plan.opened_at_ms == 1234567890
-    assert plan.stop_loss == pytest.approx(2131.6017)
-    assert plan.take_profit == pytest.approx(2092.6958)
+    assert plan.stop_loss == pytest.approx(2138.6117)
+    assert plan.take_profit == pytest.approx(2099.7058)
+    assert client.limit_orders[-1]["price"] == pytest.approx(plan.take_profit)
 
 
 def test_executed_entry_price_ignores_zero_avg_price():
@@ -467,8 +578,10 @@ async def test_auto_trader_opens_short_from_router_signal(monkeypatch):
     assert client.leverage_calls == [("ETHUSDC", 8)]
     assert client.orders[0]["side"] == "SELL"
     assert client.orders[0]["reduce_only"] is False
-    assert len(client.conditional_orders) == 1
-    assert len(client.limit_orders) == 1
+    assert client.orders[0]["price"] == pytest.approx(2098)
+    assert len(client.conditional_orders) == 0
+    assert len(client.limit_orders) == 0
+    assert "ETHUSDC" in trader._pending_entries
 
 
 @pytest.mark.asyncio
