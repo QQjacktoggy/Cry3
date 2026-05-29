@@ -43,9 +43,9 @@ async def test_order() -> None:
         mark_price = float(mark.get("markPrice") or 0)
         print(f"   Current Mark Price: ${mark_price:,.2f}")
         
-        # 2. Place a small limit buy order far below the market (e.g. mark_price * 0.5)
-        test_price = round(mark_price * 0.5, 2)
-        qty = "0.01"  # small test quantity
+        # 2. Place a small limit buy order far below the market (e.g. mark_price * 0.8)
+        test_price = round(mark_price * 0.8, 2)
+        qty = "0.02"  # 0.02 ETH * ~1600 USD = ~32 USDC notional (exceeds the 20 USDC minimum)
         client_oid = f"cry3test_{int(time.time() * 1000)}"
         
         print(f"\n2. Placing test limit BUY order on {symbol}...")
