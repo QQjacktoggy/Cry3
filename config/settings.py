@@ -40,7 +40,7 @@ class Settings(BaseSettings):
 
     # Testnet trader guardrails and candidate strategy metadata.
     trading_mode: str = "signal_only"
-    testnet_strategy_label: str = "router_allocator_v13_trend350"
+    testnet_strategy_label: str = "router_allocator_high_return_live"
     testnet_equity_usdc: float = 150.0
     testnet_daily_target_pct: float = 2.7
     testnet_auto_trade_interval_minutes: int = 5
@@ -58,10 +58,18 @@ class Settings(BaseSettings):
     testnet_order_notional_usdc: float = 10.0
     testnet_order_leverage: int = 5
     testnet_max_order_notional_usdc: float = 150.0
+    testnet_maker_fee_rate: float = 0.0002
+    testnet_taker_fee_rate: float = 0.0004
     testnet_exchange_protection_enabled: bool = True
     testnet_min_reward_pct: float = 0.12
     testnet_entry_order_ttl_bars: int = 8
+    testnet_entry_fill_policy: str = "limit_tolerance"
     testnet_entry_tolerance_bps: float = 0.0
+    testnet_entry_tolerance_min_score: int = 0
+    testnet_entry_reprice_enabled: bool = True
+    testnet_entry_reprice_trigger_bps: float = 2.0
+    testnet_entry_reprice_cooldown_seconds: int = 15
+    testnet_entry_reprice_max_updates: int = 3
     testnet_daily_report_enabled: bool = True
     testnet_daily_report_hour: int = 21
     testnet_daily_report_minute: int = 0

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -12,7 +13,18 @@ from src.gridbot.binance.client import BinanceFuturesClient
 from src.gridbot.binance.models import IncomeRecord, PositionInfo
 from src.gridbot.strategy.long_ntrend import NTrendConfig, generate_ntrend_signal
 from src.gridbot.strategy.long_pullback import Candle, SignalPlan, StrategyConfig
-from src.gridbot.strategy.signal_journal import generate_router_allocator_v13_trend350_live_decision
+from src.gridbot.strategy.signal_journal import (
+    explain_router_allocator_high_return_live_block,
+    explain_router_allocator_v13_trend350_live_block,
+    generate_router_allocator_high_return_live_decision,
+    generate_router_allocator_v13_trend350_live_decision,
+)
+from src.gridbot.testnet.fill_policy import (
+    effective_entry_tolerance_bps,
+    entry_limit_price,
+    normalize_entry_fill_policy,
+    reward_pct_for_entry,
+)
 from src.gridbot.testnet.trader import TestnetOrderResult, TestnetTrader
 from src.gridbot.utils.logging import get_logger
 
@@ -85,8 +97,15 @@ REASON_LABELS = {
 }
 
 ENTRY_MODE_LABELS = {
+    "router_limit": "高報酬 Router 原始 Entry 掛單",
+    "router_filled": "高報酬 Router Entry 成交",
     "trend350_limit": "Trend350 原始 Entry 掛單",
     "trend350_filled": "Trend350 Entry 成交",
+}
+
+FILL_POLICY_LABELS = {
+    "strict": "嚴格原始 Entry",
+    "limit_tolerance": "限價容忍補單",
 }
 
 
@@ -134,10 +153,14 @@ class PendingEntry:
     order_entry_price: float
     planned_stop: float
     planned_take_profit: float
+    fill_policy: str
+    tolerance_bps: float
     order_id: int | None
     client_order_id: str
     quantity: str
     created_at_ms: int
+    last_update_ms: int
+    update_count: int
     expires_at_ms: int
     reason: str
 
@@ -161,6 +184,7 @@ class TestnetAutoTrader:
         self._target_stop_notified = False
         self._loss_stop_notified = False
         self._last_flat_manage_check_ms: dict[str, int] = {}
+        self._cooldown_until: dict[str, float] = {}
 
     async def run_cycle(self) -> None:
         await self.run_manage_cycle()
@@ -248,7 +272,7 @@ class TestnetAutoTrader:
                     reduce_only=False,
                     order={"orderId": pending.order_id, "clientOrderId": pending.client_order_id},
                 )
-                await self._notify_entry(result, pending.decision, plan, entry_mode="trend350_filled")
+                await self._notify_entry(result, pending.decision, plan, entry_mode=self._router_entry_mode("filled"))
             if symbol not in self._plans:
                 recovered = await self._recover_plan(symbol, position, today_net)
                 if recovered is not None:
@@ -276,6 +300,7 @@ class TestnetAutoTrader:
             await self._notify_exchange_exit(symbol, plan, exit_order, today_net=today_net)
         else:
             await self._cleanup_stale_protection_orders(symbol)
+            await self._cleanup_stale_entry_orders(symbol)
         self._last_flat_manage_check_ms[symbol] = self._now_ms()
 
         if today_net >= target_stop:
@@ -303,6 +328,22 @@ class TestnetAutoTrader:
         candles = await self._load_candles(symbol)
         decision = self._live_signal_decision(symbol, candles, today_net)
         signal = decision.signal
+        if self._blocks_exploratory_live_entry(decision):
+            logger.info(
+                "testnet_signal_wait_exploratory_block",
+                symbol=symbol,
+                strategy=decision.strategy,
+                regime=decision.regime,
+                risk_mode=decision.risk_mode,
+                market_playbook=decision.market_playbook,
+                allocator_profile=decision.allocator_profile,
+                allocator_state=decision.allocator_state,
+                allocator_scale=decision.allocator_scale,
+                action=signal.action,
+                score=signal.score,
+                reasons=signal.reasons[:3],
+            )
+            return
         if signal.action not in {"PLAN_LONG", "PLAN_SHORT"} or signal.score < self._settings.testnet_min_signal_score:
             logger.info(
                 "testnet_signal_wait",
@@ -344,7 +385,15 @@ class TestnetAutoTrader:
             return
         planned_entry = self._planned_entry_price(signal)
         planned_stop, planned_take_profit = self._live_exit_levels(signal, direction, planned_entry)
-        order_entry_price = self._entry_limit_price(direction, planned_entry, planned_stop, planned_take_profit)
+        fill_policy = normalize_entry_fill_policy(self._settings.testnet_entry_fill_policy)
+        tolerance_bps = self._entry_tolerance_bps(decision)
+        order_entry_price = self._entry_limit_price(
+            direction,
+            planned_entry,
+            planned_stop,
+            planned_take_profit,
+            tolerance_bps=tolerance_bps,
+        )
         tolerated_reward_pct = self._reward_pct_for_entry(order_entry_price, planned_take_profit, direction)
         if tolerated_reward_pct < self._settings.testnet_min_reward_pct:
             logger.info(
@@ -364,7 +413,45 @@ class TestnetAutoTrader:
                 take_profit=planned_take_profit,
                 reward_pct=tolerated_reward_pct,
                 min_reward_pct=self._settings.testnet_min_reward_pct,
-                tolerance_bps=self._settings.testnet_entry_tolerance_bps,
+                fill_policy=fill_policy,
+                tolerance_bps=tolerance_bps,
+                configured_tolerance_bps=self._settings.testnet_entry_tolerance_bps,
+                reasons=signal.reasons[:3],
+            )
+            return
+        reprice_headroom_reward_pct = self._reprice_headroom_reward_pct(
+            direction,
+            order_entry_price,
+            planned_stop,
+            planned_take_profit,
+            tolerance_bps=tolerance_bps,
+        )
+        reprice_min_reward_pct = self._effective_reprice_min_reward_pct(decision)
+        if (
+            reprice_headroom_reward_pct is not None
+            and reprice_headroom_reward_pct < reprice_min_reward_pct
+        ):
+            logger.info(
+                "testnet_signal_wait_reprice_headroom",
+                symbol=symbol,
+                strategy=decision.strategy,
+                regime=decision.regime,
+                risk_mode=decision.risk_mode,
+                market_playbook=decision.market_playbook,
+                allocator_profile=decision.allocator_profile,
+                allocator_state=decision.allocator_state,
+                allocator_scale=decision.allocator_scale,
+                action=signal.action,
+                score=signal.score,
+                order_entry_price=order_entry_price,
+                take_profit=planned_take_profit,
+                reward_pct=tolerated_reward_pct,
+                reprice_headroom_reward_pct=reprice_headroom_reward_pct,
+                min_reward_pct=reprice_min_reward_pct,
+                configured_min_reward_pct=self._settings.testnet_min_reward_pct,
+                reprice_trigger_bps=self._settings.testnet_entry_reprice_trigger_bps,
+                fill_policy=fill_policy,
+                tolerance_bps=tolerance_bps,
                 reasons=signal.reasons[:3],
             )
             return
@@ -378,6 +465,8 @@ class TestnetAutoTrader:
             order_entry_price=order_entry_price,
             planned_stop=planned_stop,
             planned_take_profit=planned_take_profit,
+            fill_policy=fill_policy,
+            tolerance_bps=tolerance_bps,
         )
 
     async def _place_pending_entry_limit(
@@ -391,6 +480,8 @@ class TestnetAutoTrader:
         order_entry_price: float,
         planned_stop: float,
         planned_take_profit: float,
+        fill_policy: str,
+        tolerance_bps: float,
     ) -> None:
         result = await self._trader.place_entry_limit(
             symbol,
@@ -413,15 +504,19 @@ class TestnetAutoTrader:
             order_entry_price=order_entry_price,
             planned_stop=planned_stop,
             planned_take_profit=planned_take_profit,
+            fill_policy=fill_policy,
+            tolerance_bps=tolerance_bps,
             order_id=self._order_int(result.order, "orderId"),
             client_order_id=client_order_id,
             quantity=result.quantity,
             created_at_ms=now_ms,
+            last_update_ms=now_ms,
+            update_count=0,
             expires_at_ms=now_ms + self._settings.testnet_entry_order_ttl_bars * self._interval_ms(),
-            reason="trend350 entry limit",
+            reason="router entry limit",
         )
         logger.info(
-            "testnet_trend350_entry_limit_placed",
+            "testnet_router_entry_limit_placed",
             symbol=symbol,
             strategy=decision.strategy,
             regime=decision.regime,
@@ -437,7 +532,9 @@ class TestnetAutoTrader:
             stop=planned_stop,
             take_profit=planned_take_profit,
             ttl_bars=self._settings.testnet_entry_order_ttl_bars,
-            tolerance_bps=self._settings.testnet_entry_tolerance_bps,
+            fill_policy=fill_policy,
+            tolerance_bps=tolerance_bps,
+            configured_tolerance_bps=self._settings.testnet_entry_tolerance_bps,
             order_id=result.order.get("orderId"),
             client_order_id=client_order_id,
         )
@@ -449,36 +546,125 @@ class TestnetAutoTrader:
         if not order_open:
             self._pending_entries.pop(symbol, None)
             logger.info(
-                "testnet_trend350_entry_order_missing",
+                "testnet_router_entry_order_missing",
                 symbol=symbol,
                 strategy=pending.decision.strategy,
                 order_id=pending.order_id,
                 client_order_id=pending.client_order_id,
             )
             return
+        if await self._maybe_reprice_pending_entry(symbol, pending):
+            return
         if self._now_ms() < pending.expires_at_ms:
             logger.info(
-                "testnet_trend350_entry_limit_wait",
+                "testnet_router_entry_limit_wait",
                 symbol=symbol,
                 strategy=pending.decision.strategy,
                 action=pending.decision.signal.action,
                 entry=pending.order_entry_price,
                 planned_entry=pending.planned_entry,
+                fill_policy=pending.fill_policy,
+                tolerance_bps=pending.tolerance_bps,
                 expires_in_seconds=max(0, (pending.expires_at_ms - self._now_ms()) // 1000),
             )
             return
         await self._cancel_pending_entry(symbol, pending, reason="entry expired")
+
+    async def _maybe_reprice_pending_entry(self, symbol: str, pending: PendingEntry) -> bool:
+        if not self._settings.testnet_entry_reprice_enabled:
+            return False
+        if pending.update_count >= self._settings.testnet_entry_reprice_max_updates:
+            return False
+        if pending.fill_policy != "limit_tolerance":
+            return False
+        now_ms = self._now_ms()
+        cooldown_ms = max(0, self._settings.testnet_entry_reprice_cooldown_seconds) * 1000
+        if now_ms - pending.last_update_ms < cooldown_ms:
+            return False
+
+        mark_price = await self._current_mark_price(symbol)
+        if not self._entry_price_drifted(pending.direction, pending.order_entry_price, mark_price):
+            return False
+
+        refreshed_entry_price = self._entry_limit_price(
+            pending.direction,
+            mark_price,
+            pending.planned_stop,
+            pending.planned_take_profit,
+            tolerance_bps=pending.tolerance_bps,
+        )
+        if abs(refreshed_entry_price - pending.order_entry_price) < 1e-9:
+            return False
+
+        refreshed_reward_pct = self._reward_pct_for_entry(
+            refreshed_entry_price,
+            pending.planned_take_profit,
+            pending.direction,
+        )
+        reprice_min_reward_pct = self._effective_reprice_min_reward_pct(pending.decision)
+        if refreshed_reward_pct < reprice_min_reward_pct:
+            held_pending = self._hold_pending_entry_on_first_low_reward_reprice(
+                symbol,
+                pending,
+                refreshed_reward_pct,
+                reprice_min_reward_pct,
+                now_ms,
+            )
+            if held_pending:
+                return True
+            await self._cancel_pending_entry(symbol, pending, reason="entry repriced reward too low")
+            return True
+
+        if pending.order_id is not None:
+            await self._client.cancel_order(symbol, order_id=pending.order_id)
+        result = await self._trader.place_entry_limit(
+            symbol,
+            pending.direction,
+            refreshed_entry_price,
+            pending.notional,
+            leverage=pending.leverage,
+        )
+        client_order_id = str(result.order.get("clientOrderId") or result.order.get("clientOrderId".lower()) or "")
+        if not client_order_id:
+            client_order_id = str(result.order.get("newClientOrderId") or "")
+        updated_pending = replace(
+            pending,
+            order_entry_price=refreshed_entry_price,
+            order_id=self._order_int(result.order, "orderId"),
+            client_order_id=client_order_id,
+            quantity=result.quantity,
+            last_update_ms=now_ms,
+            update_count=pending.update_count + 1,
+            reason="router entry repriced",
+        )
+        self._pending_entries[symbol] = updated_pending
+        logger.info(
+            "testnet_router_entry_limit_repriced",
+            symbol=symbol,
+            strategy=pending.decision.strategy,
+            action=pending.decision.signal.action,
+            old_order_id=pending.order_id,
+            new_order_id=result.order.get("orderId"),
+            old_entry=pending.order_entry_price,
+            new_entry=refreshed_entry_price,
+            mark_price=mark_price,
+            update_count=updated_pending.update_count,
+            reward_pct=refreshed_reward_pct,
+        )
+        return True
 
     async def _cancel_pending_entry(self, symbol: str, pending: PendingEntry, reason: str) -> None:
         if pending.order_id is not None:
             await self._client.cancel_order(symbol, order_id=pending.order_id)
         self._pending_entries.pop(symbol, None)
         logger.info(
-            "testnet_trend350_entry_limit_cancelled",
+            "testnet_router_entry_limit_cancelled",
             symbol=symbol,
             strategy=pending.decision.strategy,
             order_id=pending.order_id,
             client_order_id=pending.client_order_id,
+            fill_policy=pending.fill_policy,
+            tolerance_bps=pending.tolerance_bps,
             reason=reason,
         )
 
@@ -500,7 +686,7 @@ class TestnetAutoTrader:
             take_profit=pending.planned_take_profit,
             max_holding_bars=pending.decision.max_holding_bars,
             score=pending.decision.signal.score,
-            reasons=[f"strategy={pending.decision.strategy}", "trend350_entry_limit_fill"] + pending.decision.signal.reasons,
+            reasons=[f"strategy={pending.decision.strategy}", "router_entry_limit_fill"] + pending.decision.signal.reasons,
         )
 
     async def _manage_position(self, symbol: str, position: PositionInfo, today_net: float) -> None:
@@ -528,6 +714,8 @@ class TestnetAutoTrader:
         if result:
             await self._cleanup_stale_protection_orders(symbol)
             self._plans.pop(symbol, None)
+            if reason == "strategy stop loss":
+                self._cooldown_until[plan.strategy] = time.time() + 300
             await self._notify_order(reason, result, position, plan, today_net=today_net)
 
     async def _close_unmanaged_position(self, symbol: str, position: PositionInfo, today_net: float) -> None:
@@ -568,8 +756,8 @@ class TestnetAutoTrader:
             risk_per_trade_pct=0.9,
             min_score=self._settings.testnet_min_signal_score,
             max_position_margin_pct=self._settings.testnet_max_position_margin_pct,
-            maker_fee_rate=0.0,
-            taker_fee_rate=0.0004,
+            maker_fee_rate=self._settings.testnet_maker_fee_rate,
+            taker_fee_rate=self._settings.testnet_taker_fee_rate,
         )
         return NTrendConfig(base=base)
 
@@ -579,7 +767,50 @@ class TestnetAutoTrader:
         candles: list[Candle],
         today_net: float,
     ) -> LiveDecisionContext:
-        if self._settings.testnet_strategy_label.startswith("router_allocator_v13_trend350"):
+        if self._settings.testnet_strategy_label == "winrate_optimized_portfolio":
+            from src.gridbot.strategy.winrate_optimized_portfolio import generate_winrate_optimized_portfolio_decision
+            decision = generate_winrate_optimized_portfolio_decision(
+                candles=candles,
+                today_net=today_net,
+                cooldown_until=self._cooldown_until,
+                equity_usdc=self._settings.testnet_equity_usdc,
+            )
+            if decision is None:
+                return LiveDecisionContext(
+                    signal=SignalPlan(
+                        action="WAIT",
+                        confidence=0,
+                        score=0,
+                        symbol=symbol,
+                        price=candles[-1].close,
+                        rsi=None,
+                        atr=None,
+                        support=None,
+                        vwap=None,
+                        reasons=["winrate_optimized_portfolio: no signal triggered or filtered out"],
+                    ),
+                    strategy="portfolio_wait",
+                    regime="blocked",
+                    risk_mode="blocked",
+                    market_playbook="blocked",
+                    allocator_state="blocked",
+                    allocator_profile="blocked",
+                    allocator_scale=0.0,
+                    max_holding_bars=0,
+                )
+            return LiveDecisionContext(
+                signal=decision.signal,
+                strategy=decision.strategy,
+                regime=decision.regime,
+                risk_mode=decision.risk_mode,
+                market_playbook=decision.market_playbook,
+                allocator_state=decision.allocator_state,
+                allocator_profile=decision.allocator_profile,
+                allocator_scale=decision.allocator_scale,
+                max_holding_bars=decision.max_holding_bars,
+            )
+
+        if self._uses_router_live_family():
             base = StrategyConfig(
                 symbol=symbol,
                 equity_usdc=self._settings.testnet_equity_usdc,
@@ -589,8 +820,8 @@ class TestnetAutoTrader:
                 risk_per_trade_pct=100.0,
                 min_score=60,
                 max_effective_leverage=self._settings.max_effective_leverage,
-                maker_fee_rate=0.0,
-                taker_fee_rate=0.0004,
+                maker_fee_rate=self._settings.testnet_maker_fee_rate,
+                taker_fee_rate=self._settings.testnet_taker_fee_rate,
                 daily_soft_loss_pct=self._settings.daily_soft_loss_pct,
                 daily_max_loss_pct=self._settings.max_daily_loss_pct,
                 daily_loss_risk_scale=0.55,
@@ -604,8 +835,19 @@ class TestnetAutoTrader:
                 take_profit_r=(0.55, 1.1, 2.2),
                 exit_weights=(0.25, 0.35, 0.40),
             )
-            decision = generate_router_allocator_v13_trend350_live_decision(candles, base, today_net)
+            decision_fn = (
+                generate_router_allocator_v13_trend350_live_decision
+                if self._settings.testnet_strategy_label.startswith("router_allocator_v13_trend350")
+                else generate_router_allocator_high_return_live_decision
+            )
+            block_reason_fn = (
+                explain_router_allocator_v13_trend350_live_block
+                if self._settings.testnet_strategy_label.startswith("router_allocator_v13_trend350")
+                else explain_router_allocator_high_return_live_block
+            )
+            decision = decision_fn(candles, base, today_net)
             if decision is None:
+                blocked_reason = block_reason_fn(candles, base, today_net)
                 return LiveDecisionContext(
                     signal=SignalPlan(
                         action="WAIT",
@@ -617,7 +859,7 @@ class TestnetAutoTrader:
                         atr=None,
                         support=None,
                         vwap=None,
-                        reasons=["router live decision blocked"],
+                        reasons=[f"router live decision blocked: {blocked_reason}"],
                     ),
                     strategy="router_wait",
                     regime="blocked",
@@ -652,6 +894,22 @@ class TestnetAutoTrader:
             allocator_scale=1.0,
             max_holding_bars=48,
         )
+
+    def _uses_router_live_family(self) -> bool:
+        label = self._settings.testnet_strategy_label
+        return (
+            label.startswith("router_allocator_high_return")
+            or label.startswith("router_allocator_v9")
+            or label.startswith("router_allocator_v11")
+            or label.startswith("router_allocator_v13_trend350")
+        )
+
+    def _router_entry_mode(self, phase: str) -> str:
+        prefix = "trend350" if self._settings.testnet_strategy_label.startswith("router_allocator_v13_trend350") else "router"
+        return f"{prefix}_{phase}"
+
+    def _blocks_exploratory_live_entry(self, decision: LiveDecisionContext) -> bool:
+        return self._uses_router_live_family() and decision.allocator_profile == "exploratory_long"
 
     def _bounded_signal_notional(self, signal: SignalPlan) -> float:
         leverage = self._bounded_signal_leverage(signal)
@@ -703,13 +961,110 @@ class TestnetAutoTrader:
         return self._reward_pct_for_entry(planned_entry, planned_tp, direction)
 
     def _reward_pct_for_entry(self, entry: float, take_profit: float, direction: str) -> float:
-        if entry <= 0 or take_profit <= 0:
-            return 0.0
+        return reward_pct_for_entry(entry, take_profit, direction)
+
+    def _reprice_headroom_reward_pct(
+        self,
+        direction: str,
+        order_entry_price: float,
+        planned_stop: float,
+        planned_take_profit: float,
+        *,
+        tolerance_bps: float,
+    ) -> float | None:
+        if not self._settings.testnet_entry_reprice_enabled:
+            return None
+        if normalize_entry_fill_policy(self._settings.testnet_entry_fill_policy) != "limit_tolerance":
+            return None
+        if order_entry_price <= 0:
+            return None
+        trigger_ratio = self._settings.testnet_entry_reprice_trigger_bps / 10_000
         if direction == "short":
-            reward_distance = entry - take_profit
+            simulated_mark_price = order_entry_price * (1 - trigger_ratio)
         else:
-            reward_distance = take_profit - entry
-        return max(reward_distance, 0.0) / entry * 100
+            simulated_mark_price = order_entry_price * (1 + trigger_ratio)
+        simulated_entry = self._entry_limit_price(
+            direction,
+            simulated_mark_price,
+            planned_stop,
+            planned_take_profit,
+            tolerance_bps=tolerance_bps,
+        )
+        return self._reward_pct_for_entry(simulated_entry, planned_take_profit, direction)
+
+    def _effective_reprice_min_reward_pct(self, decision: LiveDecisionContext) -> float:
+        min_reward_pct = self._settings.testnet_min_reward_pct
+        if not self._uses_router_live_family():
+            return min_reward_pct
+        if (
+            decision.strategy == "orb_long"
+            and decision.regime == "trend_up"
+            and decision.allocator_profile in {"trend_up_normal_weak", "trend_up_normal", "trend_up_aggressive"}
+            and decision.allocator_scale >= 0.35
+            and decision.signal.score >= 84
+        ):
+            return max(0.08, min_reward_pct * 0.80)
+        if decision.signal.score < 90:
+            return min_reward_pct
+        if decision.strategy == "orb_long" and decision.regime in {"trend_up", "low_liquidity"}:
+            return max(0.08, min_reward_pct * 0.80)
+        if decision.strategy == "orb_short" and decision.regime in {"trend_down", "high_volatility"}:
+            return max(0.08, min_reward_pct * 0.80)
+        return min_reward_pct
+
+    def _hold_pending_entry_on_first_low_reward_reprice(
+        self,
+        symbol: str,
+        pending: PendingEntry,
+        refreshed_reward_pct: float,
+        reprice_min_reward_pct: float,
+        now_ms: int,
+    ) -> bool:
+        decision = pending.decision
+        if pending.reason == "router entry hold after low reward reprice":
+            return False
+        if (
+            decision.strategy != "orb_long"
+            or decision.regime != "trend_up"
+            or decision.allocator_profile not in {"trend_up_normal_weak", "trend_up_normal", "trend_up_aggressive"}
+            or decision.allocator_scale < 0.35
+            or decision.signal.score < 84
+        ):
+            return False
+        held_pending = replace(
+            pending,
+            last_update_ms=now_ms,
+            reason="router entry hold after low reward reprice",
+        )
+        self._pending_entries[symbol] = held_pending
+        logger.info(
+            "testnet_router_entry_limit_hold_low_reward",
+            symbol=symbol,
+            strategy=decision.strategy,
+            order_id=pending.order_id,
+            client_order_id=pending.client_order_id,
+            current_entry=pending.order_entry_price,
+            refreshed_reward_pct=refreshed_reward_pct,
+            min_reward_pct=reprice_min_reward_pct,
+            update_count=pending.update_count,
+        )
+        return True
+
+    def _entry_price_drifted(self, direction: str, order_entry_price: float, mark_price: float) -> bool:
+        if order_entry_price <= 0 or mark_price <= 0:
+            return False
+        trigger_ratio = self._settings.testnet_entry_reprice_trigger_bps / 10_000
+        if direction == "short":
+            return mark_price <= order_entry_price * (1 - trigger_ratio)
+        return mark_price >= order_entry_price * (1 + trigger_ratio)
+
+    def _entry_tolerance_bps(self, decision: LiveDecisionContext) -> float:
+        return effective_entry_tolerance_bps(
+            self._settings.testnet_entry_fill_policy,
+            self._settings.testnet_entry_tolerance_bps,
+            score=decision.signal.score,
+            min_score=self._settings.testnet_entry_tolerance_min_score,
+        )
 
     def _entry_limit_price(
         self,
@@ -717,26 +1072,14 @@ class TestnetAutoTrader:
         planned_entry: float,
         planned_stop: float,
         planned_take_profit: float,
+        tolerance_bps: float | None = None,
     ) -> float:
-        tolerance_bps = max(0.0, float(self._settings.testnet_entry_tolerance_bps))
-        if tolerance_bps <= 0 or planned_entry <= 0:
-            return planned_entry
-
-        shift = planned_entry * tolerance_bps / 10_000
-        epsilon = max(planned_entry * 0.000001, 0.0001)
-        if direction == "short":
-            candidate = planned_entry - shift
-            if planned_take_profit > 0:
-                candidate = max(candidate, planned_take_profit + epsilon)
-            if planned_stop > 0:
-                candidate = min(candidate, planned_stop - epsilon)
-        else:
-            candidate = planned_entry + shift
-            if planned_take_profit > 0:
-                candidate = min(candidate, planned_take_profit - epsilon)
-            if planned_stop > 0:
-                candidate = max(candidate, planned_stop + epsilon)
-        return round(max(candidate, 0.0), 8)
+        if tolerance_bps is None:
+            tolerance_bps = effective_entry_tolerance_bps(
+                self._settings.testnet_entry_fill_policy,
+                self._settings.testnet_entry_tolerance_bps,
+            )
+        return entry_limit_price(direction, planned_entry, planned_stop, planned_take_profit, tolerance_bps)
 
     async def _sync_protection_orders(self, symbol: str, plan: ActivePlan, quantity: str | None = None) -> None:
         if not self._settings.testnet_exchange_protection_enabled:
@@ -805,6 +1148,16 @@ class TestnetAutoTrader:
                 client_order_id.startswith(STOP_ORDER_PREFIX)
                 or client_order_id.startswith(TAKE_PROFIT_ORDER_PREFIX)
             ):
+                continue
+            await self._cancel_plain_order(symbol, order)
+
+    async def _cleanup_stale_entry_orders(self, symbol: str) -> None:
+        if symbol in self._pending_entries:
+            return
+        open_orders = await self._client.get_open_orders(symbol)
+        for order in open_orders:
+            client_order_id = self._protection_client_order_id(order)
+            if not client_order_id.startswith(ENTRY_ORDER_PREFIX):
                 continue
             await self._cancel_plain_order(symbol, order)
 
@@ -1058,7 +1411,7 @@ class TestnetAutoTrader:
         result: TestnetOrderResult,
         decision: LiveDecisionContext,
         plan: ActivePlan,
-        entry_mode: str = "trend350_filled",
+        entry_mode: str = "router_filled",
     ) -> None:
         signal = decision.signal
         reasons = "\n".join(f"- {escape(reason)}" for reason in signal.reasons[:4])
@@ -1106,8 +1459,9 @@ class TestnetAutoTrader:
     ) -> None:
         signal = decision.signal
         reasons = "\n".join(f"- {escape(reason)}" for reason in signal.reasons[:4])
+        heading = _label_entry_mode(self._router_entry_mode("limit"))
         await self._notify_text(
-            "🧾 <b>Testnet Trend350 Entry 掛單</b>\n"
+            f"🧾 <b>Testnet {escape(heading)}</b>\n"
             f"交易對：<code>{escape(result.symbol)}</code>\n"
             f"方向：<b>{escape(_label_side(result.side))}</b>\n"
             f"數量：<code>{escape(result.quantity)}</code>\n"
@@ -1116,8 +1470,9 @@ class TestnetAutoTrader:
             f"趨勢判定：<b>{escape(_label_regime(decision.regime))}</b> | 風險模式：<b>{escape(_label_risk_mode(decision.risk_mode))}</b>\n"
             f"市況劇本：<b>{escape(_label_playbook(decision.market_playbook))}</b>\n"
             f"訊號分數：{signal.score} | 信心度：{signal.confidence}\n"
+            f"成交政策：<b>{escape(_label_fill_policy(pending.fill_policy))}</b>\n"
             f"Entry Limit：${pending.order_entry_price:.4f}\n"
-            f"原始 Entry：${pending.planned_entry:.4f} | 容忍：{self._settings.testnet_entry_tolerance_bps:.2f} bps\n"
+            f"原始 Entry：${pending.planned_entry:.4f} | 實際容忍：{pending.tolerance_bps:.2f} bps\n"
             f"停損：${pending.planned_stop:.4f} | TP1：${pending.planned_take_profit:.4f}\n"
             f"有效：{self._settings.testnet_entry_order_ttl_bars} 根 K 線\n"
             f"訂單 ID：<code>{escape(str(result.order.get('orderId', 'N/A')))}</code>\n"
@@ -1179,6 +1534,7 @@ class TestnetAutoTrader:
             reason = "交易所停利單成交"
         elif client_order_id.startswith(STOP_ORDER_PREFIX):
             reason = "交易所停損單成交"
+            self._cooldown_until[plan.strategy] = time.time() + 300
         elif client_order_id.startswith("cry3close_"):
             reason = "市價平倉單成交"
 
@@ -1304,3 +1660,7 @@ def _label_reason(value: str) -> str:
 
 def _label_entry_mode(value: str) -> str:
     return ENTRY_MODE_LABELS.get(value, value)
+
+
+def _label_fill_policy(value: str) -> str:
+    return FILL_POLICY_LABELS.get(value, value)

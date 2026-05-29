@@ -10,6 +10,9 @@ from decimal import Decimal, ROUND_HALF_UP
 from config.settings import Settings
 from src.gridbot.binance.client import BinanceFuturesClient
 from src.gridbot.binance.models import PositionInfo
+from src.gridbot.utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -44,13 +47,24 @@ class TestnetTrader:
         leverage = self._bounded_leverage(leverage)
         qty = await self._quantity_for_notional(symbol, notional)
 
-        await self._client.set_leverage(symbol, leverage)
+        leverage_response = await self._client.set_leverage(symbol, leverage)
         order = await self._client.create_market_order(
             symbol=symbol,
             side=side,
             quantity=qty,
             reduce_only=False,
             client_order_id=_client_order_id("cry3tn"),
+        )
+        logger.info(
+            "testnet_market_entry_submitted",
+            symbol=symbol,
+            side=side,
+            quantity=qty,
+            notional_usdc=notional,
+            requested_leverage=leverage,
+            leverage_response=leverage_response,
+            order_id=order.get("orderId"),
+            client_order_id=order.get("clientOrderId") or order.get("newClientOrderId"),
         )
         return TestnetOrderResult(symbol, side, qty, notional, leverage, False, order)
 
@@ -69,7 +83,7 @@ class TestnetTrader:
         leverage = self._bounded_leverage(leverage)
         qty = await self._quantity_for_notional_at_price(symbol, notional, entry_price)
 
-        await self._client.set_leverage(symbol, leverage)
+        leverage_response = await self._client.set_leverage(symbol, leverage)
         order = await self._client.create_limit_order(
             symbol=symbol,
             side=side,
@@ -77,6 +91,18 @@ class TestnetTrader:
             price=entry_price,
             reduce_only=False,
             client_order_id=_client_order_id("cry3en"),
+        )
+        logger.info(
+            "testnet_limit_entry_submitted",
+            symbol=symbol,
+            side=side,
+            quantity=qty,
+            entry_price=entry_price,
+            notional_usdc=notional,
+            requested_leverage=leverage,
+            leverage_response=leverage_response,
+            order_id=order.get("orderId"),
+            client_order_id=order.get("clientOrderId") or order.get("newClientOrderId"),
         )
         return TestnetOrderResult(symbol, side, qty, notional, leverage, False, order)
 

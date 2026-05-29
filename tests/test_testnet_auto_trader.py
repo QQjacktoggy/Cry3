@@ -138,6 +138,7 @@ def _settings(**kwargs):
         "trading_symbols": "ETHUSDC",
         "trading_mode": "testnet_live",
         "telegram_chat_id": "123",
+        "testnet_strategy_label": "router_allocator_v13_trend350",
         "testnet_equity_usdc": 150,
         "testnet_max_order_notional_usdc": 150,
         "max_effective_leverage": 20,
@@ -189,13 +190,71 @@ async def test_auto_trader_opens_and_notifies(monkeypatch):
     assert client.orders[0]["side"] == "BUY"
     assert client.orders[0]["reduce_only"] is False
     assert telegram.bot.messages
-    assert "Testnet Trend350 Entry 掛單" in telegram.bot.messages[0]["text"]
+    assert "Testnet Trend350 原始 Entry 掛單" in telegram.bot.messages[0]["text"]
     assert "策略：<b>orb_long</b>" in telegram.bot.messages[0]["text"]
     assert "方向：<b>買入 / 回補</b>" in telegram.bot.messages[0]["text"]
     assert "趨勢判定：<b>上升趨勢</b> | 風險模式：<b>積極</b>" in telegram.bot.messages[0]["text"]
     assert "Entry Limit：$2100.0000" in telegram.bot.messages[0]["text"]
     assert len(client.conditional_orders) == 0
     assert len(client.limit_orders) == 0
+    assert "ETHUSDC" in trader._pending_entries
+
+
+@pytest.mark.asyncio
+async def test_auto_trader_high_return_label_uses_high_return_live_wrapper(monkeypatch):
+    client = FakeClient()
+    telegram = FakeTelegramApp()
+    trader = TestnetAutoTrader(_settings(testnet_strategy_label="router_allocator_high_return_live"), client, telegram)
+
+    def unexpected_legacy_signal(candles, base, day_pnl=0.0):
+        raise AssertionError("legacy trend350 live wrapper should not run for high-return label")
+
+    def fake_high_return_signal(candles, base, day_pnl=0.0):
+        class FakeDecision:
+            signal = SignalPlan(
+                action="PLAN_LONG",
+                confidence=88,
+                score=88,
+                symbol="ETHUSDC",
+                price=2100,
+                rsi=55,
+                atr=20,
+                support=2050,
+                vwap=2080,
+                entries=[2100],
+                stop_loss=2070,
+                take_profits=[2130],
+                planned_notional_usdc=300,
+                leverage_cap=10,
+                reasons=["high return router"],
+            )
+            strategy = "orb_long"
+            regime = "trend_up"
+            risk_mode = "aggressive"
+            market_playbook = "breakout"
+            allocator_state = "active"
+            allocator_profile = "trend_aggressive"
+            allocator_scale = 3.5
+            max_holding_bars = 24
+
+        return FakeDecision()
+
+    monkeypatch.setattr(
+        "src.gridbot.testnet.auto_trader.generate_router_allocator_v13_trend350_live_decision",
+        unexpected_legacy_signal,
+    )
+    monkeypatch.setattr(
+        "src.gridbot.testnet.auto_trader.generate_router_allocator_high_return_live_decision",
+        fake_high_return_signal,
+    )
+
+    await trader.run_cycle()
+
+    assert client.leverage_calls == [("ETHUSDC", 10)]
+    assert client.orders[0]["side"] == "BUY"
+    assert telegram.bot.messages
+    assert "Testnet 高報酬 Router 原始 Entry 掛單" in telegram.bot.messages[0]["text"]
+    assert "策略：<b>orb_long</b>" in telegram.bot.messages[0]["text"]
     assert "ETHUSDC" in trader._pending_entries
 
 
@@ -243,11 +302,285 @@ async def test_auto_trader_applies_entry_tolerance_to_limit_price(monkeypatch):
     assert pending.order_entry_price == pytest.approx(2101.05)
 
 
+@pytest.mark.asyncio
+async def test_manage_cycle_reprices_pending_entry_when_mark_runs_away(monkeypatch):
+    client = FakeClient()
+    telegram = FakeTelegramApp()
+    trader = TestnetAutoTrader(
+        _settings(
+            testnet_entry_fill_policy="limit_tolerance",
+            testnet_entry_tolerance_bps=0,
+            testnet_entry_reprice_trigger_bps=2,
+            testnet_entry_reprice_cooldown_seconds=15,
+            testnet_entry_reprice_max_updates=3,
+        ),
+        client,
+        telegram,
+    )
+
+    def fake_signal(candles, base, day_pnl=0.0):
+        class FakeDecision:
+            signal = SignalPlan(
+                action="PLAN_LONG",
+                confidence=82,
+                score=82,
+                symbol="ETHUSDC",
+                price=2100,
+                rsi=55,
+                atr=20,
+                support=2050,
+                vwap=2080,
+                entries=[2100],
+                stop_loss=2070,
+                take_profits=[2130],
+                planned_notional_usdc=300,
+                leverage_cap=10,
+                reasons=["test signal"],
+            )
+            strategy = "orb_long"
+            regime = "trend_up"
+            risk_mode = "aggressive"
+            market_playbook = "breakout"
+            allocator_state = "active"
+            allocator_profile = "trend_aggressive"
+            allocator_scale = 3.5
+            max_holding_bars = 24
+
+        return FakeDecision()
+
+    monkeypatch.setattr("src.gridbot.testnet.auto_trader.generate_router_allocator_v13_trend350_live_decision", fake_signal)
+    monkeypatch.setattr(trader, "_now_ms", lambda: 1_000_000)
+
+    await trader.run_cycle()
+
+    pending = trader._pending_entries["ETHUSDC"]
+    assert pending.order_entry_price == pytest.approx(2100)
+
+    client.mark_price = 2108
+    monkeypatch.setattr(trader, "_now_ms", lambda: 1_016_000)
+    await trader.run_manage_cycle()
+
+    updated = trader._pending_entries["ETHUSDC"]
+    assert updated.order_entry_price == pytest.approx(2108)
+    assert updated.update_count == 1
+    assert client.cancelled_orders == [("ETHUSDC", 321)]
+    assert client.orders[-1]["price"] == pytest.approx(2108)
+
+
+@pytest.mark.asyncio
+async def test_manage_cycle_cancels_pending_entry_when_reprice_kills_reward(monkeypatch):
+    client = FakeClient()
+    trader = TestnetAutoTrader(
+        _settings(
+            testnet_entry_fill_policy="limit_tolerance",
+            testnet_entry_tolerance_bps=0,
+            testnet_entry_reprice_trigger_bps=2,
+            testnet_entry_reprice_cooldown_seconds=15,
+            testnet_entry_reprice_max_updates=3,
+            testnet_min_reward_pct=0.12,
+        ),
+        client,
+        FakeTelegramApp(),
+    )
+
+    def fake_signal(candles, base, day_pnl=0.0):
+        class FakeDecision:
+            signal = SignalPlan(
+                action="PLAN_LONG",
+                confidence=82,
+                score=82,
+                symbol="ETHUSDC",
+                price=2100,
+                rsi=55,
+                atr=20,
+                support=2050,
+                vwap=2080,
+                entries=[2100],
+                stop_loss=2070,
+                take_profits=[2102.6],
+                planned_notional_usdc=300,
+                leverage_cap=10,
+                reasons=["tight reward"],
+            )
+            strategy = "orb_long"
+            regime = "trend_up"
+            risk_mode = "aggressive"
+            market_playbook = "breakout"
+            allocator_state = "active"
+            allocator_profile = "trend_aggressive"
+            allocator_scale = 3.5
+            max_holding_bars = 24
+
+        return FakeDecision()
+
+    monkeypatch.setattr("src.gridbot.testnet.auto_trader.generate_router_allocator_v13_trend350_live_decision", fake_signal)
+    monkeypatch.setattr(trader, "_now_ms", lambda: 2_000_000)
+    monkeypatch.setattr(trader, "_reprice_headroom_reward_pct", lambda *args, **kwargs: None)
+
+    await trader.run_cycle()
+
+    client.mark_price = 2102
+    monkeypatch.setattr(trader, "_now_ms", lambda: 2_016_000)
+    await trader.run_manage_cycle()
+
+    assert "ETHUSDC" not in trader._pending_entries
+    assert client.cancelled_orders == [("ETHUSDC", 321)]
+
+
+@pytest.mark.asyncio
+async def test_manage_cycle_reprices_high_return_breakout_instead_of_cancelling_at_relaxed_reward_floor(monkeypatch):
+    client = FakeClient()
+    telegram = FakeTelegramApp()
+    trader = TestnetAutoTrader(
+        _settings(
+            testnet_strategy_label="router_allocator_high_return_live",
+            testnet_entry_fill_policy="limit_tolerance",
+            testnet_entry_tolerance_bps=0,
+            testnet_entry_reprice_trigger_bps=2,
+            testnet_entry_reprice_cooldown_seconds=15,
+            testnet_entry_reprice_max_updates=3,
+            testnet_min_reward_pct=0.12,
+        ),
+        client,
+        telegram,
+    )
+
+    def fake_high_return_signal(candles, base, day_pnl=0.0):
+        class FakeDecision:
+            signal = SignalPlan(
+                action="PLAN_LONG",
+                confidence=84,
+                score=84,
+                symbol="ETHUSDC",
+                price=2100,
+                rsi=55,
+                atr=20,
+                support=2050,
+                vwap=2080,
+                entries=[2100],
+                stop_loss=2070,
+                take_profits=[2102.6],
+                planned_notional_usdc=300,
+                leverage_cap=10,
+                reasons=["strong breakout"],
+            )
+            strategy = "orb_long"
+            regime = "trend_up"
+            risk_mode = "normal"
+            market_playbook = "no_trade"
+            allocator_state = "normal"
+            allocator_profile = "trend_up_normal_weak"
+            allocator_scale = 0.35
+            max_holding_bars = 24
+
+        return FakeDecision()
+
+    monkeypatch.setattr(
+        "src.gridbot.testnet.auto_trader.generate_router_allocator_high_return_live_decision",
+        fake_high_return_signal,
+    )
+    monkeypatch.setattr(trader, "_now_ms", lambda: 3_000_000)
+    monkeypatch.setattr(trader, "_reprice_headroom_reward_pct", lambda *args, **kwargs: 0.10)
+
+    await trader.run_cycle()
+
+    client.mark_price = 2100.5
+    monkeypatch.setattr(trader, "_now_ms", lambda: 3_016_000)
+    await trader.run_manage_cycle()
+
+    updated = trader._pending_entries["ETHUSDC"]
+    assert updated.order_entry_price == pytest.approx(2100.5)
+    assert updated.update_count == 1
+    assert client.cancelled_orders == [("ETHUSDC", 321)]
+    assert client.orders[-1]["price"] == pytest.approx(2100.5)
+
+
+@pytest.mark.asyncio
+async def test_manage_cycle_holds_high_return_trend_up_breakout_before_low_reward_cancel(monkeypatch):
+    client = FakeClient()
+    trader = TestnetAutoTrader(
+        _settings(
+            testnet_strategy_label="router_allocator_high_return_live",
+            testnet_entry_fill_policy="limit_tolerance",
+            testnet_entry_tolerance_bps=0,
+            testnet_entry_reprice_trigger_bps=2,
+            testnet_entry_reprice_cooldown_seconds=15,
+            testnet_entry_reprice_max_updates=3,
+            testnet_min_reward_pct=0.12,
+        ),
+        client,
+        FakeTelegramApp(),
+    )
+
+    def fake_high_return_signal(candles, base, day_pnl=0.0):
+        class FakeDecision:
+            signal = SignalPlan(
+                action="PLAN_LONG",
+                confidence=84,
+                score=84,
+                symbol="ETHUSDC",
+                price=2100,
+                rsi=55,
+                atr=20,
+                support=2050,
+                vwap=2080,
+                entries=[2100],
+                stop_loss=2070,
+                take_profits=[2102.6],
+                planned_notional_usdc=300,
+                leverage_cap=10,
+                reasons=["strong breakout"],
+            )
+            strategy = "orb_long"
+            regime = "trend_up"
+            risk_mode = "normal"
+            market_playbook = "no_trade"
+            allocator_state = "normal"
+            allocator_profile = "trend_up_normal_weak"
+            allocator_scale = 0.35
+            max_holding_bars = 24
+
+        return FakeDecision()
+
+    monkeypatch.setattr(
+        "src.gridbot.testnet.auto_trader.generate_router_allocator_high_return_live_decision",
+        fake_high_return_signal,
+    )
+    monkeypatch.setattr(trader, "_now_ms", lambda: 4_000_000)
+    monkeypatch.setattr(trader, "_reprice_headroom_reward_pct", lambda *args, **kwargs: None)
+
+    await trader.run_cycle()
+
+    client.mark_price = 2100.7
+    monkeypatch.setattr(trader, "_now_ms", lambda: 4_016_000)
+    await trader.run_manage_cycle()
+
+    held = trader._pending_entries["ETHUSDC"]
+    assert held.reason == "router entry hold after low reward reprice"
+    assert client.cancelled_orders == []
+
+    monkeypatch.setattr(trader, "_now_ms", lambda: 4_032_000)
+    await trader.run_manage_cycle()
+
+    assert "ETHUSDC" not in trader._pending_entries
+    assert client.cancelled_orders == [("ETHUSDC", 321)]
+
+
 def test_entry_tolerance_never_crosses_take_profit():
     trader = TestnetAutoTrader(_settings(testnet_entry_tolerance_bps=50), FakeClient(), FakeTelegramApp())
 
     assert trader._entry_limit_price("long", 2100, 2070, 2100.5) == pytest.approx(2100.4979)
     assert trader._entry_limit_price("short", 2100, 2130, 2099.5) == pytest.approx(2099.5021)
+
+
+def test_strict_entry_fill_policy_ignores_tolerance():
+    trader = TestnetAutoTrader(
+        _settings(testnet_entry_fill_policy="strict", testnet_entry_tolerance_bps=50),
+        FakeClient(),
+        FakeTelegramApp(),
+    )
+
+    assert trader._entry_limit_price("long", 2100, 2070, 2130) == pytest.approx(2100)
 
 
 @pytest.mark.asyncio
@@ -537,6 +870,167 @@ async def test_auto_trader_skips_tight_reward_signal(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_auto_trader_skips_signal_when_reprice_headroom_would_fail(monkeypatch):
+    client = FakeClient()
+    trader = TestnetAutoTrader(
+        _settings(
+            testnet_entry_fill_policy="limit_tolerance",
+            testnet_entry_tolerance_bps=3,
+            testnet_entry_reprice_enabled=True,
+            testnet_entry_reprice_trigger_bps=2,
+            testnet_min_reward_pct=0.12,
+        ),
+        client,
+        FakeTelegramApp(),
+    )
+
+    def fake_signal(candles, base, day_pnl=0.0):
+        class FakeDecision:
+            signal = SignalPlan(
+                action="PLAN_SHORT",
+                confidence=92,
+                score=92,
+                symbol="ETHUSDC",
+                price=2110.4514,
+                rsi=42,
+                atr=18,
+                support=2120,
+                vwap=2105,
+                entries=[2110.4514],
+                stop_loss=2117.0306,
+                take_profits=[2106.8328],
+                planned_notional_usdc=150,
+                leverage_cap=8,
+                reasons=["short headroom too thin"],
+            )
+            strategy = "orb_short"
+            regime = "trend_down"
+            risk_mode = "off"
+            market_playbook = "no_trade"
+            allocator_state = "normal"
+            allocator_profile = "short"
+            allocator_scale = 0.55
+            max_holding_bars = 24
+
+        return FakeDecision()
+
+    monkeypatch.setattr("src.gridbot.testnet.auto_trader.generate_router_allocator_v13_trend350_live_decision", fake_signal)
+
+    await trader.run_cycle()
+
+    assert client.orders == []
+    assert trader._pending_entries == {}
+
+
+@pytest.mark.asyncio
+async def test_high_return_live_blocks_exploratory_long_entries(monkeypatch):
+    client = FakeClient()
+    trader = TestnetAutoTrader(
+        _settings(testnet_strategy_label="router_allocator_high_return_live"),
+        client,
+        FakeTelegramApp(),
+    )
+
+    def fake_high_return_signal(candles, base, day_pnl=0.0):
+        class FakeDecision:
+            signal = SignalPlan(
+                action="PLAN_LONG",
+                confidence=84,
+                score=84,
+                symbol="ETHUSDC",
+                price=2105.7219,
+                rsi=68,
+                atr=2.1,
+                support=2096.5373,
+                vwap=2097.0,
+                entries=[2105.7219],
+                stop_loss=2096.5373,
+                take_profits=[2110.7734],
+                planned_notional_usdc=44.2,
+                leverage_cap=70,
+                reasons=["exploratory long"],
+            )
+            strategy = "orb_long"
+            regime = "low_liquidity"
+            risk_mode = "off"
+            market_playbook = "no_trade"
+            allocator_state = "normal"
+            allocator_profile = "exploratory_long"
+            allocator_scale = 0.05
+            max_holding_bars = 24
+
+        return FakeDecision()
+
+    monkeypatch.setattr(
+        "src.gridbot.testnet.auto_trader.generate_router_allocator_high_return_live_decision",
+        fake_high_return_signal,
+    )
+
+    await trader.run_cycle()
+
+    assert client.orders == []
+    assert trader._pending_entries == {}
+
+
+@pytest.mark.asyncio
+async def test_high_return_breakout_can_pass_relaxed_reprice_headroom(monkeypatch):
+    client = FakeClient()
+    trader = TestnetAutoTrader(
+        _settings(
+            testnet_strategy_label="router_allocator_high_return_live",
+            testnet_entry_fill_policy="limit_tolerance",
+            testnet_entry_tolerance_bps=3,
+            testnet_entry_reprice_enabled=True,
+            testnet_entry_reprice_trigger_bps=2,
+            testnet_min_reward_pct=0.12,
+        ),
+        client,
+        FakeTelegramApp(),
+    )
+
+    def fake_high_return_signal(candles, base, day_pnl=0.0):
+        class FakeDecision:
+            signal = SignalPlan(
+                action="PLAN_LONG",
+                confidence=84,
+                score=84,
+                symbol="ETHUSDC",
+                price=2104.3835,
+                rsi=72,
+                atr=2.18,
+                support=2096.7,
+                vwap=2095.1,
+                entries=[2104.3835],
+                stop_loss=2096.7131,
+                take_profits=[2108.6022],
+                planned_notional_usdc=150,
+                leverage_cap=8,
+                reasons=["strong breakout continuation"],
+            )
+            strategy = "orb_long"
+            regime = "trend_up"
+            risk_mode = "normal"
+            market_playbook = "no_trade"
+            allocator_state = "normal"
+            allocator_profile = "trend_up_normal_weak"
+            allocator_scale = 0.35
+            max_holding_bars = 24
+
+        return FakeDecision()
+
+    monkeypatch.setattr(
+        "src.gridbot.testnet.auto_trader.generate_router_allocator_high_return_live_decision",
+        fake_high_return_signal,
+    )
+    monkeypatch.setattr(trader, "_reprice_headroom_reward_pct", lambda *args, **kwargs: 0.11)
+
+    await trader.run_cycle()
+
+    assert client.orders
+    assert "ETHUSDC" in trader._pending_entries
+
+
+@pytest.mark.asyncio
 async def test_auto_trader_opens_short_from_router_signal(monkeypatch):
     client = FakeClient()
     telegram = FakeTelegramApp()
@@ -795,6 +1289,20 @@ async def test_manage_cycle_cleans_stale_protection_orders_when_flat():
     await trader.run_manage_cycle()
 
     assert client.cancelled_orders == [("ETHUSDC", 901), ("ETHUSDC", 902)]
+
+
+@pytest.mark.asyncio
+async def test_manage_cycle_cleans_stale_entry_orders_when_flat():
+    client = FakeClient()
+    client.open_orders = [
+        {"orderId": 903, "clientOrderId": "cry3en_1"},
+        {"orderId": 904, "clientOrderId": "other_order"},
+    ]
+    trader = TestnetAutoTrader(_settings(), client, FakeTelegramApp())
+
+    await trader.run_manage_cycle()
+
+    assert client.cancelled_orders == [("ETHUSDC", 903)]
 
 
 @pytest.mark.asyncio

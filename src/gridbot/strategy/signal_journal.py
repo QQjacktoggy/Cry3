@@ -110,19 +110,23 @@ class LiveRouterDecision:
     max_holding_bars: int
 
 
-def generate_router_allocator_v13_trend350_live_decision(
+def _router_block(reason: str, **details: object) -> str:
+    if not details:
+        return reason
+    rendered = ", ".join(f"{key}={value}" for key, value in details.items())
+    return f"{reason} ({rendered})"
+
+
+def _generate_router_allocator_live_decision_debug(
     candles: list[Candle],
     base: StrategyConfig,
     day_pnl: float = 0.0,
-) -> LiveRouterDecision | None:
-    """Generate the current live decision for the validated trend350 router profile.
+    nim_hard_block_enabled: bool = True,
+) -> tuple[LiveRouterDecision | None, str]:
+    """Return the live router decision plus a precise block reason when absent."""
 
-    This mirrors the local signal_journal router flow closely enough for live
-    testnet execution while staying strictly causal: it uses only candles up to
-    the current bar and local reviewer logic.
-    """
     if not candles:
-        return None
+        return None, "no_candles"
 
     config = OrbConfig(
         base=base,
@@ -137,8 +141,9 @@ def generate_router_allocator_v13_trend350_live_decision(
 
     index = len(candles) - 1
     equity_base = _equity_base(base, base.equity_usdc)
-    if _daily_guard_reason(equity_base, day_pnl):
-        return None
+    daily_guard = _daily_guard_reason(equity_base, day_pnl)
+    if daily_guard:
+        return None, _router_block("daily_guard", reason=daily_guard, day_pnl=round(day_pnl, 4))
 
     runtime_base = _risk_adjusted_config(equity_base, day_pnl)
     decision = classify_regime(candles, index, regime_context, runtime_base)
@@ -146,8 +151,16 @@ def generate_router_allocator_v13_trend350_live_decision(
     market_decision = classify_market_state(candles, index, market_context, runtime_base)
 
     signal, strategy = _select_journal_signal(candles, index, runtime_config, context, decision, "router")
-    if signal.action != _expected_action(strategy):
-        return None
+    expected_action = _expected_action(strategy)
+    if signal.action != expected_action:
+        return None, _router_block(
+            "initial_signal_mismatch",
+            strategy=strategy,
+            signal_action=signal.action,
+            expected_action=expected_action,
+            score=signal.score,
+            regime=getattr(decision, "regime", "unknown"),
+        )
 
     routed_base = _regime_router_adjusted_base(
         runtime_base,
@@ -158,27 +171,64 @@ def generate_router_allocator_v13_trend350_live_decision(
         0.35,
     )
     if routed_base is None:
-        return None
+        return None, _router_block(
+            "regime_router_blocked",
+            strategy=strategy,
+            regime=getattr(decision, "regime", "unknown"),
+            risk_mode=getattr(decision, "risk_mode", "unknown"),
+            market_playbook=getattr(market_decision, "playbook", "unknown"),
+            market_risk_mode=getattr(market_decision, "risk_mode", "unknown"),
+        )
     if routed_base is not runtime_base:
         runtime_base = routed_base
         runtime_config = _replace_base(runtime_config, runtime_base)
         signal, strategy = _select_journal_signal(candles, index, runtime_config, context, decision, "router")
-        if signal.action != _expected_action(strategy):
-            return None
+        expected_action = _expected_action(strategy)
+        if signal.action != expected_action:
+            return None, _router_block(
+                "post_router_signal_mismatch",
+                strategy=strategy,
+                signal_action=signal.action,
+                expected_action=expected_action,
+                score=signal.score,
+                regime=getattr(decision, "regime", "unknown"),
+            )
 
     nim_review = _local_nim_policy_review("auto", strategy, signal, market_decision)
     if nim_review is not None:
         if _nim_review_rejected_by_market_state(strategy, decision, market_decision, nim_review):
-            return None
-        scaled_base = _nim_scaled_base(runtime_base, nim_review)
+            return None, _router_block(
+                "nim_rejected_by_market_state",
+                strategy=strategy,
+                nim_playbook=nim_review.playbook,
+                nim_risk_mode=nim_review.risk_mode,
+                market_playbook=getattr(market_decision, "playbook", "unknown"),
+                regime=getattr(decision, "regime", "unknown"),
+            )
+        scaled_base = _nim_scaled_base(runtime_base, nim_review, hard_block_enabled=nim_hard_block_enabled)
         if scaled_base is None:
-            return None
+            return None, _router_block(
+                "nim_scaled_to_zero",
+                strategy=strategy,
+                nim_playbook=nim_review.playbook,
+                nim_risk_mode=nim_review.risk_mode,
+                nim_confidence=round(nim_review.confidence, 3),
+            )
         if scaled_base is not runtime_base:
             runtime_base = scaled_base
             runtime_config = _replace_base(runtime_config, runtime_base)
             signal, strategy = _select_journal_signal(candles, index, runtime_config, context, decision, "router")
-            if signal.action != _expected_action(strategy):
-                return None
+            expected_action = _expected_action(strategy)
+            if signal.action != expected_action:
+                return None, _router_block(
+                    "post_nim_signal_mismatch",
+                    strategy=strategy,
+                    signal_action=signal.action,
+                    expected_action=expected_action,
+                    score=signal.score,
+                    nim_playbook=nim_review.playbook,
+                    nim_risk_mode=nim_review.risk_mode,
+                )
 
     allocated_base, allocation = _regime_allocator_adjusted_base(
         runtime_base,
@@ -211,7 +261,15 @@ def generate_router_allocator_v13_trend350_live_decision(
         signal_score=signal.score,
     )
     if allocated_base is None:
-        return None
+        return None, _router_block(
+            "allocator_blocked",
+            strategy=strategy,
+            regime=getattr(decision, "regime", "unknown"),
+            market_playbook=getattr(market_decision, "playbook", "unknown"),
+            nim_playbook=getattr(nim_review, "playbook", "none"),
+            nim_risk_mode=getattr(nim_review, "risk_mode", "none"),
+            score=signal.score,
+        )
     allocator_state = allocation["state"]
     allocator_profile = allocation["profile"]
     allocator_scale = allocation["scale"]
@@ -220,8 +278,18 @@ def generate_router_allocator_v13_trend350_live_decision(
         runtime_base = allocated_base
         runtime_config = _replace_base(runtime_config, runtime_base)
         signal, strategy = _select_journal_signal(candles, index, runtime_config, context, decision, "router")
-        if signal.action != _expected_action(strategy):
-            return None
+        expected_action = _expected_action(strategy)
+        if signal.action != expected_action:
+            return None, _router_block(
+                "post_allocator_signal_mismatch",
+                strategy=strategy,
+                signal_action=signal.action,
+                expected_action=expected_action,
+                score=signal.score,
+                allocator_state=allocator_state,
+                allocator_profile=allocator_profile,
+                allocator_scale=allocator_scale,
+            )
 
     ai_risk_review = _local_ai_risk_review(
         strategy,
@@ -234,13 +302,29 @@ def generate_router_allocator_v13_trend350_live_decision(
     )
     if ai_risk_review is not None:
         if ai_risk_review.decision == "reject" or ai_risk_review.risk_scale <= 0:
-            return None
+            return None, _router_block(
+                "ai_risk_rejected",
+                strategy=strategy,
+                ai_decision=ai_risk_review.decision,
+                ai_level=ai_risk_review.risk_level,
+                ai_scale=ai_risk_review.risk_scale,
+                reason_codes="|".join(ai_risk_review.reason_codes) or "none",
+            )
         if ai_risk_review.decision == "reduce" and ai_risk_review.risk_scale < 1.0:
             runtime_base = _scaled_base(runtime_base, ai_risk_review.risk_scale)
             runtime_config = _replace_base(runtime_config, runtime_base)
             signal, strategy = _select_journal_signal(candles, index, runtime_config, context, decision, "router")
-            if signal.action != _expected_action(strategy):
-                return None
+            expected_action = _expected_action(strategy)
+            if signal.action != expected_action:
+                return None, _router_block(
+                    "post_ai_risk_signal_mismatch",
+                    strategy=strategy,
+                    signal_action=signal.action,
+                    expected_action=expected_action,
+                    score=signal.score,
+                    ai_scale=ai_risk_review.risk_scale,
+                    ai_level=ai_risk_review.risk_level,
+                )
 
     trade_config = _strategy_trade_config(
         runtime_config,
@@ -255,17 +339,99 @@ def generate_router_allocator_v13_trend350_live_decision(
         24,
         "short_reversion",
     )
-    return LiveRouterDecision(
-        signal=signal,
-        strategy=strategy,
-        regime=decision.regime if decision is not None else "unknown",
-        risk_mode=decision.risk_mode if decision is not None else "unknown",
-        market_playbook=market_decision.playbook if market_decision is not None else "unknown",
-        allocator_state=allocator_state,
-        allocator_profile=allocator_profile,
-        allocator_scale=allocator_scale,
-        max_holding_bars=trade_config.base.max_holding_bars,
+    return (
+        LiveRouterDecision(
+            signal=signal,
+            strategy=strategy,
+            regime=decision.regime if decision is not None else "unknown",
+            risk_mode=decision.risk_mode if decision is not None else "unknown",
+            market_playbook=market_decision.playbook if market_decision is not None else "unknown",
+            allocator_state=allocator_state,
+            allocator_profile=allocator_profile,
+            allocator_scale=allocator_scale,
+            max_holding_bars=trade_config.base.max_holding_bars,
+        ),
+        "ok",
     )
+
+
+def _generate_router_allocator_live_decision(
+    candles: list[Candle],
+    base: StrategyConfig,
+    day_pnl: float = 0.0,
+    nim_hard_block_enabled: bool = True,
+) -> LiveRouterDecision | None:
+    """Generate the current live decision for the high-return router family."""
+
+    decision, _ = _generate_router_allocator_live_decision_debug(
+        candles,
+        base,
+        day_pnl,
+        nim_hard_block_enabled=nim_hard_block_enabled,
+    )
+    return decision
+
+
+def generate_router_allocator_high_return_live_decision(
+    candles: list[Candle],
+    base: StrategyConfig,
+    day_pnl: float = 0.0,
+) -> LiveRouterDecision | None:
+    """Live wrapper for the saved high-return router allocator family."""
+
+    return _generate_router_allocator_live_decision(
+        candles,
+        base,
+        day_pnl,
+        nim_hard_block_enabled=False,
+    )
+
+
+def explain_router_allocator_high_return_live_block(
+    candles: list[Candle],
+    base: StrategyConfig,
+    day_pnl: float = 0.0,
+) -> str:
+    """Explain why the high-return live router path returned no tradable decision."""
+
+    _, reason = _generate_router_allocator_live_decision_debug(
+        candles,
+        base,
+        day_pnl,
+        nim_hard_block_enabled=False,
+    )
+    return reason
+
+
+def generate_router_allocator_v13_trend350_live_decision(
+    candles: list[Candle],
+    base: StrategyConfig,
+    day_pnl: float = 0.0,
+) -> LiveRouterDecision | None:
+    """Backward-compatible alias for the legacy trend350 live label."""
+
+    return _generate_router_allocator_live_decision(
+        candles,
+        base,
+        day_pnl,
+        nim_hard_block_enabled=True,
+    )
+
+
+def explain_router_allocator_v13_trend350_live_block(
+    candles: list[Candle],
+    base: StrategyConfig,
+    day_pnl: float = 0.0,
+) -> str:
+    """Backward-compatible block reason helper for the legacy trend350 live label."""
+
+    _, reason = _generate_router_allocator_live_decision_debug(
+        candles,
+        base,
+        day_pnl,
+        nim_hard_block_enabled=True,
+    )
+    return reason
 
 
 def run_orb_signal_journal(
@@ -856,11 +1022,24 @@ def _nim_review_rejected_by_market_state(strategy: str, regime_decision, market_
     )
 
 
-def _nim_scaled_base(base: StrategyConfig, review) -> StrategyConfig | None:
-    if review.playbook == "no_trade" and review.risk_mode == "off" and review.confidence >= 0.82:
+def _nim_scaled_base(
+    base: StrategyConfig,
+    review,
+    *,
+    hard_block_enabled: bool = True,
+) -> StrategyConfig | None:
+    if (
+        hard_block_enabled
+        and review.playbook == "no_trade"
+        and review.risk_mode == "off"
+        and review.confidence >= 0.82
+    ):
         return None
     if review.playbook == "no_trade":
-        scale = 0.25 if review.risk_mode in {"small", "off"} else 0.35
+        if review.risk_mode == "off" and not hard_block_enabled:
+            scale = 0.25
+        else:
+            scale = 0.25 if review.risk_mode in {"small", "off"} else 0.35
     elif review.playbook == "long_breakout" and review.risk_mode == "small":
         scale = 0.12
     elif review.risk_mode == "aggressive":

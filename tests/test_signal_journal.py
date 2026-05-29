@@ -1,10 +1,12 @@
 import unittest
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from src.gridbot.strategy.long_orb import OrbConfig
-from src.gridbot.strategy.long_pullback import StrategyConfig
+from src.gridbot.strategy.long_pullback import SignalPlan, StrategyConfig
 from src.gridbot.strategy.signal_journal import (
+    LocalNimReview,
     _allocator_daily_state,
     _allocator_profile,
     _ai_risk_judge_ai_query_needed,
@@ -23,6 +25,9 @@ from src.gridbot.strategy.signal_journal import (
     _strategy_holding_config,
     _strategy_trade_config,
     _uses_defensive_exit_profile,
+    explain_router_allocator_v13_trend350_live_block,
+    generate_router_allocator_high_return_live_decision,
+    generate_router_allocator_v13_trend350_live_decision,
     run_orb_signal_journal,
     summarize_allocator_journal,
     summarize_signal_journal,
@@ -54,6 +59,78 @@ def _fillable_short_orb_candles():
 
 
 class TestSignalJournal(unittest.TestCase):
+    def test_high_return_live_bypasses_nim_hard_block_but_legacy_trend350_does_not(self):
+        candles = _fillable_orb_candles()[-20:]
+        base = StrategyConfig(symbol="ETHUSDC", min_score=44, risk_per_trade_pct=2.0, max_position_margin_pct=60.0)
+        signal = SignalPlan(
+            action="PLAN_LONG",
+            confidence=68,
+            score=68,
+            symbol="ETHUSDC",
+            price=2106.78,
+            rsi=78,
+            atr=2.03,
+            support=2096.74,
+            vwap=2094.92,
+            entries=[2104.6732],
+            stop_loss=2096.7431,
+            take_profits=[2109.034755, 2113.39631, 2122.11942],
+            planned_notional_usdc=300.0,
+            leverage_cap=10.0,
+            reasons=["close broke session OR high by 0.57 ATR"],
+        )
+        regime_decision = SimpleNamespace(
+            regime="low_liquidity",
+            risk_mode="off",
+            confidence=0.78,
+            features=SimpleNamespace(close_position_lookback=0.94, trend_slope_atr=2.33),
+        )
+        market_decision = SimpleNamespace(
+            playbook="no_trade",
+            risk_mode="off",
+            trend="up",
+            ma20_structure="above_rising",
+            n_pattern="none",
+            breakout_quality="weak",
+            pullback_quality="deep",
+            confidence=0.78,
+            features=SimpleNamespace(volume_ratio=0.0312, atr_percentile=0.4877),
+        )
+        allocation = {"state": "normal", "profile": "exploratory_long", "scale": 0.35}
+        trade_config = SimpleNamespace(base=SimpleNamespace(max_holding_bars=24))
+
+        with (
+            patch("src.gridbot.strategy.signal_journal.build_orb_context", return_value=object()),
+            patch("src.gridbot.strategy.signal_journal.build_regime_context", return_value=object()),
+            patch("src.gridbot.strategy.signal_journal.build_market_state_context", return_value=object()),
+            patch("src.gridbot.strategy.signal_journal.classify_regime", return_value=regime_decision),
+            patch("src.gridbot.strategy.signal_journal.classify_market_state", return_value=market_decision),
+            patch("src.gridbot.strategy.signal_journal._daily_guard_reason", return_value=None),
+            patch("src.gridbot.strategy.signal_journal._risk_adjusted_config", side_effect=lambda equity, day_pnl: equity),
+            patch("src.gridbot.strategy.signal_journal._select_journal_signal", return_value=(signal, "orb_long")),
+            patch("src.gridbot.strategy.signal_journal._regime_router_adjusted_base", side_effect=lambda *args, **kwargs: args[0]),
+            patch(
+                "src.gridbot.strategy.signal_journal._local_nim_policy_review",
+                return_value=LocalNimReview("no_trade", "off", 0.84, ("local_volume_too_thin",)),
+            ),
+            patch("src.gridbot.strategy.signal_journal._nim_review_rejected_by_market_state", return_value=False),
+            patch(
+                "src.gridbot.strategy.signal_journal._regime_allocator_adjusted_base",
+                return_value=(base, allocation),
+            ),
+            patch("src.gridbot.strategy.signal_journal._local_ai_risk_review", return_value=None),
+            patch("src.gridbot.strategy.signal_journal._strategy_trade_config", return_value=trade_config),
+        ):
+            high_return = generate_router_allocator_high_return_live_decision(candles, base)
+            legacy = generate_router_allocator_v13_trend350_live_decision(candles, base)
+            legacy_block = explain_router_allocator_v13_trend350_live_block(candles, base)
+
+        self.assertIsNotNone(high_return)
+        self.assertEqual(high_return.strategy, "orb_long")
+        self.assertEqual(high_return.allocator_profile, "exploratory_long")
+        self.assertIsNone(legacy)
+        self.assertIn("nim_scaled_to_zero", legacy_block)
+
     def test_orb_signal_journal_records_signal_before_entry(self):
         candles = _fillable_orb_candles()
         config = OrbConfig(

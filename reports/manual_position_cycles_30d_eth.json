@@ -1,0 +1,22 @@
+{
+  "generated_at": "2026-05-27T17:04:51.285972+08:00",
+  "symbol": "ETHUSDC",
+  "days": 30,
+  "manual_fills": 276,
+  "grid_order_ids_excluded": 374,
+  "summary": {
+    "cycles": 0,
+    "wins": 0,
+    "losses": 0,
+    "win_rate": 0.0,
+    "net_pnl_ex_funding": 0,
+    "realized_pnl": 0,
+    "commission": 0,
+    "profit_factor": null,
+    "best_cycle_net": 0.0,
+    "worst_cycle_net": 0.0,
+    "maker_entry_ratio": 0.0,
+    "by_day": {}
+  },
+  "cycles": []
+}
