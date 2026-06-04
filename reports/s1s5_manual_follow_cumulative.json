@@ -1,0 +1,250 @@
+{
+  "generated_at": "2026-06-04T01:45:38+00:00",
+  "allowed_strategies": [
+    "S1_BB_RSI",
+    "S2_SuperTrend",
+    "S3_EMA_MACD",
+    "S4_Donchian",
+    "S5_Stoch"
+  ],
+  "source_db": "C:\\tmp\\gridbot_s1s5_snapshot.db",
+  "s1s5_signal_count": 4,
+  "s1s5_cycle_count": 4,
+  "live_manual_follow": {
+    "overall": {
+      "signals": 4,
+      "closed": 4,
+      "open": 0,
+      "expired": 0,
+      "win_rate_pct": 100.0,
+      "gross_pnl_usdc": 4.233,
+      "fees_usdc": 0.1995,
+      "net_pnl_usdc": 4.0335,
+      "avg_net_pnl_usdc": 1.0084,
+      "avg_entry_notional_usdc": 499.21,
+      "maker_fills": 7,
+      "taker_fills": 1,
+      "taker_fill_ratio_pct": 12.5,
+      "avg_hold_seconds": 77.61,
+      "avg_entry_delay_seconds": 50.54,
+      "avg_entry_slippage_bps": -0.53
+    },
+    "by_strategy": {
+      "S2_SuperTrend": {
+        "signals": 4,
+        "closed": 4,
+        "open": 0,
+        "expired": 0,
+        "win_rate_pct": 100.0,
+        "gross_pnl_usdc": 4.233,
+        "fees_usdc": 0.1995,
+        "net_pnl_usdc": 4.0335,
+        "avg_net_pnl_usdc": 1.0084,
+        "avg_entry_notional_usdc": 499.21,
+        "maker_fills": 7,
+        "taker_fills": 1,
+        "taker_fill_ratio_pct": 12.5,
+        "avg_hold_seconds": 77.61,
+        "avg_entry_delay_seconds": 50.54,
+        "avg_entry_slippage_bps": -0.53
+      }
+    },
+    "by_strategy_direction": {
+      "S2_SuperTrend:short": {
+        "signals": 4,
+        "closed": 4,
+        "open": 0,
+        "expired": 0,
+        "win_rate_pct": 100.0,
+        "gross_pnl_usdc": 4.233,
+        "fees_usdc": 0.1995,
+        "net_pnl_usdc": 4.0335,
+        "avg_net_pnl_usdc": 1.0084,
+        "avg_entry_notional_usdc": 499.21,
+        "maker_fills": 7,
+        "taker_fills": 1,
+        "taker_fill_ratio_pct": 12.5,
+        "avg_hold_seconds": 77.61,
+        "avg_entry_delay_seconds": 50.54,
+        "avg_entry_slippage_bps": -0.53
+      }
+    },
+    "latest_closed_cycles": [
+      {
+        "audit_id": 1346,
+        "time_taipei": "2026-06-04T09:24:48+08:00",
+        "execution_id": "ethusdc:s2supertrend:1780536000000:1780536157877",
+        "strategy": "S2_SuperTrend",
+        "direction": "short",
+        "planned_entry": 1772.39,
+        "entry_avg_price": 1770.0000000000002,
+        "exit_avg_price": 1768.89,
+        "entry_qty": 0.282,
+        "gross_pnl_usdc": 0.31301999,
+        "fees_usdc": 0.19953079,
+        "net_pnl_usdc": 0.1135,
+        "maker_count": 1,
+        "taker_count": 1,
+        "holding_seconds": 36.111,
+        "entry_slippage_bps": 13.484616816839818
+      },
+      {
+        "audit_id": 1344,
+        "time_taipei": "2026-06-04T09:22:48+08:00",
+        "execution_id": "ethusdc:s2supertrend:1780535700000:1780535992984",
+        "strategy": "S2_SuperTrend",
+        "direction": "short",
+        "planned_entry": 1775.51,
+        "entry_avg_price": 1776.9999999999998,
+        "exit_avg_price": 1771.9999999999998,
+        "entry_qty": 0.281,
+        "gross_pnl_usdc": 1.405,
+        "fees_usdc": 0.0,
+        "net_pnl_usdc": 1.405,
+        "maker_count": 2,
+        "taker_count": 0,
+        "holding_seconds": 104.105,
+        "entry_slippage_bps": -8.391954987579803
+      },
+      {
+        "audit_id": 1342,
+        "time_taipei": "2026-06-04T09:21:49+08:00",
+        "execution_id": "ethusdc:s2supertrend:1780535400000:1780535688033",
+        "strategy": "S2_SuperTrend",
+        "direction": "short",
+        "planned_entry": 1784.61,
+        "entry_avg_price": 1783.9999999999998,
+        "exit_avg_price": 1779.9999999999998,
+        "entry_qty": 0.28,
+        "gross_pnl_usdc": 1.12,
+        "fees_usdc": 0.0,
+        "net_pnl_usdc": 1.12,
+        "maker_count": 2,
+        "taker_count": 0,
+        "holding_seconds": 51.768,
+        "entry_slippage_bps": 3.418113761550856
+      },
+      {
+        "audit_id": 1341,
+        "time_taipei": "2026-06-04T09:21:49+08:00",
+        "execution_id": "ethusdc:s2supertrend:1780535100000:1780535383032",
+        "strategy": "S2_SuperTrend",
+        "direction": "short",
+        "planned_entry": 1786.1,
+        "entry_avg_price": 1787.9999999999998,
+        "exit_avg_price": 1782.9999999999998,
+        "entry_qty": 0.279,
+        "gross_pnl_usdc": 1.395,
+        "fees_usdc": 0.0,
+        "net_pnl_usdc": 1.395,
+        "maker_count": 2,
+        "taker_count": 0,
+        "holding_seconds": 118.459,
+        "entry_slippage_bps": -10.637702256311872
+      }
+    ]
+  },
+  "manual_style_reference": {
+    "source": "reports\\manual_trades_ai_2026-05-25_2026-05-27.json",
+    "summary": {
+      "orders": 64,
+      "wins": 47,
+      "losses": 17,
+      "win_rate": 0.734375,
+      "net_pnl_ex_funding": -30.55573416000001,
+      "avg_order_net": -0.47743334625,
+      "best_order_net": 9.04906682,
+      "worst_order_net": -65.10411492,
+      "profit_factor": 0.6469007609830676,
+      "setup_tag_counts": {
+        "chase_or_late_entry": 5,
+        "fade_after_push": 14,
+        "mixed": 13,
+        "stretched_entry": 32
+      },
+      "risk_flag_counts": {
+        "crowded_volume": 8,
+        "far_from_ema": 13,
+        "far_from_vwap": 23,
+        "has_taker_fill": 9,
+        "not_zero_fee_maker": 9,
+        "overheated_15m_move": 15
+      },
+      "by_day": {
+        "2026-05-25": {
+          "orders": 20,
+          "net_pnl_ex_funding": 22.101742669999997
+        },
+        "2026-05-26": {
+          "orders": 31,
+          "net_pnl_ex_funding": -62.09503078000001
+        },
+        "2026-05-27": {
+          "orders": 13,
+          "net_pnl_ex_funding": 9.43755395
+        }
+      }
+    },
+    "top_setup_tags": {
+      "stretched_entry": 32,
+      "fade_after_push": 14,
+      "mixed": 13,
+      "chase_or_late_entry": 5
+    },
+    "top_risk_flags": {
+      "far_from_vwap": 23,
+      "overheated_15m_move": 15,
+      "far_from_ema": 13,
+      "has_taker_fill": 9,
+      "not_zero_fee_maker": 9,
+      "crowded_volume": 8
+    },
+    "by_direction": {
+      "long": {
+        "signals": 25,
+        "closed": 25,
+        "open": 0,
+        "expired": 0,
+        "win_rate_pct": 76.0,
+        "gross_pnl_usdc": 27.1242,
+        "fees_usdc": 0.0,
+        "net_pnl_usdc": 27.1242,
+        "avg_net_pnl_usdc": 1.085,
+        "avg_entry_notional_usdc": 1965.62,
+        "maker_fills": 22,
+        "taker_fills": 3,
+        "taker_fill_ratio_pct": 12.0,
+        "avg_hold_seconds": null,
+        "avg_entry_delay_seconds": null,
+        "avg_entry_slippage_bps": null
+      },
+      "short": {
+        "signals": 39,
+        "closed": 39,
+        "open": 0,
+        "expired": 0,
+        "win_rate_pct": 71.79,
+        "gross_pnl_usdc": -57.68,
+        "fees_usdc": 0.0,
+        "net_pnl_usdc": -57.68,
+        "avg_net_pnl_usdc": -1.479,
+        "avg_entry_notional_usdc": 1476.9,
+        "maker_fills": 33,
+        "taker_fills": 6,
+        "taker_fill_ratio_pct": 15.38,
+        "avg_hold_seconds": null,
+        "avg_entry_delay_seconds": null,
+        "avg_entry_slippage_bps": null
+      }
+    }
+  },
+  "recommendations": [
+    "Keep S2_SuperTrend active as the main S1-S5 live candidate until at least 30 closed follow cycles are collected.",
+    "Prefer maker exits for S2 when possible; taker fills are already visible in net PnL compression.",
+    "Do not upsize S3_EMA_MACD yet; wait for live manual-follow evidence.",
+    "Do not upsize S4_Donchian yet; wait for live manual-follow evidence.",
+    "Do not upsize S5_Stoch yet; wait for live manual-follow evidence.",
+    "Track maker/taker separately; manual history shows fees are a major difference between good small wins and weak net results.",
+    "Add a distance-to-VWAP/EMA tag to every S1-S5 notification so your follow trades can be compared against the manual loss patterns."
+  ]
+}

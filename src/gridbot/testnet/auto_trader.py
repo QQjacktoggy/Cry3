@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import replace
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from html import escape
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from config.settings import Settings
 from src.gridbot.binance.client import BinanceFuturesClient
@@ -185,6 +188,16 @@ class TestnetAutoTrader:
         self._loss_stop_notified = False
         self._last_flat_manage_check_ms: dict[str, int] = {}
         self._cooldown_until: dict[str, float] = {}
+        self._manual_signal_messages: dict[int, dict] = {}
+        self._latest_manual_signal: dict | None = None
+
+    def get_manual_signal_message(self, message_id: int | None) -> dict | None:
+        if message_id is None:
+            return None
+        return self._manual_signal_messages.get(int(message_id))
+
+    def get_latest_manual_signal(self) -> dict | None:
+        return self._latest_manual_signal
 
     async def run_cycle(self) -> None:
         await self.run_manage_cycle()
@@ -194,7 +207,7 @@ class TestnetAutoTrader:
         if self._settings.trading_mode != "testnet_live":
             logger.info("testnet_auto_trade_skipped", mode=self._settings.trading_mode)
             return
-        if not self._settings.binance_testnet:
+        if not self._settings.binance_testnet and not self._settings.testnet_telegram_signal_only:
             raise RuntimeError("Refusing auto trading unless BINANCE_TESTNET=true.")
 
         for symbol in self._settings.symbols_list:
@@ -202,6 +215,9 @@ class TestnetAutoTrader:
 
     async def run_manage_cycle(self) -> None:
         if self._settings.trading_mode != "testnet_live":
+            return
+        if self._settings.testnet_telegram_signal_only:
+            logger.info("testnet_manage_cycle_skipped", reason="telegram_signal_only")
             return
         if not self._settings.binance_testnet:
             raise RuntimeError("Refusing auto trading unless BINANCE_TESTNET=true.")
@@ -216,6 +232,10 @@ class TestnetAutoTrader:
             await self._run_symbol(symbol, allow_new_entries=False)
 
     async def _run_symbol(self, symbol: str, allow_new_entries: bool) -> None:
+        if self._settings.testnet_telegram_signal_only:
+            await self._run_signal_only_symbol(symbol, allow_new_entries=allow_new_entries)
+            return
+
         today_net = await self._today_net_pnl(symbol)
         loss_stop = -self._settings.testnet_equity_usdc * self._settings.max_daily_loss_pct / 100
         target_stop = self._settings.testnet_equity_usdc * self._settings.testnet_daily_target_pct / 100
@@ -341,7 +361,7 @@ class TestnetAutoTrader:
                 allocator_scale=decision.allocator_scale,
                 action=signal.action,
                 score=signal.score,
-                reasons=signal.reasons[:3],
+                reasons=signal.reasons[:8],
             )
             return
         if signal.action not in {"PLAN_LONG", "PLAN_SHORT"} or signal.score < self._settings.testnet_min_signal_score:
@@ -357,7 +377,7 @@ class TestnetAutoTrader:
                 allocator_scale=decision.allocator_scale,
                 action=signal.action,
                 score=signal.score,
-                reasons=signal.reasons[:3],
+                reasons=signal.reasons[:8],
             )
             return
 
@@ -380,7 +400,7 @@ class TestnetAutoTrader:
                 score=signal.score,
                 reward_pct=reward_pct,
                 min_reward_pct=self._settings.testnet_min_reward_pct,
-                reasons=signal.reasons[:3],
+                reasons=signal.reasons[:8],
             )
             return
         planned_entry = self._planned_entry_price(signal)
@@ -416,7 +436,7 @@ class TestnetAutoTrader:
                 fill_policy=fill_policy,
                 tolerance_bps=tolerance_bps,
                 configured_tolerance_bps=self._settings.testnet_entry_tolerance_bps,
-                reasons=signal.reasons[:3],
+                reasons=signal.reasons[:8],
             )
             return
         reprice_headroom_reward_pct = self._reprice_headroom_reward_pct(
@@ -452,7 +472,22 @@ class TestnetAutoTrader:
                 reprice_trigger_bps=self._settings.testnet_entry_reprice_trigger_bps,
                 fill_policy=fill_policy,
                 tolerance_bps=tolerance_bps,
-                reasons=signal.reasons[:3],
+                reasons=signal.reasons[:8],
+            )
+            return
+        if self._settings.testnet_telegram_signal_only:
+            await self._notify_manual_signal(
+                symbol=symbol,
+                decision=decision,
+                direction=direction,
+                notional=notional,
+                leverage=leverage,
+                planned_entry=planned_entry,
+                order_entry_price=order_entry_price,
+                planned_stop=planned_stop,
+                planned_take_profit=planned_take_profit,
+                fill_policy=fill_policy,
+                tolerance_bps=tolerance_bps,
             )
             return
         await self._place_pending_entry_limit(
@@ -468,6 +503,137 @@ class TestnetAutoTrader:
             fill_policy=fill_policy,
             tolerance_bps=tolerance_bps,
         )
+
+    async def _run_signal_only_symbol(self, symbol: str, allow_new_entries: bool) -> None:
+        if not allow_new_entries:
+            return
+
+        candles = await self._load_candles(symbol)
+        decision = self._live_signal_decision(symbol, candles, 0.0)
+        signal = decision.signal
+        if self._blocks_exploratory_live_entry(decision):
+            logger.info(
+                "manual_signal_wait_exploratory_block",
+                symbol=symbol,
+                strategy=decision.strategy,
+                regime=decision.regime,
+                risk_mode=decision.risk_mode,
+                market_playbook=decision.market_playbook,
+                allocator_profile=decision.allocator_profile,
+                allocator_state=decision.allocator_state,
+                allocator_scale=decision.allocator_scale,
+                action=signal.action,
+                score=signal.score,
+                reasons=signal.reasons[:8],
+            )
+            return
+        if signal.action not in {"PLAN_LONG", "PLAN_SHORT"} or signal.score < self._settings.testnet_min_signal_score:
+            logger.info(
+                "manual_signal_wait",
+                symbol=symbol,
+                strategy=decision.strategy,
+                regime=decision.regime,
+                risk_mode=decision.risk_mode,
+                market_playbook=decision.market_playbook,
+                allocator_profile=decision.allocator_profile,
+                allocator_state=decision.allocator_state,
+                allocator_scale=decision.allocator_scale,
+                action=signal.action,
+                score=signal.score,
+                reasons=signal.reasons[:8],
+            )
+            return
+
+        notional = self._bounded_signal_notional(signal)
+        leverage = self._bounded_signal_leverage(signal)
+        direction = "short" if signal.action == "PLAN_SHORT" else "long"
+        reward_pct = self._planned_reward_pct(signal, direction)
+        if reward_pct < self._settings.testnet_min_reward_pct:
+            logger.info(
+                "manual_signal_wait_fee_buffer",
+                symbol=symbol,
+                strategy=decision.strategy,
+                action=signal.action,
+                score=signal.score,
+                reward_pct=reward_pct,
+                min_reward_pct=self._settings.testnet_min_reward_pct,
+                reasons=signal.reasons[:8],
+            )
+            return
+
+        planned_entry = self._planned_entry_price(signal)
+        planned_stop, planned_take_profit = self._live_exit_levels(signal, direction, planned_entry)
+        fill_policy = normalize_entry_fill_policy(self._settings.testnet_entry_fill_policy)
+        tolerance_bps = self._entry_tolerance_bps(decision)
+        order_entry_price = self._entry_limit_price(
+            direction,
+            planned_entry,
+            planned_stop,
+            planned_take_profit,
+            tolerance_bps=tolerance_bps,
+        )
+        tolerated_reward_pct = self._reward_pct_for_entry(order_entry_price, planned_take_profit, direction)
+        if tolerated_reward_pct < self._settings.testnet_min_reward_pct:
+            logger.info(
+                "manual_signal_wait_entry_tolerance_fee_buffer",
+                symbol=symbol,
+                strategy=decision.strategy,
+                action=signal.action,
+                score=signal.score,
+                planned_entry=planned_entry,
+                order_entry_price=order_entry_price,
+                take_profit=planned_take_profit,
+                reward_pct=tolerated_reward_pct,
+                min_reward_pct=self._settings.testnet_min_reward_pct,
+                fill_policy=fill_policy,
+                tolerance_bps=tolerance_bps,
+                reasons=signal.reasons[:8],
+            )
+            return
+
+        reprice_headroom_reward_pct = self._reprice_headroom_reward_pct(
+            direction,
+            order_entry_price,
+            planned_stop,
+            planned_take_profit,
+            tolerance_bps=tolerance_bps,
+        )
+        reprice_min_reward_pct = self._effective_reprice_min_reward_pct(decision)
+        if (
+            reprice_headroom_reward_pct is not None
+            and reprice_headroom_reward_pct < reprice_min_reward_pct
+        ):
+            logger.info(
+                "manual_signal_wait_reprice_headroom",
+                symbol=symbol,
+                strategy=decision.strategy,
+                action=signal.action,
+                score=signal.score,
+                order_entry_price=order_entry_price,
+                take_profit=planned_take_profit,
+                reward_pct=tolerated_reward_pct,
+                reprice_headroom_reward_pct=reprice_headroom_reward_pct,
+                min_reward_pct=reprice_min_reward_pct,
+                fill_policy=fill_policy,
+                tolerance_bps=tolerance_bps,
+                reasons=signal.reasons[:8],
+            )
+            return
+
+        await self._notify_manual_signal(
+            symbol=symbol,
+            decision=decision,
+            direction=direction,
+            notional=notional,
+            leverage=leverage,
+            planned_entry=planned_entry,
+            order_entry_price=order_entry_price,
+            planned_stop=planned_stop,
+            planned_take_profit=planned_take_profit,
+            fill_policy=fill_policy,
+            tolerance_bps=tolerance_bps,
+        )
+        self._cooldown_until[decision.strategy] = time.time() + 300
 
     async def _place_pending_entry_limit(
         self,
@@ -768,7 +934,10 @@ class TestnetAutoTrader:
         today_net: float,
     ) -> LiveDecisionContext:
         if self._settings.testnet_strategy_label == "winrate_optimized_portfolio":
-            from src.gridbot.strategy.winrate_optimized_portfolio import generate_winrate_optimized_portfolio_decision
+            from src.gridbot.strategy.winrate_optimized_portfolio import (
+                explain_winrate_optimized_portfolio_no_signal,
+                generate_winrate_optimized_portfolio_decision,
+            )
             decision = generate_winrate_optimized_portfolio_decision(
                 candles=candles,
                 today_net=today_net,
@@ -776,6 +945,12 @@ class TestnetAutoTrader:
                 equity_usdc=self._settings.testnet_equity_usdc,
             )
             if decision is None:
+                reasons = explain_winrate_optimized_portfolio_no_signal(
+                    candles=candles,
+                    today_net=today_net,
+                    cooldown_until=self._cooldown_until,
+                    equity_usdc=self._settings.testnet_equity_usdc,
+                )
                 return LiveDecisionContext(
                     signal=SignalPlan(
                         action="WAIT",
@@ -787,7 +962,7 @@ class TestnetAutoTrader:
                         atr=None,
                         support=None,
                         vwap=None,
-                        reasons=["winrate_optimized_portfolio: no signal triggered or filtered out"],
+                        reasons=reasons,
                     ),
                     strategy="portfolio_wait",
                     regime="blocked",
@@ -1309,7 +1484,7 @@ class TestnetAutoTrader:
                 symbol=symbol,
                 action=signal.action,
                 strategy=decision.strategy,
-                reasons=signal.reasons[:3],
+                reasons=signal.reasons[:8],
             )
             return None
 
@@ -1406,6 +1581,100 @@ class TestnetAutoTrader:
             )
         return sum(item.income for item in records)
 
+    async def _notify_manual_signal(
+        self,
+        *,
+        symbol: str,
+        decision: LiveDecisionContext,
+        direction: str,
+        notional: float,
+        leverage: int,
+        planned_entry: float,
+        order_entry_price: float,
+        planned_stop: float,
+        planned_take_profit: float,
+        fill_policy: str,
+        tolerance_bps: float,
+    ) -> None:
+        signal = decision.signal
+        now_ms = self._now_ms()
+        execution_id = f"{symbol}-{now_ms}"
+        side_text = "做空" if direction == "short" else "做多"
+        side_icon = "🔴" if direction == "short" else "🟢"
+        reasons = "\n".join(f"- {escape(reason)}" for reason in signal.reasons[:8])
+        payload = {
+            "execution_id": execution_id,
+            "symbol": symbol,
+            "direction": direction,
+            "strategy": decision.strategy,
+            "regime": decision.regime,
+            "risk_mode": decision.risk_mode,
+            "market_playbook": decision.market_playbook,
+            "allocator_profile": decision.allocator_profile,
+            "allocator_state": decision.allocator_state,
+            "allocator_scale": decision.allocator_scale,
+            "score": signal.score,
+            "confidence": signal.confidence,
+            "planned_entry": planned_entry,
+            "order_entry_price": order_entry_price,
+            "planned_stop": planned_stop,
+            "planned_take_profit": planned_take_profit,
+            "notional_usdc": notional,
+            "leverage": leverage,
+            "fill_policy": fill_policy,
+            "tolerance_bps": tolerance_bps,
+            "sent_at_ms": now_ms,
+        }
+
+        logger.info(
+            "manual_signal_ready",
+            execution_id=execution_id,
+            symbol=symbol,
+            direction=direction,
+            strategy=decision.strategy,
+            score=signal.score,
+            notional=notional,
+            leverage=leverage,
+        )
+        self._latest_manual_signal = payload
+
+        if not self._telegram_app or not self._settings.telegram_chat_id_int:
+            logger.info("manual_signal_notice_skipped", execution_id=execution_id)
+            return
+
+        message = await self._telegram_app.bot.send_message(
+            chat_id=self._settings.telegram_chat_id_int,
+            text=(
+                f"{side_icon} <b>{side_text}訊號</b> | <b>{escape(symbol)}</b>\n"
+                f"策略：<b>{escape(decision.strategy)}</b> | score=<code>{signal.score}</code>\n"
+                f"名目金額：<b>${notional:.2f} USDC</b> | 槓桿：<b>{leverage}x</b>\n"
+                f"建議 Entry：<b>${planned_entry:.4f}</b>\n"
+                f"Limit 參考：<b>${order_entry_price:.4f}</b> ({escape(fill_policy)}, {tolerance_bps:.2f} bps)\n"
+                f"Stop：<b>${planned_stop:.4f}</b> | TP：<b>${planned_take_profit:.4f}</b>\n"
+                f"Regime：<code>{escape(decision.regime)}</code> / <code>{escape(decision.market_playbook)}</code>\n"
+                f"訊號代碼：<code>{escape(execution_id)}</code>\n"
+                f"{reasons}"
+            ),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("已下單", callback_data=f"manual_signal:{execution_id}")]]
+            ),
+        )
+        payload["message_id"] = message.message_id
+        self._manual_signal_messages[message.message_id] = payload
+        self._latest_manual_signal = payload
+
+        audit_repo = self._telegram_app.bot_data.get("audit_repo") if self._telegram_app else None
+        if audit_repo is not None:
+            await audit_repo.log(
+                "manual_signal_sent",
+                "testnet_auto_trader",
+                {
+                    **payload,
+                    "signal": payload,
+                },
+            )
+
     async def _notify_entry(
         self,
         result: TestnetOrderResult,
@@ -1414,7 +1683,7 @@ class TestnetAutoTrader:
         entry_mode: str = "router_filled",
     ) -> None:
         signal = decision.signal
-        reasons = "\n".join(f"- {escape(reason)}" for reason in signal.reasons[:4])
+        reasons = "\n".join(f"- {escape(reason)}" for reason in signal.reasons[:8])
         logger.info(
             "testnet_position_opened",
             symbol=result.symbol,
@@ -1458,7 +1727,7 @@ class TestnetAutoTrader:
         pending: PendingEntry,
     ) -> None:
         signal = decision.signal
-        reasons = "\n".join(f"- {escape(reason)}" for reason in signal.reasons[:4])
+        reasons = "\n".join(f"- {escape(reason)}" for reason in signal.reasons[:8])
         heading = _label_entry_mode(self._router_entry_mode("limit"))
         await self._notify_text(
             f"🧾 <b>Testnet {escape(heading)}</b>\n"
