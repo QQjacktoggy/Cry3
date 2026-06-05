@@ -1,0 +1,538 @@
+{
+  "mode": "wildcat_s1s5",
+  "symbol": "ETHUSDC",
+  "runs": [
+    {
+      "days": 30,
+      "generated_at": "2026-06-05T05:21:46.955325+00:00",
+      "variant_count": 1,
+      "best": {
+        "symbol": "ETHUSDC",
+        "days": 30,
+        "params": {
+          "label": "wildcat_30d_balanced_v1",
+          "s1_tp": 0.0012,
+          "s1_sl": 0.0018,
+          "s2_tp": 0.0028,
+          "s2_sl": 0.0015,
+          "s3_tp": 0.0026,
+          "s3_sl": 0.0016,
+          "s4_tp": 0.0035,
+          "s4_sl": 0.0013,
+          "s5_tp": 0.0018,
+          "s5_sl": 0.0014,
+          "s1_rsi_long_max": 38.0,
+          "s1_rsi_short_min": 62.0,
+          "s5_long_d_max": 31.0,
+          "s5_short_d_min": 69.0,
+          "range_edge_atr_margin": 0.2,
+          "min_vol_ratio": 0.22,
+          "strict_body_ratio": 0.12,
+          "breakout_vol_ratio": 1.25,
+          "breakout_body_ratio": 0.24,
+          "breakout_atr_margin": 0.08,
+          "cooldown_bars": 5,
+          "max_holding_bars": 20,
+          "entry_fee_rate": 0.0,
+          "tp_exit_fee_rate": 0.0,
+          "sl_exit_fee_rate": 0.0,
+          "time_bias": true,
+          "rolling_gate": true,
+          "adaptive_tp_sl": true,
+          "notional_usdc": 1000.0,
+          "target_daily_usdc": 20.0,
+          "leverage_options": [
+            75,
+            100
+          ],
+          "enabled_strategies": [
+            "S1_BB_RSI",
+            "S5_Stoch"
+          ],
+          "score_floor": 0.0,
+          "max_open_positions": 2,
+          "recovery_enabled": true,
+          "recovery_steps": 3,
+          "recovery_trigger_pct": 0.0009,
+          "recovery_notional_scale": 1.0,
+          "recovery_tp_shrink": 0.45,
+          "partial_exit_pct": 0.4,
+          "partial_tp_pct": 0.0005,
+          "daily_target_stop": true,
+          "daily_profit_target_usdc": 40.0,
+          "daily_floor_lock_usdc": 24.0,
+          "daily_giveback_usdc": 4.0,
+          "catchup_enabled": true,
+          "catchup_start_hour": 12,
+          "catchup_vwap_atr": 0.18,
+          "catchup_rsi_long_max": 52.0,
+          "catchup_rsi_short_min": 48.0,
+          "rescue_hour": 14,
+          "rescue_vwap_atr": 0.06,
+          "rescue_rsi_long_max": 60.0,
+          "rescue_rsi_short_min": 40.0,
+          "allow_duplicate_layers": false,
+          "max_duplicate_layers": 1
+        },
+        "trades": 2797,
+        "wins": 2399,
+        "losses": 398,
+        "win_rate_pct": 85.77,
+        "net_pnl_usdc": 631.5448,
+        "gross_profit_usdc": 1936.5455,
+        "gross_loss_usdc": 1305.0008,
+        "profit_factor": 1.4839,
+        "max_drawdown_usdc": 27.2349,
+        "strict_objective": {
+          "daily_min_target_usdc": 20.0,
+          "avg_daily_target_usdc": 30.0,
+          "max_drawdown_limit_usdc": 20.0,
+          "met": false
+        },
+        "near_10pct_objective": {
+          "daily_min_floor_usdc": 18.0,
+          "avg_daily_floor_usdc": 27.0,
+          "max_drawdown_ceiling_usdc": 22.0,
+          "met": false
+        },
+        "target_daily_usdc": 20.0,
+        "active_days": 30,
+        "avg_daily_pnl_usdc": 21.0515,
+        "avg_active_day_pnl_usdc": 21.0515,
+        "daily_target_hits": 16,
+        "daily_target_day_count": 30,
+        "daily_target_hit_rate_pct": 53.33,
+        "all_days_met_target": false,
+        "best_day_usdc": 40.4332,
+        "worst_day_usdc": -7.1745,
+        "required_notional_for_target_usdc": 950.05,
+        "leverage_report": [
+          {
+            "leverage": 75,
+            "margin_per_trade_usdc": 13.3333,
+            "avg_daily_return_on_margin_pct": 157.89
+          },
+          {
+            "leverage": 100,
+            "margin_per_trade_usdc": 10.0,
+            "avg_daily_return_on_margin_pct": 210.51
+          }
+        ],
+        "daily_pnl": [
+          {
+            "date": "2026-05-06",
+            "pnl_usdc": 15.4248,
+            "met_target": false
+          },
+          {
+            "date": "2026-05-07",
+            "pnl_usdc": 20.7128,
+            "met_target": true
+          },
+          {
+            "date": "2026-05-08",
+            "pnl_usdc": 29.8278,
+            "met_target": true
+          },
+          {
+            "date": "2026-05-09",
+            "pnl_usdc": 24.9509,
+            "met_target": true
+          },
+          {
+            "date": "2026-05-10",
+            "pnl_usdc": 16.0807,
+            "met_target": false
+          },
+          {
+            "date": "2026-05-11",
+            "pnl_usdc": 19.3636,
+            "met_target": false
+          },
+          {
+            "date": "2026-05-12",
+            "pnl_usdc": 23.4534,
+            "met_target": true
+          },
+          {
+            "date": "2026-05-13",
+            "pnl_usdc": -7.1745,
+            "met_target": false
+          },
+          {
+            "date": "2026-05-14",
+            "pnl_usdc": 40.0602,
+            "met_target": true
+          },
+          {
+            "date": "2026-05-15",
+            "pnl_usdc": 27.6989,
+            "met_target": true
+          },
+          {
+            "date": "2026-05-16",
+            "pnl_usdc": 23.125,
+            "met_target": true
+          },
+          {
+            "date": "2026-05-17",
+            "pnl_usdc": 15.8835,
+            "met_target": false
+          },
+          {
+            "date": "2026-05-18",
+            "pnl_usdc": 40.1225,
+            "met_target": true
+          },
+          {
+            "date": "2026-05-19",
+            "pnl_usdc": 16.9994,
+            "met_target": false
+          },
+          {
+            "date": "2026-05-20",
+            "pnl_usdc": 20.3107,
+            "met_target": true
+          },
+          {
+            "date": "2026-05-21",
+            "pnl_usdc": 40.4332,
+            "met_target": true
+          },
+          {
+            "date": "2026-05-22",
+            "pnl_usdc": 23.2944,
+            "met_target": true
+          },
+          {
+            "date": "2026-05-23",
+            "pnl_usdc": 13.1551,
+            "met_target": false
+          },
+          {
+            "date": "2026-05-24",
+            "pnl_usdc": 3.4295,
+            "met_target": false
+          },
+          {
+            "date": "2026-05-25",
+            "pnl_usdc": 4.9835,
+            "met_target": false
+          },
+          {
+            "date": "2026-05-26",
+            "pnl_usdc": 1.764,
+            "met_target": false
+          },
+          {
+            "date": "2026-05-27",
+            "pnl_usdc": 29.8131,
+            "met_target": true
+          },
+          {
+            "date": "2026-05-28",
+            "pnl_usdc": 13.349,
+            "met_target": false
+          },
+          {
+            "date": "2026-05-29",
+            "pnl_usdc": 17.6724,
+            "met_target": false
+          },
+          {
+            "date": "2026-05-30",
+            "pnl_usdc": 21.1491,
+            "met_target": true
+          },
+          {
+            "date": "2026-05-31",
+            "pnl_usdc": 12.8001,
+            "met_target": false
+          },
+          {
+            "date": "2026-06-01",
+            "pnl_usdc": 23.3491,
+            "met_target": true
+          },
+          {
+            "date": "2026-06-02",
+            "pnl_usdc": 19.049,
+            "met_target": false
+          },
+          {
+            "date": "2026-06-03",
+            "pnl_usdc": 40.2683,
+            "met_target": true
+          },
+          {
+            "date": "2026-06-04",
+            "pnl_usdc": 40.1954,
+            "met_target": true
+          }
+        ],
+        "by_strategy": {
+          "S1_BB_RSI": {
+            "trades": 2564,
+            "win_rate_pct": 86.78,
+            "net_pnl_usdc": 621.6463,
+            "profit_factor": 1.554,
+            "max_drawdown_usdc": 26.512
+          },
+          "S2_SuperTrend": {
+            "trades": 0,
+            "win_rate_pct": 0.0,
+            "net_pnl_usdc": 0,
+            "profit_factor": 0.0,
+            "max_drawdown_usdc": 0.0
+          },
+          "S3_EMA_MACD": {
+            "trades": 0,
+            "win_rate_pct": 0.0,
+            "net_pnl_usdc": 0,
+            "profit_factor": 0.0,
+            "max_drawdown_usdc": 0.0
+          },
+          "S4_Donchian": {
+            "trades": 0,
+            "win_rate_pct": 0.0,
+            "net_pnl_usdc": 0,
+            "profit_factor": 0.0,
+            "max_drawdown_usdc": 0.0
+          },
+          "S5_Stoch": {
+            "trades": 233,
+            "win_rate_pct": 74.68,
+            "net_pnl_usdc": 9.8985,
+            "profit_factor": 1.0541,
+            "max_drawdown_usdc": 31.9487
+          }
+        },
+        "rank_score": -2752.7828600000003,
+        "rejected": {
+          "duplicate_open": 9679,
+          "cooldown": 1368,
+          "daily_target_stop": 2552
+        },
+        "sample_trades": [
+          {
+            "strategy": "S1_BB_RSI",
+            "side": "LONG",
+            "entry_time": "2026-06-04T13:48:00+08:00",
+            "exit_time": "2026-06-04T13:50:00+08:00",
+            "entry_index": 42588,
+            "exit_index": 42590,
+            "entry_price": 1783.6158,
+            "exit_price": 1784.3093,
+            "exit_reason": "TP",
+            "gross_pnl": 0.82208,
+            "fees": 0.0,
+            "pnl": 0.82208,
+            "holding_bars": 2,
+            "dca_count": 1,
+            "partial_taken": true,
+            "final_notional_usdc": 1600.0
+          },
+          {
+            "strategy": "S1_BB_RSI",
+            "side": "LONG",
+            "entry_time": "2026-06-04T13:50:00+08:00",
+            "exit_time": "2026-06-04T13:51:00+08:00",
+            "entry_index": 42590,
+            "exit_index": 42591,
+            "entry_price": 1781.3377,
+            "exit_price": 1782.0303,
+            "exit_reason": "TP",
+            "gross_pnl": 0.86656,
+            "fees": 0.0,
+            "pnl": 0.86656,
+            "holding_bars": 1,
+            "dca_count": 1,
+            "partial_taken": true,
+            "final_notional_usdc": 1200.0
+          },
+          {
+            "strategy": "S1_BB_RSI",
+            "side": "LONG",
+            "entry_time": "2026-06-04T13:51:00+08:00",
+            "exit_time": "2026-06-04T13:52:00+08:00",
+            "entry_index": 42591,
+            "exit_index": 42592,
+            "entry_price": 1779.8,
+            "exit_price": 1781.3377,
+            "exit_reason": "TP",
+            "gross_pnl": 0.7184,
+            "fees": 0.0,
+            "pnl": 0.7184,
+            "holding_bars": 1,
+            "dca_count": 0,
+            "partial_taken": true,
+            "final_notional_usdc": 600.0
+          },
+          {
+            "strategy": "S1_BB_RSI",
+            "side": "LONG",
+            "entry_time": "2026-06-04T13:52:00+08:00",
+            "exit_time": "2026-06-04T13:53:00+08:00",
+            "entry_index": 42592,
+            "exit_index": 42593,
+            "entry_price": 1782.92,
+            "exit_price": 1784.4604,
+            "exit_reason": "TP",
+            "gross_pnl": 0.7184,
+            "fees": 0.0,
+            "pnl": 0.7184,
+            "holding_bars": 1,
+            "dca_count": 0,
+            "partial_taken": true,
+            "final_notional_usdc": 600.0
+          },
+          {
+            "strategy": "S1_BB_RSI",
+            "side": "LONG",
+            "entry_time": "2026-06-04T13:53:00+08:00",
+            "exit_time": "2026-06-04T13:58:00+08:00",
+            "entry_index": 42593,
+            "exit_index": 42598,
+            "entry_price": 1781.7069,
+            "exit_price": 1782.455,
+            "exit_reason": "TP",
+            "gross_pnl": 0.871846,
+            "fees": 0.0,
+            "pnl": 0.871846,
+            "holding_bars": 5,
+            "dca_count": 1,
+            "partial_taken": true,
+            "final_notional_usdc": 1600.0
+          },
+          {
+            "strategy": "S1_BB_RSI",
+            "side": "LONG",
+            "entry_time": "2026-06-04T13:58:00+08:00",
+            "exit_time": "2026-06-04T13:59:00+08:00",
+            "entry_index": 42598,
+            "exit_index": 42599,
+            "entry_price": 1780.21,
+            "exit_price": 1781.5721,
+            "exit_reason": "TP",
+            "gross_pnl": 0.659095,
+            "fees": 0.0,
+            "pnl": 0.659095,
+            "holding_bars": 1,
+            "dca_count": 0,
+            "partial_taken": true,
+            "final_notional_usdc": 600.0
+          },
+          {
+            "strategy": "S1_BB_RSI",
+            "side": "LONG",
+            "entry_time": "2026-06-04T13:59:00+08:00",
+            "exit_time": "2026-06-04T14:00:00+08:00",
+            "entry_index": 42599,
+            "exit_index": 42600,
+            "entry_price": 1781.4076,
+            "exit_price": 1782.021,
+            "exit_reason": "TP",
+            "gross_pnl": 0.688643,
+            "fees": 0.0,
+            "pnl": 0.688643,
+            "holding_bars": 1,
+            "dca_count": 1,
+            "partial_taken": false,
+            "final_notional_usdc": 2000.0
+          },
+          {
+            "strategy": "S1_BB_RSI",
+            "side": "LONG",
+            "entry_time": "2026-06-04T14:00:00+08:00",
+            "exit_time": "2026-06-04T14:02:00+08:00",
+            "entry_index": 42600,
+            "exit_index": 42602,
+            "entry_price": 1780.6,
+            "exit_price": 1781.9624,
+            "exit_reason": "TP",
+            "gross_pnl": 0.659095,
+            "fees": 0.0,
+            "pnl": 0.659095,
+            "holding_bars": 2,
+            "dca_count": 0,
+            "partial_taken": true,
+            "final_notional_usdc": 600.0
+          },
+          {
+            "strategy": "S1_BB_RSI",
+            "side": "LONG",
+            "entry_time": "2026-06-04T14:02:00+08:00",
+            "exit_time": "2026-06-04T14:03:00+08:00",
+            "entry_index": 42602,
+            "exit_index": 42603,
+            "entry_price": 1785.03,
+            "exit_price": 1786.3958,
+            "exit_reason": "TP",
+            "gross_pnl": 0.659095,
+            "fees": 0.0,
+            "pnl": 0.659095,
+            "holding_bars": 1,
+            "dca_count": 0,
+            "partial_taken": true,
+            "final_notional_usdc": 600.0
+          },
+          {
+            "strategy": "S1_BB_RSI",
+            "side": "LONG",
+            "entry_time": "2026-06-04T14:06:00+08:00",
+            "exit_time": "2026-06-04T14:07:00+08:00",
+            "entry_index": 42606,
+            "exit_index": 42607,
+            "entry_price": 1784.28,
+            "exit_price": 1785.6453,
+            "exit_reason": "TP",
+            "gross_pnl": 0.659095,
+            "fees": 0.0,
+            "pnl": 0.659095,
+            "holding_bars": 1,
+            "dca_count": 0,
+            "partial_taken": true,
+            "final_notional_usdc": 600.0
+          },
+          {
+            "strategy": "S1_BB_RSI",
+            "side": "LONG",
+            "entry_time": "2026-06-04T14:07:00+08:00",
+            "exit_time": "2026-06-04T14:08:00+08:00",
+            "entry_index": 42607,
+            "exit_index": 42608,
+            "entry_price": 1784.61,
+            "exit_price": 1785.9755,
+            "exit_reason": "TP",
+            "gross_pnl": 0.659095,
+            "fees": 0.0,
+            "pnl": 0.659095,
+            "holding_bars": 1,
+            "dca_count": 0,
+            "partial_taken": true,
+            "final_notional_usdc": 600.0
+          },
+          {
+            "strategy": "S1_BB_RSI",
+            "side": "SHORT",
+            "entry_time": "2026-06-04T14:18:00+08:00",
+            "exit_time": "2026-06-04T14:19:00+08:00",
+            "entry_index": 42618,
+            "exit_index": 42619,
+            "entry_price": 1797.71,
+            "exit_price": 1796.0325,
+            "exit_reason": "TP",
+            "gross_pnl": 0.759872,
+            "fees": 0.0,
+            "pnl": 0.759872,
+            "holding_bars": 1,
+            "dca_count": 0,
+            "partial_taken": true,
+            "final_notional_usdc": 600.0
+          }
+        ]
+      },
+      "top": []
+    }
+  ]
+}

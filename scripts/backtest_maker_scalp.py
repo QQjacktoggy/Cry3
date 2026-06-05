@@ -15,11 +15,18 @@ from config.settings import Settings
 
 TAIPEI = ZoneInfo("Asia/Taipei")
 
-def fetch_1m_klines(symbol: str, days: int = 7) -> list[dict]:
+def fetch_1m_klines(
+    symbol: str,
+    days: int = 7,
+    start_dt: datetime | None = None,
+    end_dt: datetime | None = None,
+) -> list[dict]:
     """Fetch recent 1m candles from Binance Futures API."""
     base_url = "https://fapi.binance.com"
-    end_dt = datetime.now(timezone.utc)
-    start_dt = end_dt - timedelta(days=days)
+    if end_dt is None:
+        end_dt = datetime.now(timezone.utc)
+    if start_dt is None:
+        start_dt = end_dt - timedelta(days=days)
     
     start_ms = int(start_dt.timestamp() * 1000)
     end_ms = int(end_dt.timestamp() * 1000)

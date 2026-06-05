@@ -1,0 +1,897 @@
+{
+  "generated_at": "2026-06-05T13:28:20.766969+08:00",
+  "preset": "wildcat_30d_balanced_v1",
+  "source_days": 61,
+  "windows_7d": {
+    "count": 55,
+    "avg_of_avg_daily": 19.5013,
+    "min_avg_daily": 4.0699,
+    "max_avg_daily": 29.7286,
+    "avg_max_drawdown": 30.9792,
+    "max_of_max_drawdown": 49.6412,
+    "windows_meeting_avg20_dd30": 24,
+    "windows": [
+      {
+        "start": "2026-04-06",
+        "end": "2026-04-12",
+        "avg_daily_pnl_usdc": 15.8095,
+        "max_drawdown_usdc": 47.8489,
+        "daily_target_hits": 3,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": -10.6394,
+        "net_pnl_usdc": 110.6665
+      },
+      {
+        "start": "2026-04-07",
+        "end": "2026-04-13",
+        "avg_daily_pnl_usdc": 16.1422,
+        "max_drawdown_usdc": 47.8489,
+        "daily_target_hits": 3,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": -10.6394,
+        "net_pnl_usdc": 112.9953
+      },
+      {
+        "start": "2026-04-08",
+        "end": "2026-04-14",
+        "avg_daily_pnl_usdc": 17.7781,
+        "max_drawdown_usdc": 47.8489,
+        "daily_target_hits": 3,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": -12.4334,
+        "net_pnl_usdc": 124.4466
+      },
+      {
+        "start": "2026-04-09",
+        "end": "2026-04-15",
+        "avg_daily_pnl_usdc": 26.4926,
+        "max_drawdown_usdc": 25.3985,
+        "daily_target_hits": 4,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": 12.1057,
+        "net_pnl_usdc": 185.4482
+      },
+      {
+        "start": "2026-04-10",
+        "end": "2026-04-16",
+        "avg_daily_pnl_usdc": 26.4057,
+        "max_drawdown_usdc": 14.9642,
+        "daily_target_hits": 5,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": 12.1057,
+        "net_pnl_usdc": 184.84
+      },
+      {
+        "start": "2026-04-11",
+        "end": "2026-04-17",
+        "avg_daily_pnl_usdc": 28.7486,
+        "max_drawdown_usdc": 19.2126,
+        "daily_target_hits": 5,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": 9.0119,
+        "net_pnl_usdc": 201.2404
+      },
+      {
+        "start": "2026-04-12",
+        "end": "2026-04-18",
+        "avg_daily_pnl_usdc": 29.7286,
+        "max_drawdown_usdc": 33.9648,
+        "daily_target_hits": 6,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": 12.5749,
+        "net_pnl_usdc": 208.1002
+      },
+      {
+        "start": "2026-04-13",
+        "end": "2026-04-19",
+        "avg_daily_pnl_usdc": 29.2282,
+        "max_drawdown_usdc": 33.9648,
+        "daily_target_hits": 5,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": 12.3294,
+        "net_pnl_usdc": 204.5975
+      },
+      {
+        "start": "2026-04-14",
+        "end": "2026-04-20",
+        "avg_daily_pnl_usdc": 28.976,
+        "max_drawdown_usdc": 33.9648,
+        "daily_target_hits": 5,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": 12.3294,
+        "net_pnl_usdc": 202.8319
+      },
+      {
+        "start": "2026-04-15",
+        "end": "2026-04-21",
+        "avg_daily_pnl_usdc": 26.3051,
+        "max_drawdown_usdc": 33.9648,
+        "daily_target_hits": 5,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": 12.3294,
+        "net_pnl_usdc": 184.1356
+      },
+      {
+        "start": "2026-04-16",
+        "end": "2026-04-22",
+        "avg_daily_pnl_usdc": 25.7345,
+        "max_drawdown_usdc": 33.9648,
+        "daily_target_hits": 5,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": 12.3294,
+        "net_pnl_usdc": 180.1414
+      },
+      {
+        "start": "2026-04-17",
+        "end": "2026-04-23",
+        "avg_daily_pnl_usdc": 24.9136,
+        "max_drawdown_usdc": 33.9648,
+        "daily_target_hits": 4,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": 12.3294,
+        "net_pnl_usdc": 174.3954
+      },
+      {
+        "start": "2026-04-18",
+        "end": "2026-04-24",
+        "avg_daily_pnl_usdc": 20.8755,
+        "max_drawdown_usdc": 33.9648,
+        "daily_target_hits": 3,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": 9.5582,
+        "net_pnl_usdc": 146.1283
+      },
+      {
+        "start": "2026-04-19",
+        "end": "2026-04-25",
+        "avg_daily_pnl_usdc": 21.9484,
+        "max_drawdown_usdc": 21.2284,
+        "daily_target_hits": 4,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": 12.471,
+        "net_pnl_usdc": 153.6389
+      },
+      {
+        "start": "2026-04-20",
+        "end": "2026-04-26",
+        "avg_daily_pnl_usdc": 20.4439,
+        "max_drawdown_usdc": 21.2284,
+        "daily_target_hits": 3,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": 12.471,
+        "net_pnl_usdc": 143.1073
+      },
+      {
+        "start": "2026-04-21",
+        "end": "2026-04-27",
+        "avg_daily_pnl_usdc": 20.171,
+        "max_drawdown_usdc": 43.8051,
+        "daily_target_hits": 2,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": 1.994,
+        "net_pnl_usdc": 141.1969
+      },
+      {
+        "start": "2026-04-22",
+        "end": "2026-04-28",
+        "avg_daily_pnl_usdc": 13.6398,
+        "max_drawdown_usdc": 43.8051,
+        "daily_target_hits": 1,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": -3.9363,
+        "net_pnl_usdc": 95.4784
+      },
+      {
+        "start": "2026-04-23",
+        "end": "2026-04-29",
+        "avg_daily_pnl_usdc": 10.831,
+        "max_drawdown_usdc": 43.8051,
+        "daily_target_hits": 0,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": -4.3094,
+        "net_pnl_usdc": 75.817
+      },
+      {
+        "start": "2026-04-24",
+        "end": "2026-04-30",
+        "avg_daily_pnl_usdc": 11.1059,
+        "max_drawdown_usdc": 43.8051,
+        "daily_target_hits": 1,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": -4.3094,
+        "net_pnl_usdc": 77.7413
+      },
+      {
+        "start": "2026-04-25",
+        "end": "2026-05-01",
+        "avg_daily_pnl_usdc": 4.6524,
+        "max_drawdown_usdc": 49.6412,
+        "daily_target_hits": 1,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": -30.6694,
+        "net_pnl_usdc": 32.5666
+      },
+      {
+        "start": "2026-04-26",
+        "end": "2026-05-02",
+        "avg_daily_pnl_usdc": 4.6042,
+        "max_drawdown_usdc": 49.6412,
+        "daily_target_hits": 1,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": -30.1012,
+        "net_pnl_usdc": 32.2294
+      },
+      {
+        "start": "2026-04-27",
+        "end": "2026-05-03",
+        "avg_daily_pnl_usdc": 4.0699,
+        "max_drawdown_usdc": 49.6412,
+        "daily_target_hits": 1,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": -30.1012,
+        "net_pnl_usdc": 28.4892
+      },
+      {
+        "start": "2026-04-28",
+        "end": "2026-05-04",
+        "avg_daily_pnl_usdc": 9.5276,
+        "max_drawdown_usdc": 49.6412,
+        "daily_target_hits": 2,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": -30.1012,
+        "net_pnl_usdc": 66.6935
+      },
+      {
+        "start": "2026-04-29",
+        "end": "2026-05-05",
+        "avg_daily_pnl_usdc": 14.2556,
+        "max_drawdown_usdc": 49.6412,
+        "daily_target_hits": 3,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": -30.1012,
+        "net_pnl_usdc": 99.7891
+      },
+      {
+        "start": "2026-04-30",
+        "end": "2026-05-06",
+        "avg_daily_pnl_usdc": 13.9785,
+        "max_drawdown_usdc": 49.6412,
+        "daily_target_hits": 3,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": -30.1012,
+        "net_pnl_usdc": 97.8492
+      },
+      {
+        "start": "2026-05-01",
+        "end": "2026-05-07",
+        "avg_daily_pnl_usdc": 13.1263,
+        "max_drawdown_usdc": 49.6412,
+        "daily_target_hits": 3,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": -32.3012,
+        "net_pnl_usdc": 91.884
+      },
+      {
+        "start": "2026-05-02",
+        "end": "2026-05-08",
+        "avg_daily_pnl_usdc": 21.0973,
+        "max_drawdown_usdc": 22.0978,
+        "daily_target_hits": 4,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": 10.5765,
+        "net_pnl_usdc": 147.6811
+      },
+      {
+        "start": "2026-05-03",
+        "end": "2026-05-09",
+        "avg_daily_pnl_usdc": 23.7102,
+        "max_drawdown_usdc": 22.0978,
+        "daily_target_hits": 5,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": 11.8806,
+        "net_pnl_usdc": 165.9716
+      },
+      {
+        "start": "2026-05-04",
+        "end": "2026-05-10",
+        "avg_daily_pnl_usdc": 24.3615,
+        "max_drawdown_usdc": 22.0978,
+        "daily_target_hits": 5,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": 14.6784,
+        "net_pnl_usdc": 170.5307
+      },
+      {
+        "start": "2026-05-05",
+        "end": "2026-05-11",
+        "avg_daily_pnl_usdc": 21.2929,
+        "max_drawdown_usdc": 22.0978,
+        "daily_target_hits": 4,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": 14.6784,
+        "net_pnl_usdc": 149.05
+      },
+      {
+        "start": "2026-05-06",
+        "end": "2026-05-12",
+        "avg_daily_pnl_usdc": 21.2954,
+        "max_drawdown_usdc": 22.0978,
+        "daily_target_hits": 4,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": 14.6784,
+        "net_pnl_usdc": 149.0677
+      },
+      {
+        "start": "2026-05-07",
+        "end": "2026-05-13",
+        "avg_daily_pnl_usdc": 18.4948,
+        "max_drawdown_usdc": 20.1148,
+        "daily_target_hits": 4,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": -7.1745,
+        "net_pnl_usdc": 129.4635
+      },
+      {
+        "start": "2026-05-08",
+        "end": "2026-05-14",
+        "avg_daily_pnl_usdc": 21.4084,
+        "max_drawdown_usdc": 21.7164,
+        "daily_target_hits": 4,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": -7.1745,
+        "net_pnl_usdc": 149.8588
+      },
+      {
+        "start": "2026-05-09",
+        "end": "2026-05-15",
+        "avg_daily_pnl_usdc": 20.0097,
+        "max_drawdown_usdc": 21.7164,
+        "daily_target_hits": 4,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": -7.1745,
+        "net_pnl_usdc": 140.0676
+      },
+      {
+        "start": "2026-05-10",
+        "end": "2026-05-16",
+        "avg_daily_pnl_usdc": 20.7411,
+        "max_drawdown_usdc": 22.7509,
+        "daily_target_hits": 4,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": -7.1745,
+        "net_pnl_usdc": 145.188
+      },
+      {
+        "start": "2026-05-11",
+        "end": "2026-05-17",
+        "avg_daily_pnl_usdc": 20.4548,
+        "max_drawdown_usdc": 22.7509,
+        "daily_target_hits": 5,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": -7.1745,
+        "net_pnl_usdc": 143.1838
+      },
+      {
+        "start": "2026-05-12",
+        "end": "2026-05-18",
+        "avg_daily_pnl_usdc": 23.3099,
+        "max_drawdown_usdc": 22.7509,
+        "daily_target_hits": 5,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": -7.1745,
+        "net_pnl_usdc": 163.169
+      },
+      {
+        "start": "2026-05-13",
+        "end": "2026-05-19",
+        "avg_daily_pnl_usdc": 22.7593,
+        "max_drawdown_usdc": 22.7509,
+        "daily_target_hits": 4,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": -4.5745,
+        "net_pnl_usdc": 159.3149
+      },
+      {
+        "start": "2026-05-14",
+        "end": "2026-05-20",
+        "avg_daily_pnl_usdc": 26.3786,
+        "max_drawdown_usdc": 26.7568,
+        "daily_target_hits": 5,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": 15.8835,
+        "net_pnl_usdc": 184.6504
+      },
+      {
+        "start": "2026-05-15",
+        "end": "2026-05-21",
+        "avg_daily_pnl_usdc": 27.4354,
+        "max_drawdown_usdc": 26.7568,
+        "daily_target_hits": 5,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": 15.8835,
+        "net_pnl_usdc": 192.048
+      },
+      {
+        "start": "2026-05-16",
+        "end": "2026-05-22",
+        "avg_daily_pnl_usdc": 25.2694,
+        "max_drawdown_usdc": 26.7568,
+        "daily_target_hits": 4,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": 15.8508,
+        "net_pnl_usdc": 176.8856
+      },
+      {
+        "start": "2026-05-17",
+        "end": "2026-05-23",
+        "avg_daily_pnl_usdc": 23.9708,
+        "max_drawdown_usdc": 26.7568,
+        "daily_target_hits": 4,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": 13.0822,
+        "net_pnl_usdc": 167.7954
+      },
+      {
+        "start": "2026-05-18",
+        "end": "2026-05-24",
+        "avg_daily_pnl_usdc": 22.6486,
+        "max_drawdown_usdc": 27.2349,
+        "daily_target_hits": 4,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": 3.5346,
+        "net_pnl_usdc": 158.54
+      },
+      {
+        "start": "2026-05-19",
+        "end": "2026-05-25",
+        "avg_daily_pnl_usdc": 17.54,
+        "max_drawdown_usdc": 27.2349,
+        "daily_target_hits": 3,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": 3.4295,
+        "net_pnl_usdc": 122.7803
+      },
+      {
+        "start": "2026-05-20",
+        "end": "2026-05-26",
+        "avg_daily_pnl_usdc": 16.2109,
+        "max_drawdown_usdc": 27.2349,
+        "daily_target_hits": 3,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": 1.8575,
+        "net_pnl_usdc": 113.476
+      },
+      {
+        "start": "2026-05-21",
+        "end": "2026-05-27",
+        "avg_daily_pnl_usdc": 16.7004,
+        "max_drawdown_usdc": 27.2349,
+        "daily_target_hits": 3,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": 1.764,
+        "net_pnl_usdc": 116.9027
+      },
+      {
+        "start": "2026-05-22",
+        "end": "2026-05-28",
+        "avg_daily_pnl_usdc": 12.1028,
+        "max_drawdown_usdc": 27.2349,
+        "daily_target_hits": 1,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": 1.764,
+        "net_pnl_usdc": 84.7193
+      },
+      {
+        "start": "2026-05-23",
+        "end": "2026-05-29",
+        "avg_daily_pnl_usdc": 12.7236,
+        "max_drawdown_usdc": 27.2349,
+        "daily_target_hits": 1,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": 1.764,
+        "net_pnl_usdc": 89.0655
+      },
+      {
+        "start": "2026-05-24",
+        "end": "2026-05-30",
+        "avg_daily_pnl_usdc": 14.1534,
+        "max_drawdown_usdc": 25.159,
+        "daily_target_hits": 2,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": 1.764,
+        "net_pnl_usdc": 99.0735
+      },
+      {
+        "start": "2026-05-25",
+        "end": "2026-05-31",
+        "avg_daily_pnl_usdc": 14.0664,
+        "max_drawdown_usdc": 25.159,
+        "daily_target_hits": 2,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": 1.764,
+        "net_pnl_usdc": 98.4646
+      },
+      {
+        "start": "2026-05-26",
+        "end": "2026-06-01",
+        "avg_daily_pnl_usdc": 16.6792,
+        "max_drawdown_usdc": 25.159,
+        "daily_target_hits": 3,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": -1.3782,
+        "net_pnl_usdc": 116.7545
+      },
+      {
+        "start": "2026-05-27",
+        "end": "2026-06-02",
+        "avg_daily_pnl_usdc": 19.3585,
+        "max_drawdown_usdc": 23.1942,
+        "daily_target_hits": 3,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": 12.8001,
+        "net_pnl_usdc": 135.5093
+      },
+      {
+        "start": "2026-05-28",
+        "end": "2026-06-03",
+        "avg_daily_pnl_usdc": 21.423,
+        "max_drawdown_usdc": 22.11,
+        "daily_target_hits": 3,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": 12.8001,
+        "net_pnl_usdc": 149.9608
+      },
+      {
+        "start": "2026-05-29",
+        "end": "2026-06-04",
+        "avg_daily_pnl_usdc": 25.1479,
+        "max_drawdown_usdc": 20.7785,
+        "daily_target_hits": 4,
+        "daily_target_day_count": 7,
+        "worst_day_usdc": 12.8001,
+        "net_pnl_usdc": 176.0353
+      },
+      {
+        "start": "2026-05-30",
+        "end": "2026-06-05",
+        "avg_daily_pnl_usdc": 22.3321,
+        "max_drawdown_usdc": 20.7785,
+        "daily_target_hits": 4,
+        "daily_target_day_count": 6,
+        "worst_day_usdc": 12.8001,
+        "net_pnl_usdc": 156.3248
+      }
+    ]
+  },
+  "windows_30d": {
+    "count": 32,
+    "avg_of_avg_daily": 18.81,
+    "min_avg_daily": 16.8889,
+    "max_avg_daily": 21.0266,
+    "avg_max_drawdown": 45.44,
+    "max_of_max_drawdown": 49.6412,
+    "windows_meeting_avg20_dd30": 5,
+    "windows": [
+      {
+        "start": "2026-04-06",
+        "end": "2026-05-05",
+        "avg_daily_pnl_usdc": 18.5612,
+        "max_drawdown_usdc": 49.6412,
+        "daily_target_hits": 14,
+        "daily_target_day_count": 30,
+        "worst_day_usdc": -30.1012,
+        "net_pnl_usdc": 556.8366
+      },
+      {
+        "start": "2026-04-07",
+        "end": "2026-05-06",
+        "avg_daily_pnl_usdc": 18.2301,
+        "max_drawdown_usdc": 49.6412,
+        "daily_target_hits": 13,
+        "daily_target_day_count": 30,
+        "worst_day_usdc": -30.1012,
+        "net_pnl_usdc": 546.9039
+      },
+      {
+        "start": "2026-04-08",
+        "end": "2026-05-07",
+        "avg_daily_pnl_usdc": 17.9484,
+        "max_drawdown_usdc": 49.6412,
+        "daily_target_hits": 13,
+        "daily_target_day_count": 30,
+        "worst_day_usdc": -30.1012,
+        "net_pnl_usdc": 538.4507
+      },
+      {
+        "start": "2026-04-09",
+        "end": "2026-05-08",
+        "avg_daily_pnl_usdc": 19.5096,
+        "max_drawdown_usdc": 49.6412,
+        "daily_target_hits": 14,
+        "daily_target_day_count": 30,
+        "worst_day_usdc": -30.1012,
+        "net_pnl_usdc": 585.2892
+      },
+      {
+        "start": "2026-04-10",
+        "end": "2026-05-09",
+        "avg_daily_pnl_usdc": 19.5803,
+        "max_drawdown_usdc": 49.6412,
+        "daily_target_hits": 15,
+        "daily_target_day_count": 30,
+        "worst_day_usdc": -30.1012,
+        "net_pnl_usdc": 587.4096
+      },
+      {
+        "start": "2026-04-11",
+        "end": "2026-05-10",
+        "avg_daily_pnl_usdc": 19.3376,
+        "max_drawdown_usdc": 49.6412,
+        "daily_target_hits": 14,
+        "daily_target_day_count": 30,
+        "worst_day_usdc": -30.1012,
+        "net_pnl_usdc": 580.1277
+      },
+      {
+        "start": "2026-04-12",
+        "end": "2026-05-11",
+        "avg_daily_pnl_usdc": 19.7894,
+        "max_drawdown_usdc": 49.6412,
+        "daily_target_hits": 15,
+        "daily_target_day_count": 30,
+        "worst_day_usdc": -30.1012,
+        "net_pnl_usdc": 593.6824
+      },
+      {
+        "start": "2026-04-13",
+        "end": "2026-05-12",
+        "avg_daily_pnl_usdc": 19.8413,
+        "max_drawdown_usdc": 49.6412,
+        "daily_target_hits": 15,
+        "daily_target_day_count": 30,
+        "worst_day_usdc": -30.1012,
+        "net_pnl_usdc": 595.2379
+      },
+      {
+        "start": "2026-04-14",
+        "end": "2026-05-13",
+        "avg_daily_pnl_usdc": 18.7023,
+        "max_drawdown_usdc": 49.6412,
+        "daily_target_hits": 14,
+        "daily_target_day_count": 30,
+        "worst_day_usdc": -30.1012,
+        "net_pnl_usdc": 561.0699
+      },
+      {
+        "start": "2026-04-15",
+        "end": "2026-05-14",
+        "avg_daily_pnl_usdc": 18.6837,
+        "max_drawdown_usdc": 49.6412,
+        "daily_target_hits": 14,
+        "daily_target_day_count": 30,
+        "worst_day_usdc": -30.1012,
+        "net_pnl_usdc": 560.5103
+      },
+      {
+        "start": "2026-04-16",
+        "end": "2026-05-15",
+        "avg_daily_pnl_usdc": 18.2693,
+        "max_drawdown_usdc": 49.6412,
+        "daily_target_hits": 14,
+        "daily_target_day_count": 30,
+        "worst_day_usdc": -30.1012,
+        "net_pnl_usdc": 548.0777
+      },
+      {
+        "start": "2026-04-17",
+        "end": "2026-05-16",
+        "avg_daily_pnl_usdc": 18.1848,
+        "max_drawdown_usdc": 49.6412,
+        "daily_target_hits": 14,
+        "daily_target_day_count": 30,
+        "worst_day_usdc": -30.1012,
+        "net_pnl_usdc": 545.5432
+      },
+      {
+        "start": "2026-04-18",
+        "end": "2026-05-17",
+        "avg_daily_pnl_usdc": 17.2781,
+        "max_drawdown_usdc": 49.6412,
+        "daily_target_hits": 13,
+        "daily_target_day_count": 30,
+        "worst_day_usdc": -30.1012,
+        "net_pnl_usdc": 518.3429
+      },
+      {
+        "start": "2026-04-19",
+        "end": "2026-05-18",
+        "avg_daily_pnl_usdc": 18.4531,
+        "max_drawdown_usdc": 49.6412,
+        "daily_target_hits": 15,
+        "daily_target_day_count": 30,
+        "worst_day_usdc": -30.1012,
+        "net_pnl_usdc": 553.5944
+      },
+      {
+        "start": "2026-04-20",
+        "end": "2026-05-19",
+        "avg_daily_pnl_usdc": 18.2452,
+        "max_drawdown_usdc": 49.6412,
+        "daily_target_hits": 14,
+        "daily_target_day_count": 30,
+        "worst_day_usdc": -30.1012,
+        "net_pnl_usdc": 547.3554
+      },
+      {
+        "start": "2026-04-21",
+        "end": "2026-05-20",
+        "avg_daily_pnl_usdc": 18.7028,
+        "max_drawdown_usdc": 49.6412,
+        "daily_target_hits": 14,
+        "daily_target_day_count": 30,
+        "worst_day_usdc": -30.1012,
+        "net_pnl_usdc": 561.0841
+      },
+      {
+        "start": "2026-04-22",
+        "end": "2026-05-21",
+        "avg_daily_pnl_usdc": 18.6568,
+        "max_drawdown_usdc": 49.6412,
+        "daily_target_hits": 14,
+        "daily_target_day_count": 30,
+        "worst_day_usdc": -30.1012,
+        "net_pnl_usdc": 559.7037
+      },
+      {
+        "start": "2026-04-23",
+        "end": "2026-05-22",
+        "avg_daily_pnl_usdc": 18.1942,
+        "max_drawdown_usdc": 49.6412,
+        "daily_target_hits": 14,
+        "daily_target_day_count": 30,
+        "worst_day_usdc": -30.1012,
+        "net_pnl_usdc": 545.8271
+      },
+      {
+        "start": "2026-04-24",
+        "end": "2026-05-23",
+        "avg_daily_pnl_usdc": 17.9779,
+        "max_drawdown_usdc": 49.6412,
+        "daily_target_hits": 14,
+        "daily_target_day_count": 30,
+        "worst_day_usdc": -30.1012,
+        "net_pnl_usdc": 539.3371
+      },
+      {
+        "start": "2026-04-25",
+        "end": "2026-05-24",
+        "avg_daily_pnl_usdc": 17.6146,
+        "max_drawdown_usdc": 49.6412,
+        "daily_target_hits": 14,
+        "daily_target_day_count": 30,
+        "worst_day_usdc": -30.1012,
+        "net_pnl_usdc": 528.4393
+      },
+      {
+        "start": "2026-04-26",
+        "end": "2026-05-25",
+        "avg_daily_pnl_usdc": 17.3502,
+        "max_drawdown_usdc": 49.6412,
+        "daily_target_hits": 14,
+        "daily_target_day_count": 30,
+        "worst_day_usdc": -30.1012,
+        "net_pnl_usdc": 520.5051
+      },
+      {
+        "start": "2026-04-27",
+        "end": "2026-05-26",
+        "avg_daily_pnl_usdc": 16.8889,
+        "max_drawdown_usdc": 49.6412,
+        "daily_target_hits": 14,
+        "daily_target_day_count": 30,
+        "worst_day_usdc": -30.1012,
+        "net_pnl_usdc": 506.6677
+      },
+      {
+        "start": "2026-04-28",
+        "end": "2026-05-27",
+        "avg_daily_pnl_usdc": 17.7839,
+        "max_drawdown_usdc": 49.6412,
+        "daily_target_hits": 15,
+        "daily_target_day_count": 30,
+        "worst_day_usdc": -30.1012,
+        "net_pnl_usdc": 533.5171
+      },
+      {
+        "start": "2026-04-29",
+        "end": "2026-05-28",
+        "avg_daily_pnl_usdc": 18.5368,
+        "max_drawdown_usdc": 49.6412,
+        "daily_target_hits": 15,
+        "daily_target_day_count": 30,
+        "worst_day_usdc": -30.1012,
+        "net_pnl_usdc": 556.1041
+      },
+      {
+        "start": "2026-04-30",
+        "end": "2026-05-29",
+        "avg_daily_pnl_usdc": 18.5719,
+        "max_drawdown_usdc": 49.6412,
+        "daily_target_hits": 15,
+        "daily_target_day_count": 30,
+        "worst_day_usdc": -30.1012,
+        "net_pnl_usdc": 557.1582
+      },
+      {
+        "start": "2026-05-01",
+        "end": "2026-05-30",
+        "avg_daily_pnl_usdc": 18.3958,
+        "max_drawdown_usdc": 49.6412,
+        "daily_target_hits": 15,
+        "daily_target_day_count": 30,
+        "worst_day_usdc": -32.3012,
+        "net_pnl_usdc": 551.8726
+      },
+      {
+        "start": "2026-05-02",
+        "end": "2026-05-31",
+        "avg_daily_pnl_usdc": 19.7935,
+        "max_drawdown_usdc": 27.2349,
+        "daily_target_hits": 15,
+        "daily_target_day_count": 30,
+        "worst_day_usdc": -7.1745,
+        "net_pnl_usdc": 593.8063
+      },
+      {
+        "start": "2026-05-03",
+        "end": "2026-06-01",
+        "avg_daily_pnl_usdc": 20.2489,
+        "max_drawdown_usdc": 27.2349,
+        "daily_target_hits": 16,
+        "daily_target_day_count": 30,
+        "worst_day_usdc": -7.1745,
+        "net_pnl_usdc": 607.4674
+      },
+      {
+        "start": "2026-05-04",
+        "end": "2026-06-02",
+        "avg_daily_pnl_usdc": 20.484,
+        "max_drawdown_usdc": 27.2349,
+        "daily_target_hits": 16,
+        "daily_target_day_count": 30,
+        "worst_day_usdc": -7.1745,
+        "net_pnl_usdc": 614.5209
+      },
+      {
+        "start": "2026-05-05",
+        "end": "2026-06-03",
+        "avg_daily_pnl_usdc": 20.468,
+        "max_drawdown_usdc": 27.2349,
+        "daily_target_hits": 16,
+        "daily_target_day_count": 30,
+        "worst_day_usdc": -7.1745,
+        "net_pnl_usdc": 614.0387
+      },
+      {
+        "start": "2026-05-06",
+        "end": "2026-06-04",
+        "avg_daily_pnl_usdc": 21.0266,
+        "max_drawdown_usdc": 27.2349,
+        "daily_target_hits": 16,
+        "daily_target_day_count": 30,
+        "worst_day_usdc": -7.1745,
+        "net_pnl_usdc": 630.7984
+      },
+      {
+        "start": "2026-05-07",
+        "end": "2026-06-05",
+        "avg_daily_pnl_usdc": 20.6123,
+        "max_drawdown_usdc": 27.2349,
+        "daily_target_hits": 16,
+        "daily_target_day_count": 29,
+        "worst_day_usdc": -7.1745,
+        "net_pnl_usdc": 618.3686
+      }
+    ]
+  }
+}

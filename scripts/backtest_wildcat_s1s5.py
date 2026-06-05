@@ -12,8 +12,8 @@ import argparse
 import json
 import math
 import sys
-from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from dataclasses import asdict, dataclass, replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from statistics import mean
 from zoneinfo import ZoneInfo
@@ -155,14 +155,44 @@ def main() -> None:
     parser.add_argument("--leverage-options", default="75,100")
     parser.add_argument("--fee-profile", default="maker_all", choices=["maker_all", "maker_tp_taker_sl", "taker_entry_exit", "all"])
     parser.add_argument("--quick", action="store_true", help="Use a smaller recovery-focused search grid for fast iteration.")
-    parser.add_argument("--preset", choices=["wildcat_converged_v1"], default=None, help="Run a fixed named wildcat preset instead of searching variants.")
+    parser.add_argument(
+        "--align-taipei-days",
+        action="store_true",
+        help="Backtest the last N complete Taiwan calendar days instead of a rolling now-minus-N-days window.",
+    )
+    parser.add_argument(
+        "--focused-preset",
+        choices=["wildcat_converged_v1", "wildcat_30d_balanced_v1"],
+        default=None,
+        help="Search only local DD/weak-day refinements around a named preset.",
+    )
+    parser.add_argument("--preset", choices=["wildcat_converged_v1", "wildcat_30d_balanced_v1"], default=None, help="Run a fixed named wildcat preset instead of searching variants.")
     parser.add_argument("--json-output", default=None, help="Optional report path. Defaults to reports/wildcat_s1s5_<days>d.json")
+    parser.add_argument("--dump-trades", action="store_true", help="Include all trades in the JSON artifact for deeper analysis.")
     args = parser.parse_args()
 
     leverages = tuple(int(x.strip()) for x in args.leverage_options.split(",") if x.strip())
     if args.preset:
         params = preset_params(args.preset, target_daily_usdc=args.target_daily_usdc, leverage_options=leverages)
-        seven = run_single(args.symbol, args.days, params, fetch=True)
+        seven = run_single(
+            args.symbol,
+            args.days,
+            params,
+            fetch=True,
+            align_taipei_days=args.align_taipei_days,
+            include_trades=args.dump_trades,
+        )
+    elif args.focused_preset:
+        seven = run_focused_research(
+            args.symbol,
+            args.days,
+            args.focused_preset,
+            top_n=args.top_n,
+            target_daily_usdc=args.target_daily_usdc,
+            leverage_options=leverages,
+            align_taipei_days=args.align_taipei_days,
+            include_trades=args.dump_trades,
+        )
     else:
         seven = run_research(
             args.symbol,
@@ -172,13 +202,22 @@ def main() -> None:
             leverage_options=leverages,
             fee_profile=args.fee_profile,
             quick=args.quick,
+            align_taipei_days=args.align_taipei_days,
+            include_trades=args.dump_trades,
         )
     payload = {"mode": "wildcat_s1s5", "symbol": args.symbol, "runs": [seven]}
 
     if args.run_30:
         best = WildcatParams(**seven["best"]["params"])
         try:
-            thirty = run_single(args.symbol, 30, best, fetch=True)
+            thirty = run_single(
+                args.symbol,
+                30,
+                best,
+                fetch=True,
+                align_taipei_days=args.align_taipei_days,
+                include_trades=args.dump_trades,
+            )
             payload["runs"].append(thirty)
         except Exception as exc:  # noqa: BLE001 - keep the 7d research artifact.
             payload["thirty_day_error"] = f"{type(exc).__name__}: {exc}"
@@ -197,8 +236,10 @@ def run_research(
     leverage_options: tuple[int, ...] = (75, 100),
     fee_profile: str = "maker_all",
     quick: bool = False,
+    align_taipei_days: bool = False,
+    include_trades: bool = False,
 ) -> dict:
-    candles = fetch_1m_klines(symbol, days=days)
+    candles = fetch_wildcat_klines(symbol, days=days, align_taipei_days=align_taipei_days)
     features = build_features(candles)
     variants = build_variants(
         target_daily_usdc=target_daily_usdc,
@@ -220,16 +261,65 @@ def run_research(
     }
 
 
-def run_single(symbol: str, days: int, params: WildcatParams, fetch: bool = True) -> dict:
-    candles = fetch_1m_klines(symbol, days=days) if fetch else []
+def run_single(
+    symbol: str,
+    days: int,
+    params: WildcatParams,
+    fetch: bool = True,
+    align_taipei_days: bool = False,
+    include_trades: bool = False,
+) -> dict:
+    candles = fetch_wildcat_klines(symbol, days=days, align_taipei_days=align_taipei_days) if fetch else []
     features = build_features(candles) if candles else None
     return {
         "days": days,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "variant_count": 1,
-        "best": run_backtest(candles, params, symbol, days, features=features),
+        "best": run_backtest(candles, params, symbol, days, features=features, include_trades=include_trades),
         "top": [],
     }
+
+
+def run_focused_research(
+    symbol: str,
+    days: int,
+    preset_name: str,
+    top_n: int = 8,
+    target_daily_usdc: float = 20.0,
+    leverage_options: tuple[int, ...] = (75, 100),
+    align_taipei_days: bool = False,
+    include_trades: bool = False,
+) -> dict:
+    candles = fetch_wildcat_klines(symbol, days=days, align_taipei_days=align_taipei_days)
+    features = build_features(candles)
+    base = preset_params(preset_name, target_daily_usdc=target_daily_usdc, leverage_options=leverage_options)
+    variants = build_local_variants(base)
+    ranked = []
+    for params in variants:
+        result = run_backtest(candles, params, symbol, days, features=features, include_trades=include_trades)
+        ranked.append(result)
+    ranked.sort(key=lambda row: row["rank_score"], reverse=True)
+    return {
+        "days": days,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "variant_count": len(variants),
+        "focused_preset": preset_name,
+        "best": ranked[0],
+        "top": ranked[:top_n],
+    }
+
+
+def fetch_wildcat_klines(symbol: str, days: int, align_taipei_days: bool = False) -> list[dict]:
+    if not align_taipei_days:
+        return fetch_1m_klines(symbol, days=days)
+    end_local = datetime.now(TAIPEI).replace(hour=0, minute=0, second=0, microsecond=0)
+    start_local = end_local - timedelta(days=days)
+    return fetch_1m_klines(
+        symbol,
+        days=days,
+        start_dt=start_local.astimezone(timezone.utc),
+        end_dt=end_local.astimezone(timezone.utc),
+    )
 
 
 def preset_params(
@@ -237,63 +327,254 @@ def preset_params(
     target_daily_usdc: float = 20.0,
     leverage_options: tuple[int, ...] = (75, 100),
 ) -> WildcatParams:
-    if name != "wildcat_converged_v1":
+    presets = {
+        "wildcat_converged_v1": WildcatParams(
+            label="wildcat_converged_v1",
+            s1_tp=0.0012,
+            s1_sl=0.0018,
+            s2_tp=0.0028,
+            s2_sl=0.0015,
+            s3_tp=0.0026,
+            s3_sl=0.0016,
+            s4_tp=0.0035,
+            s4_sl=0.0013,
+            s5_tp=0.0018,
+            s5_sl=0.0014,
+            s1_rsi_long_max=38.0,
+            s1_rsi_short_min=62.0,
+            s5_long_d_max=36.0,
+            s5_short_d_min=64.0,
+            range_edge_atr_margin=0.25,
+            min_vol_ratio=0.22,
+            strict_body_ratio=0.12,
+            breakout_vol_ratio=1.25,
+            breakout_body_ratio=0.24,
+            breakout_atr_margin=0.08,
+            cooldown_bars=3,
+            max_holding_bars=24,
+            entry_fee_rate=0.0,
+            tp_exit_fee_rate=0.0,
+            sl_exit_fee_rate=0.0,
+            target_daily_usdc=target_daily_usdc,
+            leverage_options=leverage_options,
+            enabled_strategies=("S1_BB_RSI", "S5_Stoch"),
+            score_floor=0.0,
+            max_open_positions=2,
+            recovery_enabled=True,
+            recovery_steps=3,
+            recovery_trigger_pct=0.0009,
+            recovery_notional_scale=1.0,
+            recovery_tp_shrink=0.45,
+            partial_exit_pct=0.35,
+            partial_tp_pct=0.0006,
+            daily_target_stop=True,
+            daily_profit_target_usdc=40.0,
+            daily_floor_lock_usdc=22.0,
+            daily_giveback_usdc=6.0,
+            catchup_enabled=True,
+            catchup_start_hour=12,
+            catchup_vwap_atr=0.18,
+            catchup_rsi_long_max=52.0,
+            catchup_rsi_short_min=48.0,
+            rescue_hour=14,
+            rescue_vwap_atr=0.06,
+            rescue_rsi_long_max=60.0,
+            rescue_rsi_short_min=40.0,
+            allow_duplicate_layers=True,
+            max_duplicate_layers=2,
+        ),
+        "wildcat_30d_balanced_v1": WildcatParams(
+            label="wildcat_30d_balanced_v1",
+            s1_tp=0.0012,
+            s1_sl=0.0018,
+            s2_tp=0.0028,
+            s2_sl=0.0015,
+            s3_tp=0.0026,
+            s3_sl=0.0016,
+            s4_tp=0.0035,
+            s4_sl=0.0013,
+            s5_tp=0.0018,
+            s5_sl=0.0014,
+            s1_rsi_long_max=38.0,
+            s1_rsi_short_min=62.0,
+            s5_long_d_max=31.0,
+            s5_short_d_min=69.0,
+            range_edge_atr_margin=0.20,
+            min_vol_ratio=0.22,
+            strict_body_ratio=0.12,
+            breakout_vol_ratio=1.25,
+            breakout_body_ratio=0.24,
+            breakout_atr_margin=0.08,
+            cooldown_bars=5,
+            max_holding_bars=20,
+            entry_fee_rate=0.0,
+            tp_exit_fee_rate=0.0,
+            sl_exit_fee_rate=0.0,
+            target_daily_usdc=target_daily_usdc,
+            leverage_options=leverage_options,
+            enabled_strategies=("S1_BB_RSI", "S5_Stoch"),
+            score_floor=0.0,
+            max_open_positions=2,
+            recovery_enabled=True,
+            recovery_steps=3,
+            recovery_trigger_pct=0.0009,
+            recovery_notional_scale=1.0,
+            recovery_tp_shrink=0.45,
+            partial_exit_pct=0.40,
+            partial_tp_pct=0.0005,
+            daily_target_stop=True,
+            daily_profit_target_usdc=40.0,
+            daily_floor_lock_usdc=24.0,
+            daily_giveback_usdc=4.0,
+            catchup_enabled=True,
+            catchup_start_hour=12,
+            catchup_vwap_atr=0.18,
+            catchup_rsi_long_max=52.0,
+            catchup_rsi_short_min=48.0,
+            rescue_hour=14,
+            rescue_vwap_atr=0.06,
+            rescue_rsi_long_max=60.0,
+            rescue_rsi_short_min=40.0,
+            allow_duplicate_layers=False,
+            max_duplicate_layers=1,
+        ),
+    }
+    if name not in presets:
         raise ValueError(f"Unknown wildcat preset: {name}")
-    return WildcatParams(
-        label="wildcat_converged_v1",
-        s1_tp=0.0012,
-        s1_sl=0.0018,
-        s2_tp=0.0028,
-        s2_sl=0.0015,
-        s3_tp=0.0026,
-        s3_sl=0.0016,
-        s4_tp=0.0035,
-        s4_sl=0.0013,
-        s5_tp=0.0018,
-        s5_sl=0.0014,
-        s1_rsi_long_max=38.0,
-        s1_rsi_short_min=62.0,
-        s5_long_d_max=36.0,
-        s5_short_d_min=64.0,
-        range_edge_atr_margin=0.25,
-        min_vol_ratio=0.22,
-        strict_body_ratio=0.12,
-        breakout_vol_ratio=1.25,
-        breakout_body_ratio=0.24,
-        breakout_atr_margin=0.08,
-        cooldown_bars=3,
-        max_holding_bars=24,
-        entry_fee_rate=0.0,
-        tp_exit_fee_rate=0.0,
-        sl_exit_fee_rate=0.0,
-        target_daily_usdc=target_daily_usdc,
-        leverage_options=leverage_options,
-        enabled_strategies=("S1_BB_RSI", "S5_Stoch"),
-        score_floor=0.0,
-        max_open_positions=2,
-        recovery_enabled=True,
-        recovery_steps=3,
-        recovery_trigger_pct=0.0009,
-        recovery_notional_scale=1.0,
-        recovery_tp_shrink=0.45,
-        partial_exit_pct=0.35,
-        partial_tp_pct=0.0006,
-        daily_target_stop=True,
-        daily_profit_target_usdc=40.0,
-        daily_floor_lock_usdc=22.0,
-        daily_giveback_usdc=6.0,
-        catchup_enabled=True,
-        catchup_start_hour=12,
-        catchup_vwap_atr=0.18,
-        catchup_rsi_long_max=52.0,
-        catchup_rsi_short_min=48.0,
-        rescue_hour=14,
-        rescue_vwap_atr=0.06,
-        rescue_rsi_long_max=60.0,
-        rescue_rsi_short_min=40.0,
-        allow_duplicate_layers=True,
-        max_duplicate_layers=2,
-    )
+    preset = presets[name]
+    return replace(preset, target_daily_usdc=target_daily_usdc, leverage_options=leverage_options)
+
+
+def build_local_variants(base: WildcatParams) -> list[WildcatParams]:
+    variants: list[WildcatParams] = [base]
+
+    def add_variant(label: str, **changes: object) -> None:
+        variants.append(
+            WildcatParams(
+                **{
+                    **asdict(base),
+                    **changes,
+                    "label": f"{base.label}_{label}",
+                }
+            )
+        )
+
+    # DD tightening set.
+    for recovery_steps, recovery_scale, recovery_tp_shrink in (
+        (2, 0.85, 0.50),
+        (2, 0.75, 0.55),
+        (1, 0.75, 0.60),
+    ):
+        for partial_exit_pct, partial_tp_pct in ((0.45, 0.0005), (0.55, 0.0005), (0.50, 0.0006)):
+            add_variant(
+                f"ddtight_rec{recovery_steps}_scale{int(recovery_scale * 100)}_pt{int(partial_exit_pct * 100)}",
+                recovery_steps=recovery_steps,
+                recovery_notional_scale=recovery_scale,
+                recovery_tp_shrink=recovery_tp_shrink,
+                partial_exit_pct=partial_exit_pct,
+                partial_tp_pct=partial_tp_pct,
+                allow_duplicate_layers=False,
+                max_duplicate_layers=1,
+                daily_profit_target_usdc=36.0,
+                daily_floor_lock_usdc=24.0,
+                daily_giveback_usdc=4.0,
+            )
+
+    # Preserve avg while trimming giveback and opening catch-up a bit earlier.
+    for catchup_start_hour, catchup_vwap_atr, rescue_hour in ((10, 0.16, 13), (11, 0.16, 13), (10, 0.18, 14)):
+        for floor_lock, giveback in ((24.0, 4.0), (25.0, 4.0), (24.0, 5.0)):
+            add_variant(
+                f"floor{int(floor_lock)}_gb{int(giveback)}_catch{catchup_start_hour}_rescue{rescue_hour}",
+                catchup_start_hour=catchup_start_hour,
+                catchup_vwap_atr=catchup_vwap_atr,
+                rescue_hour=rescue_hour,
+                daily_profit_target_usdc=38.0,
+                daily_floor_lock_usdc=floor_lock,
+                daily_giveback_usdc=giveback,
+                recovery_notional_scale=0.85,
+                partial_exit_pct=0.45,
+            )
+
+    # Weak-day rescue set: a little more permissive catch-up, but keep DCA contained.
+    for catchup_rsi_long_max, catchup_rsi_short_min, rescue_vwap_atr in ((54.0, 46.0, 0.05), (56.0, 44.0, 0.05)):
+        add_variant(
+            f"rescue_soft_rsi{int(catchup_rsi_long_max)}",
+            recovery_steps=2,
+            recovery_notional_scale=0.85,
+            partial_exit_pct=0.50,
+            partial_tp_pct=0.0005,
+            daily_profit_target_usdc=36.0,
+            daily_floor_lock_usdc=23.0,
+            daily_giveback_usdc=4.0,
+            catchup_start_hour=10,
+            catchup_vwap_atr=0.16,
+            catchup_rsi_long_max=catchup_rsi_long_max,
+            catchup_rsi_short_min=catchup_rsi_short_min,
+            rescue_hour=13,
+            rescue_vwap_atr=rescue_vwap_atr,
+            rescue_rsi_long_max=62.0,
+            rescue_rsi_short_min=38.0,
+            allow_duplicate_layers=False,
+            max_duplicate_layers=1,
+        )
+
+    # A narrower-hold family can cut deep intraday slips without killing frequency too hard.
+    for hold_bars, cooldown_bars in ((18, 4), (20, 4), (18, 5)):
+        add_variant(
+            f"hold{hold_bars}_cool{cooldown_bars}",
+            max_holding_bars=hold_bars,
+            cooldown_bars=cooldown_bars,
+            recovery_steps=2,
+            recovery_notional_scale=0.85,
+            partial_exit_pct=0.45,
+            daily_profit_target_usdc=36.0,
+            daily_floor_lock_usdc=24.0,
+            daily_giveback_usdc=4.0,
+        )
+
+    # Hybrid balanced set keeps duplicate layers but softens size and floor lock.
+    for duplicate_layers, dup_cap, recovery_scale in ((True, 2, 0.85), (True, 2, 0.75), (False, 1, 1.0)):
+        add_variant(
+            f"hybrid_dup{dup_cap if duplicate_layers else 0}_scale{int(recovery_scale * 100)}",
+            recovery_steps=2,
+            recovery_notional_scale=recovery_scale,
+            recovery_tp_shrink=0.50,
+            partial_exit_pct=0.45,
+            partial_tp_pct=0.0005,
+            allow_duplicate_layers=duplicate_layers,
+            max_duplicate_layers=dup_cap,
+            daily_profit_target_usdc=38.0,
+            daily_floor_lock_usdc=24.0,
+            daily_giveback_usdc=5.0,
+            catchup_start_hour=11,
+            rescue_hour=13,
+        )
+
+    # Weak-day repair set: encourage a few more S5 reversion fills without opening the floodgates.
+    for s5_long_d_max, s5_short_d_min, range_edge_atr_margin in ((38.0, 62.0, 0.18), (40.0, 60.0, 0.15)):
+        for s1_sl, recovery_trigger_pct in ((0.0017, 0.0010), (0.00165, 0.0011)):
+            add_variant(
+                f"weakfix_s5_{int(s5_long_d_max)}_{int(s5_short_d_min)}_sl{int(s1_sl * 10000)}",
+                s1_sl=s1_sl,
+                s5_long_d_max=s5_long_d_max,
+                s5_short_d_min=s5_short_d_min,
+                range_edge_atr_margin=range_edge_atr_margin,
+                strict_body_ratio=0.10,
+                recovery_steps=2,
+                recovery_trigger_pct=recovery_trigger_pct,
+                recovery_notional_scale=0.85,
+                recovery_tp_shrink=0.50,
+                partial_exit_pct=0.40,
+                partial_tp_pct=0.0005,
+                daily_profit_target_usdc=38.0,
+                daily_floor_lock_usdc=23.0,
+                daily_giveback_usdc=5.0,
+            )
+
+    deduped: dict[str, WildcatParams] = {}
+    for variant in variants:
+        deduped[variant.label] = variant
+    return list(deduped.values())
 
 
 def build_variants(
@@ -467,7 +748,14 @@ def build_variants(
     return variants
 
 
-def run_backtest(candles: list[dict], params: WildcatParams, symbol: str, days: int, features: dict | None = None) -> dict:
+def run_backtest(
+    candles: list[dict],
+    params: WildcatParams,
+    symbol: str,
+    days: int,
+    features: dict | None = None,
+    include_trades: bool = False,
+) -> dict:
     if len(candles) < 160:
         raise ValueError("Need at least 160 1m candles for wildcat S1-S5 backtest.")
 
@@ -548,7 +836,7 @@ def run_backtest(candles: list[dict], params: WildcatParams, symbol: str, days: 
         trades.append(force_exit(final, candle_time(final), len(candles) - 1, position, params, "EOD"))
 
     summary = summarize(trades, days, params)
-    return {
+    result = {
         "symbol": symbol,
         "days": days,
         "params": asdict(params),
@@ -557,6 +845,9 @@ def run_backtest(candles: list[dict], params: WildcatParams, symbol: str, days: 
         "rejected": rejected,
         "sample_trades": trades[-12:],
     }
+    if include_trades:
+        result["all_trades"] = trades
+    return result
 
 
 def build_features(candles: list[dict]) -> dict:
