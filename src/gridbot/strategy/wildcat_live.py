@@ -199,8 +199,8 @@ def explain_wildcat_no_signal(
         "市場特徵："
         f"trend=<code>{trend}</code> / "
         f"vol=<code>{vol_state}</code> / "
-        f"量能比=<code>{vol_ratio:.2f}</code> (門檻>={params.min_vol_ratio:.2f}) / "
-        f"實體比=<code>{body_ratio:.2f}</code> (門檻>={params.strict_body_ratio:.2f})"
+        f"量能比=<code>{vol_ratio:.2f}</code> (門檻&gt;={params.min_vol_ratio:.2f}) / "
+        f"實體比=<code>{body_ratio:.2f}</code> (門檻&gt;={params.strict_body_ratio:.2f})"
     ]
 
     # Check S1
@@ -214,9 +214,9 @@ def explain_wildcat_no_signal(
     if vol_state not in {"low", "normal"}:
         s1_reasons.append(f"需要 low/normal 波動，目前為 {vol_state}")
     if vol_ratio < params.min_vol_ratio:
-        s1_reasons.append(f"量能比例 {vol_ratio:.2f} < {params.min_vol_ratio:.2f}")
+        s1_reasons.append(f"量能比例 {vol_ratio:.2f} &lt; {params.min_vol_ratio:.2f}")
     if body_ratio < params.strict_body_ratio:
-        s1_reasons.append(f"實體比例 {body_ratio:.2f} < {params.strict_body_ratio:.2f}")
+        s1_reasons.append(f"實體比例 {body_ratio:.2f} &lt; {params.strict_body_ratio:.2f}")
 
     long_atr_bound = bb_lower_val + params.range_edge_atr_margin * atr_val
     short_atr_bound = bb_upper_val - params.range_edge_atr_margin * atr_val
@@ -228,8 +228,8 @@ def explain_wildcat_no_signal(
         s1_status = "watch"
         if not s1_long_ok and not s1_short_ok:
             s1_reasons.append(
-                f"未達邊界；做多需價格<=${long_atr_bound:.2f}(目前${price:.2f})且RSI<={params.s1_rsi_long_max:.1f}(目前{rsi_val:.1f})；"
-                f"做空需價格>=${short_atr_bound:.2f}(目前${price:.2f})且RSI>={params.s1_rsi_short_min:.1f}(目前{rsi_val:.1f})"
+                f"未達邊界；做多需價格&lt;=${long_atr_bound:.2f}(目前${price:.2f})且RSI&lt;={params.s1_rsi_long_max:.1f}(目前{rsi_val:.1f})；"
+                f"做空需價格&gt;=${short_atr_bound:.2f}(目前${price:.2f})且RSI&gt;={params.s1_rsi_short_min:.1f}(目前{rsi_val:.1f})"
             )
         else:
             s1_status = "ready"
@@ -247,9 +247,9 @@ def explain_wildcat_no_signal(
     if vol_state != "normal":
         s5_reasons.append(f"需要 normal 波動，目前為 {vol_state}")
     if vol_ratio < params.min_vol_ratio:
-        s5_reasons.append(f"量能比例 {vol_ratio:.2f} < {params.min_vol_ratio:.2f}")
+        s5_reasons.append(f"量能比例 {vol_ratio:.2f} &lt; {params.min_vol_ratio:.2f}")
     if body_ratio < params.strict_body_ratio:
-        s5_reasons.append(f"實體比例 {body_ratio:.2f} < {params.strict_body_ratio:.2f}")
+        s5_reasons.append(f"實體比例 {body_ratio:.2f} &lt; {params.strict_body_ratio:.2f}")
 
     stoch_k_prev = features["stoch_k"][index - 1]
     stoch_d_prev = features["stoch_d"][index - 1]
@@ -268,8 +268,8 @@ def explain_wildcat_no_signal(
         if not s5_long_ok and not s5_short_ok:
             s5_reasons.append(
                 f"未交叉或未達邊界；K={stoch_k_val:.1f}, D={stoch_d_val:.1f}；"
-                f"做多需Stoch黃金交叉且D<{params.s5_long_d_max:.1f}且價格<=${long_vwap_bound:.2f}；"
-                f"做空需Stoch死亡交叉且D>{params.s5_short_d_min:.1f}且價格>=${short_vwap_bound:.2f}"
+                f"做多需Stoch黃金交叉且D&lt;{params.s5_long_d_max:.1f}且價格&lt;=${long_vwap_bound:.2f}；"
+                f"做空需Stoch死亡交叉且D&gt;{params.s5_short_d_min:.1f}且價格&gt;=${short_vwap_bound:.2f}"
             )
         else:
             s5_status = "ready"
