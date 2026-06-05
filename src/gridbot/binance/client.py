@@ -41,6 +41,15 @@ def _format_tick_price(price: float, tick_size: Decimal) -> str:
     return format(quantized.normalize(), "f")
 
 
+def _format_step_quantity(quantity: float, step_size: Decimal) -> str:
+    if step_size <= 0:
+        return f"{quantity:.6f}"
+    raw = Decimal(str(quantity))
+    steps = (raw / step_size).to_integral_value(rounding=ROUND_HALF_UP)
+    quantized = steps * step_size
+    return format(quantized.normalize(), "f")
+
+
 class BinanceFuturesClient:
     """Async client for Binance USD-M Futures API (FAPI endpoints)."""
 
@@ -87,6 +96,11 @@ class BinanceFuturesClient:
     async def get_mark_price(self, symbol: str) -> dict:
         """GET /fapi/v1/markPrice — includes lastFundingRate and nextFundingTime"""
         return await self.client.futures_mark_price(symbol=symbol)
+
+    @async_retry(max_attempts=3, base_delay=1.0, exceptions=(Exception,))
+    async def get_book_ticker(self, symbol: str) -> dict:
+        """GET /fapi/v1/ticker/bookTicker."""
+        return await self.client.futures_orderbook_ticker(symbol=symbol)
 
     @async_retry(max_attempts=3, base_delay=1.0, exceptions=(Exception,))
     async def get_funding_rate_history(self, symbol: str, limit: int = 10) -> list[dict]:
@@ -204,6 +218,32 @@ class BinanceFuturesClient:
         return await self.client.futures_create_order(**params)
 
     @async_retry(max_attempts=3, base_delay=2.0, exceptions=(BinanceAPIException, Exception))
+    async def create_post_only_limit_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: float | str,
+        price: float,
+        reduce_only: bool = False,
+        client_order_id: str | None = None,
+    ) -> dict:
+        """POST /fapi/v1/order — maker-only LIMIT order using GTX."""
+        tick_size = await self._price_tick_size(symbol)
+        params = {
+            "symbol": symbol,
+            "side": side,
+            "type": "LIMIT",
+            "timeInForce": "GTX",
+            "quantity": quantity,
+            "price": _format_tick_price(price, tick_size),
+        }
+        if reduce_only:
+            params["reduceOnly"] = "true"
+        if client_order_id:
+            params["newClientOrderId"] = client_order_id
+        return await self.client.futures_create_order(**params)
+
+    @async_retry(max_attempts=3, base_delay=2.0, exceptions=(BinanceAPIException, Exception))
     async def create_reduce_only_limit_order(
         self,
         symbol: str,
@@ -240,6 +280,22 @@ class BinanceFuturesClient:
                     self._price_tick_sizes[symbol] = tick_size
                     return tick_size
         return Decimal("0.0001")
+
+    async def price_tick_size(self, symbol: str) -> Decimal:
+        return await self._price_tick_size(symbol)
+
+    async def quantity_step_size(self, symbol: str) -> Decimal:
+        info = await self.get_exchange_info()
+        for item in info.get("symbols", []):
+            if item.get("symbol") != symbol:
+                continue
+            for flt in item.get("filters", []):
+                if flt.get("filterType") == "LOT_SIZE":
+                    return Decimal(str(flt.get("stepSize", "0.001")))
+        return Decimal("0.001")
+
+    async def format_quantity(self, symbol: str, quantity: float) -> str:
+        return _format_step_quantity(quantity, await self.quantity_step_size(symbol))
 
     @async_retry(max_attempts=3, base_delay=2.0, exceptions=(BinanceAPIException, Exception))
     async def get_user_trades(

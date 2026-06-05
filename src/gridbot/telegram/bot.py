@@ -3,7 +3,7 @@
 Registers all command handlers and builds the Application.
 """
 
-from telegram.ext import Application, CommandHandler, MessageHandler, filters
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters
 
 from config.settings import Settings
 from src.gridbot.ai.gemini import GeminiAnalyzer
@@ -15,17 +15,24 @@ from src.gridbot.storage.repositories import (
     GridSessionRepository,
     IncomeRepository,
     MarketSnapshotRepository,
+    MainnetRunRepository,
     PerformanceRepository,
     RecommendationRepository,
 )
 from src.gridbot.telegram.handlers import (
+    cmd_ai,
     cmd_help,
+    cmd_mainnet,
     cmd_pause,
-    cmd_recommend,
+    cmd_pnl,
     cmd_resume,
+    cmd_signal,
     cmd_start,
     cmd_testnet,
-    handle_share_link,
+    handle_mainnet_callback,
+    handle_manual_signal_callback,
+    handle_text_message,
+    handle_unknown_command,
 )
 from src.gridbot.utils.logging import get_logger
 
@@ -62,18 +69,24 @@ def build_telegram_app(
     app.bot_data["perf_repo"] = PerformanceRepository(db)
     app.bot_data["rec_repo"] = RecommendationRepository(db)
     app.bot_data["audit_repo"] = AuditLogRepository(db)
+    app.bot_data["mainnet_run_repo"] = MainnetRunRepository(db)
 
     # Register command handlers
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("testnet", cmd_testnet))
+    app.add_handler(CommandHandler("mainnet", cmd_mainnet))
+    app.add_handler(CommandHandler("pnl", cmd_pnl))
+    app.add_handler(CommandHandler("ai", cmd_ai))
+    app.add_handler(CommandHandler("signal", cmd_signal))
     app.add_handler(CommandHandler("pause", cmd_pause))
     app.add_handler(CommandHandler("resume", cmd_resume))
-    app.add_handler(CommandHandler("recommend", cmd_recommend))
+    app.add_handler(CallbackQueryHandler(handle_mainnet_callback, pattern=r"^mainnet:"))
+    app.add_handler(CallbackQueryHandler(handle_manual_signal_callback, pattern=r"^manual_signal:"))
 
-    # Auto-detect Binance share links in any non-command text message
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_share_link))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
+    app.add_handler(MessageHandler(filters.COMMAND, handle_unknown_command))
 
-    logger.info("telegram_app_configured", handlers=7)
+    logger.info("telegram_app_configured", handlers=13)
 
     return app

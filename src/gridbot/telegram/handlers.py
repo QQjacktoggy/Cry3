@@ -31,6 +31,23 @@ logger = get_logger(__name__)
 TAIPEI = ZoneInfo("Asia/Taipei")
 
 
+async def _authorized(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    settings: Settings = context.application.bot_data["settings"]
+    allowed_chat = settings.telegram_chat_id_int
+    chat_id = update.effective_chat.id if update.effective_chat else 0
+    if allowed_chat and chat_id != allowed_chat:
+        logger.warning(
+            "telegram_unauthorized_update_ignored",
+            chat_id=chat_id,
+            allowed_chat=allowed_chat,
+            user_id=update.effective_user.id if update.effective_user else None,
+        )
+        if update.callback_query:
+            await update.callback_query.answer("未授權的 Telegram chat。", show_alert=False)
+        return False
+    return True
+
+
 def _trade_time_label(trade: FuturesTrade) -> str:
     return datetime.fromtimestamp(trade.time_ms / 1000, tz=timezone.utc).astimezone(TAIPEI).strftime("%m/%d %H:%M:%S")
 
@@ -456,21 +473,26 @@ async def _call_minimax(settings: Settings, payload: dict) -> str:
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/start — Welcome message."""
+    if not await _authorized(update, context):
+        return
     await update.message.reply_text(
         "🟢 <b>Cry3 手動訊號模式已啟動</b>\n\n"
         "系統目前會在 GCP VM 背景持續掃描 ETHUSDC，出現可執行訊號時主動推送 Telegram。\n"
         "你看到開單通知後，去 mainnet 下單；系統會自動抓 mainnet 成交來匹配該訊號。\n"
         "訊息下方的 <b>已下單</b> 按鈕保留作人工補註記，不按也會收集資料。\n\n"
-        "輸入 /signal 可查看最新判斷，輸入 /help 看完整流程。",
+        "輸入 /signal 可查看最新判斷，輸入 /mainnet 可管理 one-run 驗證，輸入 /help 看完整流程。",
         parse_mode="HTML",
     )
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/help — List all active commands."""
+    if not await _authorized(update, context):
+        return
     await update.message.reply_text(
         "📋 <b>目前 Telegram 流程</b>\n\n"
         "➡️ /signal — 查看目前 ETHUSDC 最新訊號判斷\n"
+        "➡️ /mainnet — 啟動/查詢 mainnet one-run 自動驗證\n"
         "➡️ /pnl — 查看 mainnet 今日 PnL 與成交分析\n"
         "➡️ /pause — 暫停訊號推送\n"
         "➡️ /resume — 恢復訊號推送\n"
@@ -480,7 +502,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "1. Bot 偵測到可開單訊號時，會主動推送 <b>開單通知</b>。\n"
         "2. 你在 mainnet 完成下單後，Bot 會自動抓成交並匹配該則訊號。\n"
         "3. <b>已下單</b> 按鈕只作人工補註記；不按也會寫入資料集。\n"
-        "4. 之後會用這些 signal / 成交 / PnL 配對資料分析並優化手動策略。\n\n"
+        "4. /mainnet 的 one-run 只會在你按下啟動後接下一個 wildcat 訊號，完成後自動停止。\n"
+        "5. 之後會用這些 signal / 成交 / PnL 配對資料分析並優化策略。\n\n"
         "目前 /testnet 已停用；/pnl 會查 mainnet 今日 PnL。",
         parse_mode="HTML",
     )
@@ -488,6 +511,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_testnet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/testnet — Testnet trader status and guardrails."""
+    if not await _authorized(update, context):
+        return
     app_data = context.application.bot_data
     binance_client: BinanceFuturesClient = app_data["binance_client"]
     settings: Settings = app_data["settings"]
@@ -550,6 +575,8 @@ async def cmd_testnet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/pnl — Mainnet today PnL and recent trade structure."""
+    if not await _authorized(update, context):
+        return
     app_data = context.application.bot_data
     settings: Settings = app_data["settings"]
 
@@ -566,6 +593,8 @@ async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_ai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/ai — MiniMax-M3 analysis of recent manual signals and matched trades."""
+    if not await _authorized(update, context):
+        return
     settings: Settings = context.application.bot_data["settings"]
     if not settings.minimax_api_key:
         await update.message.reply_text("尚未設定 MiniMax API key，無法執行 AI 分析。")
@@ -587,6 +616,8 @@ async def cmd_ai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/pause — Pause scheduled fetching and trading."""
+    if not await _authorized(update, context):
+        return
     scheduler = context.application.bot_data.get("scheduler")
     if scheduler:
         scheduler.pause()
@@ -597,6 +628,8 @@ async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/resume — Resume scheduled fetching and trading."""
+    if not await _authorized(update, context):
+        return
     scheduler = context.application.bot_data.get("scheduler")
     if scheduler:
         scheduler.resume()
@@ -607,6 +640,8 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def cmd_signal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/signal — Confirm current signal status in real-time."""
+    if not await _authorized(update, context):
+        return
     app_data = context.application.bot_data
     settings: Settings = app_data["settings"]
     trader = app_data.get("trader")
@@ -790,7 +825,21 @@ async def cmd_signal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text(f"❌ 取得即時訊號失敗：{str(exc)[:300]}")
 
 
+async def cmd_mainnet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/mainnet — Mainnet one-run status and controls."""
+    if not await _authorized(update, context):
+        return
+    manager = context.application.bot_data.get("mainnet_one_run_manager")
+    if manager is None:
+        await update.message.reply_text("❌ Mainnet one-run manager 尚未初始化。")
+        return
+    status = await manager.status()
+    await update.message.reply_text(status.text, parse_mode="HTML", reply_markup=status.reply_markup)
+
+
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _authorized(update, context):
+        return
     message = update.message
     if message is None or not message.text:
         return
@@ -813,6 +862,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def handle_unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _authorized(update, context):
+        return
     if not update.message:
         return
     await update.message.reply_text(
@@ -820,6 +871,7 @@ async def handle_unknown_command(update: Update, context: ContextTypes.DEFAULT_T
         "現在這支 bot 的主要流程是：\n"
         "/signal 查看即時判斷\n"
         "/pnl 查看 mainnet 今日 PnL\n"
+        "/mainnet 啟動/查詢 mainnet one-run\n"
         "/pause 暫停訊號推送\n"
         "/resume 恢復訊號推送\n\n"
         "收到開單通知後，手動下單並按訊息下方的「已下單」。"
@@ -827,6 +879,8 @@ async def handle_unknown_command(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def handle_manual_signal_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _authorized(update, context):
+        return
     query = update.callback_query
     if query is None:
         return
@@ -847,6 +901,30 @@ async def handle_manual_signal_callback(update: Update, context: ContextTypes.DE
         replied_message_id=replied_message_id,
         raw_text=data,
     )
+
+
+async def handle_mainnet_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _authorized(update, context):
+        return
+    query = update.callback_query
+    if query is None:
+        return
+    manager = context.application.bot_data.get("mainnet_one_run_manager")
+    if manager is None:
+        await query.answer("Mainnet manager 尚未初始化。", show_alert=True)
+        return
+    data = query.data or ""
+    await query.answer("處理中...")
+    if data == "mainnet:arm":
+        text = await manager.arm(actor="telegram")
+        await query.message.reply_text(text, parse_mode="HTML")
+        return
+    if data == "mainnet:cancel":
+        text = await manager.cancel()
+        await query.message.reply_text(text, parse_mode="HTML")
+        return
+    status = await manager.status()
+    await query.message.reply_text(status.text, parse_mode="HTML", reply_markup=status.reply_markup)
 
 
 async def _confirm_manual_signal(

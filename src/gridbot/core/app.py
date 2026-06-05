@@ -13,6 +13,7 @@ from src.gridbot.binance.models import FuturesTrade, IncomeRecord, MarketSnapsho
 from src.gridbot.core.scheduler import Scheduler
 from src.gridbot.grid.analyzer import compute_metrics
 from src.gridbot.grid.models import GridMetrics
+from src.gridbot.mainnet.one_run import MainnetOneRunManager
 from src.gridbot.storage.database import Database
 from src.gridbot.storage.repositories import (
     AuditLogRepository,
@@ -20,6 +21,7 @@ from src.gridbot.storage.repositories import (
     GridSessionRepository,
     IncomeRepository,
     MarketSnapshotRepository,
+    MainnetRunRepository,
     PerformanceRepository,
     RecommendationRepository,
 )
@@ -42,6 +44,14 @@ class App:
         self.settings = settings
         self.db = Database(settings.db_path)
         self.binance = BinanceFuturesClient(settings)
+        self.mainnet_settings = settings.model_copy(
+            update={
+                "binance_api_key": settings.mainnet_api_key,
+                "binance_api_secret": settings.mainnet_api_secret,
+                "binance_testnet": False,
+            }
+        )
+        self.mainnet_binance = BinanceFuturesClient(self.mainnet_settings)
         self.gemini = GeminiAnalyzer(settings)
         self.scheduler = Scheduler()
 
@@ -53,6 +63,7 @@ class App:
         self.perf_repo = PerformanceRepository(self.db)
         self.rec_repo = RecommendationRepository(self.db)
         self.audit_repo = AuditLogRepository(self.db)
+        self.mainnet_run_repo = MainnetRunRepository(self.db)
 
         # Fetcher
         self.fetcher = BinanceFetcher(
@@ -66,17 +77,21 @@ class App:
 
         self.telegram_app = None
         self.testnet_auto_trader = None
+        self.mainnet_one_run_manager = None
 
     async def initialize(self) -> None:
         """Initialize all components."""
         await self.db.initialize()
         await self.binance.connect()
+        if self.settings.mainnet_one_run_enabled and self.settings.mainnet_api_key:
+            await self.mainnet_binance.connect()
         logger.info("app_initialized")
 
     async def shutdown(self) -> None:
         """Graceful shutdown."""
         self.scheduler.shutdown()
         await self.binance.close()
+        await self.mainnet_binance.close()
         await self.db.close()
         logger.info("app_shutdown")
 
@@ -454,6 +469,17 @@ class App:
                 client=self.binance,
                 telegram_app=self.telegram_app,
             )
+            if self.telegram_app:
+                self.telegram_app.bot_data["trader"] = self.testnet_auto_trader
+
+            self.mainnet_one_run_manager = MainnetOneRunManager(
+                settings=self.settings,
+                client=self.mainnet_binance,
+                repo=self.mainnet_run_repo,
+                telegram_app=self.telegram_app,
+            )
+            if self.telegram_app:
+                self.telegram_app.bot_data["mainnet_one_run_manager"] = self.mainnet_one_run_manager
 
             # Schedule periodic tasks
             self.scheduler.add_fetch_job(
@@ -481,6 +507,14 @@ class App:
                         minute=self.settings.testnet_daily_report_minute,
                         timezone=self.settings.testnet_daily_report_timezone,
                     )
+            if self.settings.mainnet_one_run_enabled:
+                self.scheduler.add_mainnet_one_run_job(
+                    self.mainnet_one_run_manager.run_cycle,
+                    interval_seconds=min(
+                        self.settings.mainnet_one_run_entry_scan_interval_seconds,
+                        self.settings.mainnet_one_run_manage_interval_seconds,
+                    ),
+                )
             self.scheduler.start()
 
             # Run initial fetch

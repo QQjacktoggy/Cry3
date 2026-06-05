@@ -464,6 +464,99 @@ class AuditLogRepository:
         )
 
 
+class MainnetRunRepository:
+    """Repository for Telegram-triggered mainnet one-run validation state."""
+
+    ACTIVE_STATUSES = ("ARMED", "ENTRY_PENDING", "RUNNING", "CLOSING")
+
+    def __init__(self, db: Database) -> None:
+        self._db = db
+
+    async def create_run(self, run: dict) -> None:
+        now_ms = int(time.time() * 1000)
+        await self._db.execute(
+            """INSERT INTO mainnet_runs
+            (run_id, symbol, strategy_label, status, params_json, armed_at_ms, updated_at_ms)
+            VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                run["run_id"],
+                run["symbol"],
+                run["strategy_label"],
+                run.get("status", "ARMED"),
+                json.dumps(run.get("params", {}), ensure_ascii=False),
+                run.get("armed_at_ms", now_ms),
+                now_ms,
+            ),
+        )
+
+    async def get_active_run(self) -> dict | None:
+        placeholders = ",".join("?" for _ in self.ACTIVE_STATUSES)
+        return await self._db.fetchone(
+            f"""SELECT * FROM mainnet_runs
+            WHERE status IN ({placeholders})
+            ORDER BY armed_at_ms DESC LIMIT 1""",
+            self.ACTIVE_STATUSES,
+        )
+
+    async def get_latest_run(self) -> dict | None:
+        return await self._db.fetchone(
+            "SELECT * FROM mainnet_runs ORDER BY armed_at_ms DESC LIMIT 1"
+        )
+
+    async def update_run(self, run_id: str, **fields) -> None:
+        if not fields:
+            return
+        fields["updated_at_ms"] = int(time.time() * 1000)
+        assignments = []
+        values = []
+        for key, value in fields.items():
+            if key in {"signal_json", "params_json"} and not isinstance(value, str):
+                value = json.dumps(value, ensure_ascii=False)
+            assignments.append(f"{key} = ?")
+            values.append(value)
+        values.append(run_id)
+        await self._db.execute(
+            f"UPDATE mainnet_runs SET {', '.join(assignments)} WHERE run_id = ?",
+            tuple(values),
+        )
+
+    async def complete_run(
+        self,
+        run_id: str,
+        status: str,
+        exit_reason: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        await self.update_run(
+            run_id,
+            status=status,
+            exit_reason=exit_reason,
+            error=error,
+            completed_at_ms=int(time.time() * 1000),
+        )
+
+    async def log_event(self, run_id: str, event_type: str, details: dict) -> None:
+        await self._db.execute(
+            """INSERT INTO mainnet_run_events
+            (run_id, event_time_ms, event_type, details_json)
+            VALUES (?, ?, ?, ?)""",
+            (
+                run_id,
+                int(time.time() * 1000),
+                event_type,
+                json.dumps(details, ensure_ascii=False),
+            ),
+        )
+
+    async def get_events(self, run_id: str, limit: int = 30) -> list[dict]:
+        return await self._db.fetchall(
+            """SELECT * FROM mainnet_run_events
+            WHERE run_id = ?
+            ORDER BY event_time_ms DESC LIMIT ?""",
+            (run_id, limit),
+        )
+
+
 class ConfigRepository:
     def __init__(self, db: Database) -> None:
         self._db = db

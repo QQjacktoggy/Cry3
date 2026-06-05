@@ -64,6 +64,18 @@ class Scheduler:
         )
         logger.info("scheduler_job_added", job="testnet_manage_cycle", interval_seconds=interval_seconds)
 
+    def add_mainnet_one_run_job(self, func, interval_seconds: int, **kwargs) -> None:
+        """Add a fast periodic mainnet one-run management job."""
+        self._scheduler.add_job(
+            func,
+            "interval",
+            seconds=interval_seconds,
+            id="mainnet_one_run_cycle",
+            replace_existing=True,
+            **kwargs,
+        )
+        logger.info("scheduler_job_added", job="mainnet_one_run_cycle", interval_seconds=interval_seconds)
+
     def add_testnet_daily_report_job(
         self,
         func,

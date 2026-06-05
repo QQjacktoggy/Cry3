@@ -75,6 +75,47 @@ class Settings(BaseSettings):
     testnet_daily_report_minute: int = 0
     testnet_daily_report_timezone: str = "Asia/Taipei"
 
+    # Telegram signal / manual mainnet analysis helpers.
+    testnet_telegram_signal_only: bool = False
+    manual_mainnet_api_key: str = ""
+    manual_mainnet_api_secret: str = ""
+    manual_signal_match_window_minutes: int = 20
+    minimax_api_key: str = ""
+    minimax_base_url: str = "https://api.minimax.io/v1"
+    minimax_model: str = "MiniMax-M3"
+
+    # Mainnet one-run validation. This is intentionally opt-in and separate
+    # from the testnet trader so testnet safeguards remain intact.
+    mainnet_one_run_enabled: bool = False
+    mainnet_api_key: str = ""
+    mainnet_api_secret: str = ""
+    mainnet_symbol: str = "ETHUSDC"
+    mainnet_strategy_label: str = "wildcat_v2_adverse_guard"
+    mainnet_equity_cap_usdc: float = 200.0
+    mainnet_initial_notional_usdc: float = 1000.0
+    mainnet_max_cumulative_notional_usdc: float = 4000.0
+    mainnet_leverage: int = 75
+    mainnet_fallback_leverage: int = 100
+    mainnet_require_zero_maker_fee: bool = True
+    mainnet_expected_taker_fee_rate: float = 0.0004
+    mainnet_one_run_entry_scan_interval_seconds: int = 15
+    mainnet_one_run_manage_interval_seconds: int = 10
+    mainnet_one_run_signal_timeout_minutes: int = 60
+    mainnet_entry_order_ttl_seconds: int = 45
+    mainnet_entry_reprice_interval_seconds: int = 10
+    mainnet_entry_reprice_max_updates: int = 3
+    mainnet_entry_max_deviation_bps: float = 8.0
+    mainnet_partial_exit_pct: float = 0.40
+    mainnet_partial_tp_pct: float = 0.0005
+    mainnet_recovery_enabled: bool = True
+    mainnet_recovery_steps: int = 3
+    mainnet_recovery_trigger_pct: float = 0.0009
+    mainnet_recovery_tp_shrink: float = 0.45
+    mainnet_adverse_exit_bars: int = 10
+    mainnet_adverse_exit_loss_pct: float = 0.0007
+    mainnet_max_holding_bars: int = 20
+    mainnet_client_order_prefix: str = "cry3mn"
+
     # Risk management
     margin_ratio_warning: float = 0.6    # 60% → send warning
     margin_ratio_critical: float = 0.8   # 80% → urgent alert
