@@ -20,6 +20,8 @@ from src.gridbot.strategy.wildcat_live import WildcatLiveDecision, generate_wild
 from src.gridbot.utils.logging import get_logger
 
 logger = get_logger(__name__)
+PARTIAL_TP_SUFFIX = "_tp1"
+FINAL_TP_SUFFIX = "_tp2"
 
 
 TERMINAL_STATUSES = {"COMPLETED", "ENTRY_EXPIRED", "FAILED", "CANCELLED", "EMERGENCY_CLOSED"}
@@ -47,6 +49,7 @@ class MainnetOneRunManager:
         self._telegram_app = telegram_app
         self._protection_sent: set[str] = set()
         self._partial_taken: set[str] = set()
+        self._partial_order_armed: set[str] = set()
         self._recovery_counts: dict[str, int] = {}
 
     async def status(self) -> RunStatus:
@@ -203,6 +206,7 @@ class MainnetOneRunManager:
                 "entry_filled",
                 {"entry_price": position.entry_price, "qty": abs(position.position_amt)},
             )
+            await self._sync_take_profit_orders(run, position, json.loads(run.get("signal_json") or "{}"))
             await self._notify(
                 "✅ <b>Mainnet one-run 已成交</b>\n"
                 f"Run：<code>{escape(run['run_id'])}</code>\n"
@@ -228,6 +232,10 @@ class MainnetOneRunManager:
         if not position:
             await self._finish_flat_run(run, "flat_detected")
             return
+        current_qty = abs(position.position_amt)
+        if abs(current_qty - float(run.get("qty") or 0.0)) > 1e-9:
+            await self._repo.update_run(run["run_id"], qty=current_qty)
+            run["qty"] = current_qty
         if run["status"] == "CLOSING":
             logger.info(
                 "mainnet_one_run_waiting_close_fill",
@@ -241,19 +249,17 @@ class MainnetOneRunManager:
         side = str(run.get("side") or signal.get("side") or "").upper()
         mark = position.mark_price
         entry = float(run.get("avg_entry_price") or position.entry_price)
-        qty = abs(position.position_amt)
-        tp_price = float(signal.get("take_profit") or 0.0)
+        qty = current_qty
         sl_price = float(signal.get("stop_loss") or 0.0)
         close_side = "SELL" if position.position_amt > 0 else "BUY"
         run_age_bars = max(0, int((int(time.time() * 1000) - int(run["armed_at_ms"])) / 60_000))
 
-        if await self._maybe_partial_exit(run, position, close_side, entry, mark):
-            return
+        await self._refresh_partial_fill_state(run, position)
+        await self._sync_take_profit_orders(run, position, signal)
         if await self._maybe_recovery(run, signal, position):
             return
-        if self._hit_stop_or_tp(side, mark, sl_price, tp_price):
-            reason = "TP" if self._hit_tp(side, mark, tp_price) else "SL"
-            await self._close_position(symbol, close_side, qty, reason, run)
+        if self._hit_stop(side, mark, sl_price):
+            await self._close_position(symbol, close_side, qty, "SL", run)
             return
         unrealized_loss_limit = -float(
             run.get("cumulative_notional_usdc") or self._settings.mainnet_effective_entry_notional_usdc
@@ -289,6 +295,7 @@ class MainnetOneRunManager:
             "price": decision.signal.price,
             "entry_price": float(price),
             "stop_loss": decision.signal.stop_loss,
+            "take_profits": decision.signal.take_profits,
             "take_profit": decision.signal.take_profits[0] if decision.signal.take_profits else None,
             "score": decision.signal.score,
             "reasons": decision.signal.reasons,
@@ -370,27 +377,126 @@ class MainnetOneRunManager:
             price = max(bid + tick, Decimal(str(signal_price)))
         return price
 
-    async def _maybe_partial_exit(self, run: dict, position: PositionInfo, close_side: str, entry: float, mark: float) -> bool:
-        if run["run_id"] in self._partial_taken:
-            return False
-        if position.position_direction == "LONG":
-            hit = mark >= entry * (1 + self._settings.mainnet_partial_tp_pct)
-        else:
-            hit = mark <= entry * (1 - self._settings.mainnet_partial_tp_pct)
-        if not hit:
-            return False
-        close_qty = abs(position.position_amt) * self._settings.mainnet_partial_exit_pct
-        qty = await self._client.format_quantity(position.symbol, close_qty)
-        await self._client.create_market_order(
-            position.symbol,
-            close_side,
-            qty,
-            reduce_only=True,
-            client_order_id=f"{run['run_id']}_partial",
+    async def _refresh_partial_fill_state(self, run: dict, position: PositionInfo) -> None:
+        run_id = run["run_id"]
+        if run_id in self._partial_taken or run_id not in self._partial_order_armed:
+            return
+        current_qty = abs(position.position_amt)
+        initial_qty = float(run.get("qty") or 0.0)
+        open_orders = await self._client.get_open_orders(position.symbol)
+        partial_open = any(
+            str(order.get("clientOrderId") or "") == f"{run_id}{PARTIAL_TP_SUFFIX}"
+            for order in open_orders
         )
-        self._partial_taken.add(run["run_id"])
-        await self._repo.log_event(run["run_id"], "partial_exit", {"qty": qty, "mark": mark})
-        await self._notify(f"✅ Mainnet one-run 已部分獲利了結：<code>{escape(run['run_id'])}</code> qty=<code>{escape(qty)}</code>")
+        if partial_open or abs(current_qty - initial_qty) < 1e-9:
+            return
+        qty_closed = max(0.0, initial_qty - current_qty)
+        qty_text = await self._client.format_quantity(position.symbol, qty_closed) if qty_closed > 0 else "unknown"
+        self._partial_taken.add(run_id)
+        self._partial_order_armed.discard(run_id)
+        await self._repo.log_event(run_id, "partial_exit", {"qty": qty_text, "position_qty": current_qty})
+        await self._notify(
+            f"✅ Mainnet one-run 已部分獲利了結：<code>{escape(run_id)}</code> qty=<code>{escape(str(qty_text))}</code>"
+        )
+
+    async def _sync_take_profit_orders(self, run: dict, position: PositionInfo, signal: dict) -> None:
+        run_id = run["run_id"]
+        side = str(run.get("side") or signal.get("side") or position.position_direction).upper()
+        if side not in {"LONG", "SHORT"}:
+            return
+        current_qty = abs(position.position_amt)
+        if current_qty <= 0:
+            return
+        close_side = "SELL" if position.position_direction == "LONG" else "BUY"
+        desired = await self._desired_take_profit_orders(run, position, signal, close_side)
+        existing_orders = await self._client.get_open_orders(position.symbol)
+        existing_tp = [
+            order for order in existing_orders
+            if str(order.get("clientOrderId") or "").startswith(f"{run_id}_tp")
+        ]
+        if self._take_profit_orders_match(existing_tp, desired):
+            return
+        for order in existing_tp:
+            await self._client.cancel_order(position.symbol, int(order["orderId"]))
+        for client_order_id, qty, price in desired:
+            await self._client.create_reduce_only_limit_order(
+                position.symbol,
+                close_side,
+                qty,
+                price,
+                client_order_id=client_order_id,
+                post_only=True,
+            )
+        if any(client_order_id.endswith(PARTIAL_TP_SUFFIX) for client_order_id, _, _ in desired):
+            self._partial_order_armed.add(run_id)
+        await self._repo.log_event(
+            run_id,
+            "take_profit_synced",
+            {
+                "orders": [
+                    {"client_order_id": client_order_id, "qty": qty, "price": price}
+                    for client_order_id, qty, price in desired
+                ]
+            },
+        )
+
+    async def _desired_take_profit_orders(
+        self,
+        run: dict,
+        position: PositionInfo,
+        signal: dict,
+        close_side: str,
+    ) -> list[tuple[str, str, float]]:
+        run_id = run["run_id"]
+        current_qty = abs(position.position_amt)
+        if current_qty <= 0:
+            return []
+        full_tp_price = float(signal.get("take_profit") or 0.0)
+        partial_price = self._partial_take_profit_price(position)
+        orders: list[tuple[str, str, float]] = []
+        remaining_qty = current_qty
+        if (
+            run_id not in self._partial_taken
+            and self._settings.mainnet_partial_exit_pct > 0
+            and partial_price > 0
+        ):
+            partial_qty_raw = current_qty * self._settings.mainnet_partial_exit_pct
+            partial_qty = await self._client.format_quantity(position.symbol, partial_qty_raw)
+            if float(partial_qty) > 0:
+                orders.append((f"{run_id}{PARTIAL_TP_SUFFIX}", partial_qty, partial_price))
+                remaining_qty = max(0.0, current_qty - float(partial_qty))
+        if full_tp_price > 0 and remaining_qty > 0:
+            final_qty = await self._client.format_quantity(position.symbol, remaining_qty)
+            if float(final_qty) > 0:
+                orders.append((f"{run_id}{FINAL_TP_SUFFIX}", final_qty, full_tp_price))
+        return orders
+
+    def _partial_take_profit_price(self, position: PositionInfo) -> float:
+        if position.position_direction == "LONG":
+            return position.entry_price * (1 + self._settings.mainnet_partial_tp_pct)
+        if position.position_direction == "SHORT":
+            return position.entry_price * (1 - self._settings.mainnet_partial_tp_pct)
+        return 0.0
+
+    def _take_profit_orders_match(
+        self,
+        existing_orders: list[dict],
+        desired_orders: list[tuple[str, str, float]],
+    ) -> bool:
+        if len(existing_orders) != len(desired_orders):
+            return False
+        existing_by_id = {
+            str(order.get("clientOrderId") or ""): order
+            for order in existing_orders
+        }
+        for client_order_id, qty, price in desired_orders:
+            order = existing_by_id.get(client_order_id)
+            if order is None:
+                return False
+            if abs(float(order.get("origQty") or 0.0) - float(qty)) > 1e-9:
+                return False
+            if abs(float(order.get("price") or 0.0) - float(price)) > 1e-6:
+                return False
         return True
 
     async def _maybe_recovery(self, run: dict, signal: dict, position: PositionInfo) -> bool:
@@ -433,16 +539,12 @@ class MainnetOneRunManager:
         await self._notify(f"🧩 Mainnet one-run 已掛 DCA maker 單 #{count + 1}：<code>{escape(run['run_id'])}</code>")
         return True
 
-    def _hit_tp(self, side: str, mark: float, tp_price: float) -> bool:
-        if tp_price <= 0:
-            return False
-        return mark >= tp_price if side == "LONG" else mark <= tp_price
-
-    def _hit_stop_or_tp(self, side: str, mark: float, sl_price: float, tp_price: float) -> bool:
+    def _hit_stop(self, side: str, mark: float, sl_price: float) -> bool:
         hit_sl = mark <= sl_price if side == "LONG" else mark >= sl_price
-        return self._hit_tp(side, mark, tp_price) or (sl_price > 0 and hit_sl)
+        return sl_price > 0 and hit_sl
 
     async def _close_position(self, symbol: str, side: str, qty: float, reason: str, run: dict) -> None:
+        await self._cancel_take_profit_orders(symbol, run["run_id"])
         qty_str = await self._client.format_quantity(symbol, qty)
         order = await self._client.create_market_order(
             symbol,
@@ -455,15 +557,80 @@ class MainnetOneRunManager:
         await self._repo.update_run(run["run_id"], status="CLOSING", exit_reason=reason)
         await self._notify(f"🏁 Mainnet one-run 已送出平倉：<code>{escape(run['run_id'])}</code> reason=<b>{escape(reason)}</b>")
 
+    async def _cancel_take_profit_orders(self, symbol: str, run_id: str) -> None:
+        open_orders = await self._client.get_open_orders(symbol)
+        for order in open_orders:
+            client_order_id = str(order.get("clientOrderId") or "")
+            if client_order_id.startswith(f"{run_id}_tp"):
+                await self._client.cancel_order(symbol, int(order["orderId"]))
+
     async def _finish_flat_run(self, run: dict, reason: str) -> None:
-        await self._repo.complete_run(run["run_id"], "COMPLETED", run.get("exit_reason") or reason)
+        summary = await self._build_run_summary(run)
+        exit_reason = run.get("exit_reason") or summary["exit_reason"] or reason
+        await self._repo.update_run(
+            run["run_id"],
+            qty=summary["qty"],
+            realized_pnl_usdc=summary["realized_pnl_usdc"],
+            commission_usdc=summary["commission_usdc"],
+        )
+        await self._repo.complete_run(run["run_id"], "COMPLETED", exit_reason)
         await self._repo.log_event(run["run_id"], "completed", {"reason": reason})
         await self._notify(
             "🏁 <b>Mainnet one-run 已完成</b>\n"
             f"Run：<code>{escape(run['run_id'])}</code>\n"
-            f"結果：<code>{escape(str(run.get('exit_reason') or reason))}</code>\n"
+            f"結果：<code>{escape(str(exit_reason))}</code>\n"
+            f"最大倉位：<code>{summary['qty']:.6f}</code>\n"
+            f"已實現損益：<b>${summary['realized_pnl_usdc']:.4f}</b>\n"
+            f"手續費：<b>${summary['commission_usdc']:.4f}</b>\n"
             "自動交易已回到待命，不會自動開下一單。"
         )
+
+    async def _build_run_summary(self, run: dict) -> dict[str, float | str | None]:
+        orders, trades = await self._load_run_orders_and_trades(run)
+        qty = 0.0
+        for trade in trades:
+            qty = max(qty, float(trade.qty))
+        for order in orders:
+            qty = max(qty, abs(float(order.get("origQty") or 0.0)))
+        realized_pnl = sum(float(trade.realized_pnl) for trade in trades)
+        commission = sum(float(trade.commission) for trade in trades)
+        exit_reason = self._infer_flat_exit_reason(run, orders)
+        return {
+            "qty": qty,
+            "realized_pnl_usdc": realized_pnl,
+            "commission_usdc": commission,
+            "exit_reason": exit_reason,
+        }
+
+    async def _load_run_orders_and_trades(self, run: dict) -> tuple[list[dict], list]:
+        start_time = max(0, int(run.get("armed_at_ms") or 0) - 60_000)
+        orders = await self._client.get_all_orders(run["symbol"], start_time=start_time, limit=1000)
+        matching_orders = [
+            order for order in orders
+            if str(order.get("clientOrderId") or "").startswith(run["run_id"])
+        ]
+        order_ids = {int(order.get("orderId", 0) or 0) for order in matching_orders}
+        trades = await self._client.get_user_trades(run["symbol"], start_time=start_time, limit=1000)
+        matching_trades = [trade for trade in trades if int(trade.order_id) in order_ids]
+        return matching_orders, matching_trades
+
+    def _infer_flat_exit_reason(self, run: dict, orders: list[dict]) -> str | None:
+        latest_filled = None
+        latest_time = -1
+        for order in orders:
+            if str(order.get("status", "")).upper() != "FILLED":
+                continue
+            order_time = int(order.get("updateTime") or order.get("time") or 0)
+            if order_time >= latest_time:
+                latest_time = order_time
+                latest_filled = str(order.get("clientOrderId") or "")
+        if not latest_filled:
+            return run.get("exit_reason")
+        if latest_filled.endswith(FINAL_TP_SUFFIX) or latest_filled.endswith(PARTIAL_TP_SUFFIX):
+            return "TP"
+        if latest_filled.endswith("_close"):
+            return run.get("exit_reason")
+        return run.get("exit_reason")
 
     def _buttons(self, active: bool) -> InlineKeyboardMarkup:
         if active:
