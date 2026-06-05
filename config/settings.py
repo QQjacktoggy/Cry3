@@ -156,6 +156,28 @@ class Settings(BaseSettings):
     mainnet_max_holding_bars: int = 20
     mainnet_client_order_prefix: str = "cry3mn"
 
+    # GTX post-only rejection handling.
+    # If a post-only (GTX) order is rejected (-5022), re-quote with a fresh
+    # book price and retry up to this many times before giving up.
+    mainnet_gtx_retry_attempts: int = 3
+    # Maximum slippage (in basis points) from the original signal price that
+    # is acceptable when re-quoting after a GTX rejection.
+    # Entry: 8 bps = 0.08% — matches mainnet_entry_max_deviation_bps default.
+    mainnet_entry_slippage_bps: float = 8.0
+    # TP / DCA: slightly tighter — these are exit/averaging orders, not
+    # time-sensitive entries, so we allow less chase.
+    mainnet_tp_slippage_bps: float = 5.0
+    mainnet_dca_slippage_bps: float = 5.0
+    # If a TP order is rejected even after all GTX retries, fall back to a
+    # GTC limit order at the best available price.  It is better to pay
+    # taker fee on a TP than to miss the exit entirely.
+    mainnet_tp_fallback_to_gtc: bool = True
+    # If an entry order is rejected even after all GTX retries AND the
+    # slippage is within tolerance, fall back to a GTC limit order.
+    # This means we accept the taker fee risk to get the position open.
+    # Set to False to let the run expire on GTX rejection (old behaviour).
+    mainnet_entry_fallback_to_gtc: bool = False
+
     @property
     def mainnet_effective_entry_notional_usdc(self) -> float:
         """Clamp one-run single-ticket notional to the configured equity cap."""
@@ -177,6 +199,7 @@ class Settings(BaseSettings):
         configured = max(0.0, float(self.mainnet_max_cumulative_notional_usdc))
         minimum_required = self.mainnet_effective_entry_notional_usdc * (max(0, int(self.mainnet_recovery_steps)) + 1)
         return max(configured, minimum_required)
+
     # Risk management
     margin_ratio_warning: float = 0.6    # 60% → send warning
     margin_ratio_critical: float = 0.8   # 80% → urgent alert

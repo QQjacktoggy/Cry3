@@ -217,6 +217,36 @@ class BinanceFuturesClient:
             params["newClientOrderId"] = client_order_id
         return await self.client.futures_create_order(**params)
 
+
+    async def create_limit_order_raw(
+        self,
+        symbol: str,
+        side: str,
+        quantity: float | str,
+        price: float,
+        time_in_force: str = "GTC",
+        reduce_only: bool = False,
+        client_order_id: str | None = None,
+    ) -> dict:
+        """Place a limit order WITHOUT automatic retry.
+
+        Use this when the caller needs fine-grained control over retries,
+        e.g. GTX Post-Only (-5022) rejection handling in the one-run manager.
+        """
+        tick_size = await self._price_tick_size(symbol)
+        params = {
+            "symbol": symbol,
+            "side": side,
+            "type": "LIMIT",
+            "timeInForce": time_in_force,
+            "quantity": quantity,
+            "price": _format_tick_price(price, tick_size),
+        }
+        if reduce_only:
+            params["reduceOnly"] = "true"
+        if client_order_id:
+            params["newClientOrderId"] = client_order_id
+        return await self.client.futures_create_order(**params)
     @async_retry(max_attempts=3, base_delay=2.0, exceptions=(BinanceAPIException, Exception))
     async def create_post_only_limit_order(
         self,

@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from html import escape
 
+from binance import BinanceAPIException
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from config.settings import Settings
@@ -25,6 +27,10 @@ FINAL_TP_SUFFIX = "_tp2"
 
 
 TERMINAL_STATUSES = {"COMPLETED", "ENTRY_EXPIRED", "FAILED", "CANCELLED", "EMERGENCY_CLOSED"}
+
+
+class GTXSlippageExceeded(Exception):
+    """Raised when price slippage exceeds tolerance after GTX Post-Only rejection."""
 
 
 @dataclass(frozen=True)
@@ -282,20 +288,38 @@ class MainnetOneRunManager:
             run["symbol"],
             entry_notional / decision.signal.price,
         )
-        price = await self._passive_price(run["symbol"], side, decision.signal.price)
         client_order_id = f"{run['run_id']}_entry"
-        order = await self._client.create_post_only_limit_order(
-            symbol=run["symbol"],
-            side=side,
-            quantity=qty,
-            price=price,
-            client_order_id=client_order_id,
-        )
+        try:
+            order = await self._place_post_only_with_retry(
+                symbol=run["symbol"],
+                side=side,
+                quantity=qty,
+                signal_price=decision.signal.price,
+                client_order_id=client_order_id,
+                slippage_bps=self._settings.mainnet_entry_slippage_bps,
+                fallback_to_gtc=self._settings.mainnet_entry_fallback_to_gtc,
+                reduce_only=False,
+            )
+        except GTXSlippageExceeded as exc:
+            # Entry rejected — slippage exceeded tolerance, stop this run
+            await self._repo.complete_run(run["run_id"], "ENTRY_REJECTED", "slippage_exceeded")
+            await self._repo.log_event(run["run_id"], "entry_rejected", {
+                "reason": "slippage_exceeded",
+                "detail": str(exc)[:500],
+            })
+            await self._notify(
+                "⚠️ <b>Mainnet one-run entry 被拒</b>\n"
+                f"Run：<code>{escape(run['run_id'])}</code>\n"
+                f"原因：滑價超出容忍範圍\n"
+                f"詳情：<code>{escape(str(exc)[:400])}</code>"
+            )
+            return
+        final_price = float(order.get("price", 0) or decision.signal.price)
         payload = {
             "side": decision.side,
             "strategy": decision.strategy,
             "price": decision.signal.price,
-            "entry_price": float(price),
+            "entry_price": final_price,
             "stop_loss": decision.signal.stop_loss,
             "take_profits": decision.signal.take_profits,
             "take_profit": decision.signal.take_profits[0] if decision.signal.take_profits else None,
@@ -320,16 +344,18 @@ class MainnetOneRunManager:
             signal_json=payload,
             entry_order_id=int(order.get("orderId", 0) or 0),
             entry_client_order_id=client_order_id,
-            entry_price=float(price),
+            entry_price=final_price,
             cumulative_notional_usdc=entry_notional,
         )
         await self._repo.log_event(run["run_id"], "entry_placed", {"order": order, "signal": payload})
+        used_gtc = order.get("timeInForce") != "GTX"
+        gtc_note = "\n⚠️ 使用 GTC 限價單進場（maker 保護已關閉）" if used_gtc else ""
         await self._notify(
             f"{'🟢' if decision.side == 'LONG' else '🔴'} <b>AUTO {('做多' if decision.side == 'LONG' else '做空')} 已掛 maker 單</b>\n"
             f"Run：<code>{escape(run['run_id'])}</code>\n"
             f"策略：<b>{escape(decision.strategy)}</b> | score=<code>{decision.signal.score}</code>\n"
-            f"Entry：<b>${float(price):.4f}</b> | Qty：<code>{escape(str(qty))}</code>\n"
-            f"Stop：<b>${float(decision.signal.stop_loss or 0):.4f}</b> | TP：<b>${float(decision.signal.take_profits[0] if decision.signal.take_profits else 0):.4f}</b>\n"
+            f"Entry：<b>${final_price:.4f}</b> | Qty：<code>{escape(str(qty))}</code>\n"
+            f"Stop：<b>${float(decision.signal.stop_loss or 0):.4f}</b> | TP：<b>${float(decision.signal.take_profits[0] if decision.signal.take_profits else 0):.4f}</b>{gtc_note}\n"
             "若 maker 掛單逾時未成交，本 run 會停止，不會追價硬吃 taker。"
         )
 
@@ -379,6 +405,110 @@ class MainnetOneRunManager:
             price = max(bid + tick, Decimal(str(signal_price)))
         return price
 
+    async def _place_post_only_with_retry(
+        self,
+        symbol: str,
+        side: str,
+        quantity: float | str,
+        signal_price: float,
+        client_order_id: str,
+        slippage_bps: float,
+        fallback_to_gtc: bool = False,
+        reduce_only: bool = False,
+    ) -> dict:
+        """Place a maker (GTX) order with -5022 Post-Only rejection handling.
+
+        On -5022 (would fill as taker), re-quotes with fresh book data and
+        retries up to mainnet_gtx_retry_attempts times.
+        On each retry, checks that the new price is within slippage_bps of
+        the original signal_price.
+        If all GTX retries fail:
+        - fallback_to_gtc=True → places a GTC limit order at passive price
+        - fallback_to_gtc=False → raises BinanceAPIException from last attempt
+        If slippage exceeds tolerance at any point, raises GTXSlippageExceeded.
+        """
+        max_attempts = self._settings.mainnet_gtx_retry_attempts
+        last_exc: BinanceAPIException | None = None
+
+        for attempt in range(1, max_attempts + 1):
+            # Always get fresh book data for each attempt
+            price = await self._passive_price(symbol, side, signal_price)
+
+            # Slippage check (skip on first attempt — initial price is strategy-driven)
+            if attempt > 1:
+                deviation_bps = abs(float(price) - signal_price) / signal_price * 10_000
+                if deviation_bps > slippage_bps:
+                    raise GTXSlippageExceeded(
+                        f"GTX retry attempt {attempt}: slippage {deviation_bps:.2f} bps "
+                        f"exceeds tolerance {slippage_bps} bps "
+                        f"(price={float(price)}, signal={signal_price})"
+                    )
+
+            try:
+                order = await self._client.create_limit_order_raw(
+                    symbol=symbol,
+                    side=side,
+                    quantity=quantity,
+                    price=float(price),
+                    time_in_force="GTX",
+                    reduce_only=reduce_only,
+                    client_order_id=client_order_id,
+                )
+                if attempt > 1:
+                    logger.info(
+                        "gtx_retry_success",
+                        run_id=client_order_id.split("_")[0],
+                        attempt=attempt,
+                        side=side,
+                        price=float(price),
+                        signal_price=signal_price,
+                    )
+                return order
+            except BinanceAPIException as exc:
+                if exc.code != -5022:
+                    raise
+                last_exc = exc
+                logger.warning(
+                    "gtx_post_only_rejected_retrying",
+                    run_id=client_order_id.split("_")[0],
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    side=side,
+                    price=float(price),
+                    signal_price=signal_price,
+                    error=str(exc),
+                )
+
+        # All GTX retries exhausted — try GTC fallback if enabled
+        if fallback_to_gtc:
+            price = await self._passive_price(symbol, side, signal_price)
+            deviation_bps = abs(float(price) - signal_price) / signal_price * 10_000
+            if deviation_bps <= slippage_bps:
+                logger.warning(
+                    "gtx_fallback_to_gtc",
+                    run_id=client_order_id.split("_")[0],
+                    side=side,
+                    price=float(price),
+                    signal_price=signal_price,
+                    slippage_bps=deviation_bps,
+                )
+                return await self._client.create_limit_order(
+                    symbol=symbol,
+                    side=side,
+                    quantity=quantity,
+                    price=float(price),
+                    reduce_only=reduce_only,
+                    client_order_id=client_order_id,
+                )
+            # Slippage too large even for GTC fallback
+            raise GTXSlippageExceeded(
+                f"GTX retries exhausted, GTC fallback slippage {deviation_bps:.2f} bps "
+                f"exceeds tolerance {slippage_bps} bps"
+            )
+
+        # No GTC fallback — re-raise last BinanceAPIException
+        raise last_exc  # type: ignore[misc]
+
     async def _refresh_partial_fill_state(self, run: dict, position: PositionInfo) -> None:
         run_id = run["run_id"]
         if run_id in self._partial_taken or run_id not in self._partial_order_armed:
@@ -421,14 +551,35 @@ class MainnetOneRunManager:
         for order in existing_tp:
             await self._client.cancel_order(position.symbol, int(order["orderId"]))
         for client_order_id, qty, price in desired:
-            await self._client.create_reduce_only_limit_order(
-                position.symbol,
-                close_side,
-                qty,
-                price,
-                client_order_id=client_order_id,
-                post_only=True,
-            )
+            try:
+                await self._client.create_reduce_only_limit_order(
+                    position.symbol,
+                    close_side,
+                    qty,
+                    price,
+                    client_order_id=client_order_id,
+                    post_only=True,
+                )
+            except BinanceAPIException as exc:
+                if exc.code == -5022 and self._settings.mainnet_tp_fallback_to_gtc:
+                    # Market past TP — fill immediately as taker to ensure exit
+                    logger.warning(
+                        "tp_post_only_rejected_fallback_gtc",
+                        run_id=run_id,
+                        client_order_id=client_order_id,
+                        price=price,
+                        side=close_side,
+                    )
+                    await self._client.create_reduce_only_limit_order(
+                        position.symbol,
+                        close_side,
+                        qty,
+                        price,
+                        client_order_id=client_order_id,
+                        post_only=False,
+                    )
+                else:
+                    raise
         if any(client_order_id.endswith(PARTIAL_TP_SUFFIX) for client_order_id, _, _ in desired):
             self._partial_order_armed.add(run_id)
         await self._repo.log_event(
@@ -527,14 +678,29 @@ class MainnetOneRunManager:
             position.symbol,
             entry_notional / max(position.mark_price, 1e-9),
         )
-        price = await self._passive_price(position.symbol, side, position.mark_price)
-        order = await self._client.create_post_only_limit_order(
-            position.symbol,
-            side,
-            qty,
-            float(price),
-            client_order_id=f"{run['run_id']}_dca{count + 1}",
-        )
+        client_order_id = f"{run['run_id']}_dca{count + 1}"
+        try:
+            order = await self._place_post_only_with_retry(
+                symbol=position.symbol,
+                side=side,
+                quantity=qty,
+                signal_price=position.mark_price,
+                client_order_id=client_order_id,
+                slippage_bps=self._settings.mainnet_dca_slippage_bps,
+                fallback_to_gtc=False,  # DCA 不用 GTC 追價
+                reduce_only=False,
+            )
+        except (GTXSlippageExceeded, BinanceAPIException) as exc:
+            logger.warning(
+                "dca_order_failed_skipping",
+                run_id=run["run_id"],
+                dca_number=count + 1,
+                error=str(exc)[:300],
+            )
+            await self._notify(
+                f"⚠️ DCA #{count + 1} 掛單失敗，跳過：<code>{escape(str(exc)[:200])}</code>"
+            )
+            return False
         self._recovery_counts[run["run_id"]] = count + 1
         await self._repo.update_run(run["run_id"], cumulative_notional_usdc=cumulative + entry_notional)
         await self._repo.log_event(run["run_id"], "recovery_entry_placed", {"order": order, "signal": signal})
