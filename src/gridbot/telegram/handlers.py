@@ -689,7 +689,7 @@ async def cmd_signal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             action_lbl = SIDE_LABELS.get(action, action)
             is_no_signal_wait = (
                 action == "WAIT"
-                and decision.strategy == "portfolio_wait"
+                and decision.strategy in ("portfolio_wait", "wildcat_wait")
             )
 
             strategy_name = settings.testnet_strategy_label
