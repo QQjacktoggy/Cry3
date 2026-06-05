@@ -1,0 +1,35 @@
+ M config/settings.py
+ M src/gridbot/binance/client.py
+ M src/gridbot/binance/models.py
+ M src/gridbot/core/app.py
+ M src/gridbot/core/scheduler.py
+ M src/gridbot/strategy/signal_journal.py
+ M src/gridbot/strategy/winrate_optimized_portfolio.py
+ M src/gridbot/telegram/bot.py
+ M src/gridbot/telegram/formatters.py
+ M src/gridbot/telegram/handlers.py
+ M src/gridbot/testnet/auto_trader.py
+ M src/gridbot/testnet/trader.py
+ M tests/test_binance_client.py
+ M tests/test_telegram_formatters.py
+ M tests/test_testnet_auto_trader.py
+?? .codex_backup/
+?? .codex_deploy/
+?? config/.env.testnet.example
+?? reports/manual_mainnet_2026-06-02_morning_eth.json
+?? reports/manual_position_cycles_2026-06-02_eth.json
+?? reports/s1s5_manual_follow_cumulative.json
+?? scripts/analyze_s1s5_manual_follow.py
+?? scripts/clear_testnet_symbol.py
+?? scripts/inspect_mainnet_maker_orders.py
+?? scripts/inspect_recent_testnet_trades.py
+?? scripts/inspect_testnet_signal.py
+?? scripts/review_testnet_live.py
+?? scripts/summarize_testnet_execution.py
+?? src/gridbot/manual/
+?? src/gridbot/testnet/pnl.py
+?? testnet/.env.testnet.bak_20260601_fix10
+?? testnet/.env.testnet.bak_20260602_notional1000
+?? testnet/inspect_incomes.py
+?? tests/test_testnet_pnl.py
+?? tests/test_winrate_optimized_portfolio.py

@@ -1,0 +1,16 @@
+ config/settings.py                                 |  151 +-
+ src/gridbot/binance/client.py                      |  781 ++--
+ src/gridbot/binance/models.py                      |  668 ++--
+ src/gridbot/core/app.py                            |  958 ++---
+ src/gridbot/core/scheduler.py                      |  194 +-
+ src/gridbot/strategy/signal_journal.py             | 4028 ++++++++++----------
+ .../strategy/winrate_optimized_portfolio.py        | 1287 +++++--
+ src/gridbot/telegram/bot.py                        |   42 +-
+ src/gridbot/telegram/formatters.py                 |  729 ++--
+ src/gridbot/telegram/handlers.py                   | 1249 +++---
+ src/gridbot/testnet/auto_trader.py                 |  415 +-
+ src/gridbot/testnet/trader.py                      |  428 ++-
+ tests/test_binance_client.py                       |  257 +-
+ tests/test_telegram_formatters.py                  |  244 +-
+ tests/test_testnet_auto_trader.py                  | 3762 +++++++++++++-----
+ 15 files changed, 9271 insertions(+), 5922 deletions(-)
