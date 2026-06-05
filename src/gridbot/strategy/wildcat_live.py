@@ -236,7 +236,7 @@ def explain_wildcat_no_signal(
 
     reasons.append(
         f"<b>S1_BB_RSI [{s1_status}]</b>：RSI=<code>{rsi_val:.1f}</code>，布林=[<code>${bb_lower_val:.2f}</code>, <code>${bb_upper_val:.2f}</code>]"
-        + (f" <br>└ 未滿足：{', '.join(s1_reasons)}" if s1_reasons else " (已滿足)")
+        + (f"\n└ 未滿足：{', '.join(s1_reasons)}" if s1_reasons else " (已滿足)")
     )
 
     # Check S5
@@ -276,7 +276,7 @@ def explain_wildcat_no_signal(
 
     reasons.append(
         f"<b>S5_Stoch [{s5_status}]</b>：K/D=[<code>{stoch_k_val:.1f}</code>, <code>{stoch_d_val:.1f}</code>]，VWAP=<code>${vwap_val:.2f}</code>"
-        + (f" <br>└ 未滿足：{', '.join(s5_reasons)}" if s5_reasons else " (已滿足)")
+        + (f"\n└ 未滿足：{', '.join(s5_reasons)}" if s5_reasons else " (已滿足)")
     )
 
     return reasons
