@@ -65,12 +65,51 @@ class Settings(BaseSettings):
     testnet_min_reward_pct: float = 0.12
     testnet_entry_order_ttl_bars: int = 8
     testnet_entry_fill_policy: str = "limit_tolerance"
+    testnet_execution_sizing_mode: str = "signal"
+    testnet_auto_trade_interval_seconds: int = 300
+    testnet_kline_refresh_seconds: int = 30
+    testnet_portfolio_min_volume_ratio: float = 1.2
+    testnet_portfolio_trigger_lookback_bars: int = 20
+    testnet_portfolio_donchian_volume_multiplier: float = 1.2
+    testnet_entry_post_only_enabled: bool = False
+    testnet_entry_maker_offset_bps: float = 1.0
+    testnet_entry_book_anchor_enabled: bool = True
     testnet_entry_tolerance_bps: float = 0.0
     testnet_entry_tolerance_min_score: int = 0
+    testnet_entry_order_ttl_seconds: int = 15
     testnet_entry_reprice_enabled: bool = True
     testnet_entry_reprice_trigger_bps: float = 2.0
     testnet_entry_reprice_cooldown_seconds: int = 15
     testnet_entry_reprice_max_updates: int = 3
+    testnet_entry_market_chase_enabled: bool = False
+    testnet_entry_market_chase_min_score: int = 90
+    testnet_entry_market_chase_max_signal_age_seconds: int = 20
+    testnet_entry_market_chase_max_drift_bps: float = 6.0
+    testnet_entry_market_chase_min_reward_pct: float = 0.10
+    testnet_stop_loss_maker_enabled: bool = False
+    testnet_stop_loss_maker_offset_bps: float = 1.0
+    testnet_stop_loss_hard_fallback_enabled: bool = True
+    testnet_stop_loss_hard_fallback_offset_bps: float = 6.0
+    testnet_take_profit_post_only_enabled: bool = False
+    testnet_take_profit_exchange_grace_seconds: int = 15
+    testnet_position_watchdog_enabled: bool = True
+    testnet_position_watchdog_stale_seconds: int = 180
+    testnet_position_watchdog_fail_seconds: int = 120
+    testnet_position_watchdog_min_progress_bps: float = 3.0
+    testnet_position_watchdog_profit_bps: float = 6.0
+    testnet_position_watchdog_break_even_bps: float = 1.0
+    testnet_position_watchdog_retrace_bps: float = 5.0
+    testnet_position_watchdog_adverse_bps: float = 8.0
+    testnet_position_watchdog_flexible_tp_enabled: bool = True
+    testnet_position_watchdog_extend_near_tp_bps: float = 1.5
+    testnet_position_watchdog_extend_tp_bps: float = 4.0
+    testnet_position_watchdog_max_tp_extensions: int = 1
+    testnet_position_watchdog_exit_offset_bps: float = 1.0
+    testnet_residual_cleanup_enabled: bool = True
+    testnet_residual_cleanup_max_qty: float = 0.05
+    testnet_residual_cleanup_max_notional_usdc: float = 80.0
+    testnet_today_pnl_cache_seconds: int = 30
+    testnet_ignore_maker_fees_in_stats: bool = True
     testnet_daily_report_enabled: bool = True
     testnet_daily_report_hour: int = 21
     testnet_daily_report_minute: int = 0
@@ -93,8 +132,8 @@ class Settings(BaseSettings):
     mainnet_symbol: str = "ETHUSDC"
     mainnet_strategy_label: str = "wildcat_v2_adverse_guard"
     mainnet_equity_cap_usdc: float = 200.0
-    mainnet_initial_notional_usdc: float = 1000.0
-    mainnet_max_cumulative_notional_usdc: float = 4000.0
+    mainnet_initial_notional_usdc: float = 200.0
+    mainnet_max_cumulative_notional_usdc: float = 800.0
     mainnet_leverage: int = 75
     mainnet_fallback_leverage: int = 100
     mainnet_require_zero_maker_fee: bool = True
@@ -117,6 +156,27 @@ class Settings(BaseSettings):
     mainnet_max_holding_bars: int = 20
     mainnet_client_order_prefix: str = "cry3mn"
 
+    @property
+    def mainnet_effective_entry_notional_usdc(self) -> float:
+        """Clamp one-run single-ticket notional to the configured equity cap."""
+        ticket = max(0.0, float(self.mainnet_initial_notional_usdc))
+        cap = max(0.0, float(self.mainnet_equity_cap_usdc))
+        if ticket <= 0:
+            return cap
+        if cap <= 0:
+            return ticket
+        return min(ticket, cap)
+
+    @property
+    def mainnet_effective_entry_margin_usdc(self) -> float:
+        leverage = max(1, int(self.mainnet_leverage))
+        return self.mainnet_effective_entry_notional_usdc / leverage
+
+    @property
+    def mainnet_effective_max_cumulative_notional_usdc(self) -> float:
+        configured = max(0.0, float(self.mainnet_max_cumulative_notional_usdc))
+        minimum_required = self.mainnet_effective_entry_notional_usdc * (max(0, int(self.mainnet_recovery_steps)) + 1)
+        return max(configured, minimum_required)
     # Risk management
     margin_ratio_warning: float = 0.6    # 60% → send warning
     margin_ratio_critical: float = 0.8   # 80% → urgent alert

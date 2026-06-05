@@ -52,13 +52,16 @@ class MainnetOneRunManager:
     async def status(self) -> RunStatus:
         latest = await self._repo.get_latest_run()
         active = await self._repo.get_active_run()
+        entry_notional = self._settings.mainnet_effective_entry_notional_usdc
+        entry_margin = self._settings.mainnet_effective_entry_margin_usdc
         lines = [
             "🧪 <b>Mainnet One-Run 驗證</b>",
             f"狀態：<b>{'已啟用' if self._settings.mainnet_one_run_enabled else '未啟用'}</b>",
             f"交易對：<code>{escape(self._settings.mainnet_symbol)}</code>",
             f"策略：<code>{escape(self._settings.mainnet_strategy_label)}</code>",
             f"資金上限：<b>${self._settings.mainnet_equity_cap_usdc:.2f} USDC</b>",
-            f"名目/槓桿：<b>${self._settings.mainnet_initial_notional_usdc:.2f}</b> / <b>{self._settings.mainnet_leverage}x</b>",
+            f"單筆名目/槓桿：<b>${entry_notional:.2f}</b> / <b>{self._settings.mainnet_leverage}x</b>",
+            f"預估保證金：<b>${entry_margin:.4f} USDC</b>",
             "",
             "訊號仍會照常推送；按下啟動後，只會把下一個符合條件的 wildcat 訊號接成一個自動 run。",
         ]
@@ -106,8 +109,8 @@ class MainnetOneRunManager:
             "symbol": self._settings.mainnet_symbol,
             "strategy": self._settings.mainnet_strategy_label,
             "equity_cap_usdc": self._settings.mainnet_equity_cap_usdc,
-            "initial_notional_usdc": self._settings.mainnet_initial_notional_usdc,
-            "max_cumulative_notional_usdc": self._settings.mainnet_max_cumulative_notional_usdc,
+            "initial_notional_usdc": self._settings.mainnet_effective_entry_notional_usdc,
+            "max_cumulative_notional_usdc": self._settings.mainnet_effective_max_cumulative_notional_usdc,
             "leverage": self._settings.mainnet_leverage,
             "maker_first": True,
         }
@@ -175,7 +178,7 @@ class MainnetOneRunManager:
         decision = generate_wildcat_v2_adverse_guard_live_decision(
             candles,
             target_daily_usdc=self._settings.mainnet_equity_cap_usdc * 0.03,
-            notional_usdc=self._settings.mainnet_initial_notional_usdc,
+            notional_usdc=self._settings.mainnet_effective_entry_notional_usdc,
             leverage=self._settings.mainnet_leverage,
         )
         if decision is None:
@@ -252,7 +255,9 @@ class MainnetOneRunManager:
             reason = "TP" if self._hit_tp(side, mark, tp_price) else "SL"
             await self._close_position(symbol, close_side, qty, reason, run)
             return
-        unrealized_loss_limit = -float(run.get("cumulative_notional_usdc") or self._settings.mainnet_initial_notional_usdc) * self._settings.mainnet_adverse_exit_loss_pct
+        unrealized_loss_limit = -float(
+            run.get("cumulative_notional_usdc") or self._settings.mainnet_effective_entry_notional_usdc
+        ) * self._settings.mainnet_adverse_exit_loss_pct
         if run_age_bars >= self._settings.mainnet_adverse_exit_bars and position.unrealized_pnl <= unrealized_loss_limit:
             await self._close_position(symbol, close_side, qty, "ADVERSE_EXIT", run)
             return
@@ -264,9 +269,10 @@ class MainnetOneRunManager:
         await self._ensure_fee_guard(run["symbol"])
         await self._client.set_leverage(run["symbol"], self._settings.mainnet_leverage)
         side = "BUY" if decision.side == "LONG" else "SELL"
+        entry_notional = self._settings.mainnet_effective_entry_notional_usdc
         qty = await self._client.format_quantity(
             run["symbol"],
-            self._settings.mainnet_initial_notional_usdc / decision.signal.price,
+            entry_notional / decision.signal.price,
         )
         price = await self._passive_price(run["symbol"], side, decision.signal.price)
         client_order_id = f"{run['run_id']}_entry"
@@ -306,7 +312,7 @@ class MainnetOneRunManager:
             entry_order_id=int(order.get("orderId", 0) or 0),
             entry_client_order_id=client_order_id,
             entry_price=float(price),
-            cumulative_notional_usdc=self._settings.mainnet_initial_notional_usdc,
+            cumulative_notional_usdc=entry_notional,
         )
         await self._repo.log_event(run["run_id"], "entry_placed", {"order": order, "signal": payload})
         await self._notify(
@@ -393,8 +399,9 @@ class MainnetOneRunManager:
         count = self._recovery_counts.get(run["run_id"], 0)
         if count >= self._settings.mainnet_recovery_steps:
             return False
-        cumulative = float(run.get("cumulative_notional_usdc") or self._settings.mainnet_initial_notional_usdc)
-        if cumulative + self._settings.mainnet_initial_notional_usdc > self._settings.mainnet_max_cumulative_notional_usdc:
+        entry_notional = self._settings.mainnet_effective_entry_notional_usdc
+        cumulative = float(run.get("cumulative_notional_usdc") or entry_notional)
+        if cumulative + entry_notional > self._settings.mainnet_effective_max_cumulative_notional_usdc:
             return False
         trigger_pct = self._settings.mainnet_recovery_trigger_pct * (count + 1)
         if position.position_direction == "LONG":
@@ -410,7 +417,7 @@ class MainnetOneRunManager:
             return False
         qty = await self._client.format_quantity(
             position.symbol,
-            self._settings.mainnet_initial_notional_usdc / max(position.mark_price, 1e-9),
+            entry_notional / max(position.mark_price, 1e-9),
         )
         price = await self._passive_price(position.symbol, side, position.mark_price)
         order = await self._client.create_post_only_limit_order(
@@ -421,7 +428,7 @@ class MainnetOneRunManager:
             client_order_id=f"{run['run_id']}_dca{count + 1}",
         )
         self._recovery_counts[run["run_id"]] = count + 1
-        await self._repo.update_run(run["run_id"], cumulative_notional_usdc=cumulative + self._settings.mainnet_initial_notional_usdc)
+        await self._repo.update_run(run["run_id"], cumulative_notional_usdc=cumulative + entry_notional)
         await self._repo.log_event(run["run_id"], "recovery_entry_placed", {"order": order, "signal": signal})
         await self._notify(f"🧩 Mainnet one-run 已掛 DCA maker 單 #{count + 1}：<code>{escape(run['run_id'])}</code>")
         return True
