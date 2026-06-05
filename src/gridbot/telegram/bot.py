@@ -39,6 +39,25 @@ from src.gridbot.utils.logging import get_logger
 logger = get_logger(__name__)
 
 
+async def post_init(application: Application) -> None:
+    from telegram import BotCommand
+    commands = [
+        BotCommand("signal", "即時策略訊號與子邏輯診斷"),
+        BotCommand("mainnet", "手動實盤 one-run 驗證與開單"),
+        BotCommand("testnet", "查看 Testnet 當前部位狀態"),
+        BotCommand("pnl", "查看今日/昨日交易損益"),
+        BotCommand("ai", "使用 Gemini 分析最新交易市況"),
+        BotCommand("pause", "暫停 Testnet 自動化調度器"),
+        BotCommand("resume", "恢復 Testnet 自動化調度器"),
+        BotCommand("help", "顯示所有功能命令清單"),
+    ]
+    try:
+        await application.bot.set_my_commands(commands)
+        logger.info("telegram_bot_commands_set_success")
+    except Exception as e:
+        logger.error("telegram_bot_commands_set_failed", error=str(e))
+
+
 def build_telegram_app(
     settings: Settings,
     binance_client: BinanceFuturesClient,
@@ -53,7 +72,7 @@ def build_telegram_app(
     if not settings.telegram_bot_token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN not configured")
 
-    app = Application.builder().token(settings.telegram_bot_token).build()
+    app = Application.builder().token(settings.telegram_bot_token).post_init(post_init).build()
 
     # Store shared state in bot_data
     app.bot_data["settings"] = settings
