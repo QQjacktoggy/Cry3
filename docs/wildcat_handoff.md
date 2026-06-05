@@ -214,6 +214,7 @@ Interpretation:
 Rolling report:
 
 - [reports/wildcat_30d_balanced_v1_rolling.json](/C:/Users/jack_shih/Desktop/cry3/reports/wildcat_30d_balanced_v1_rolling.json)
+- [reports/wildcat_30d_balanced_recent_compare.json](/C:/Users/jack_shih/Desktop/cry3/reports/wildcat_30d_balanced_recent_compare.json)
 
 Using the last 60 complete Taiwan days:
 
@@ -231,6 +232,74 @@ Interpretation:
 - `wildcat_30d_balanced_v1` passes the latest single 30-day validation window.
 - It does **not** yet generalize well across rolling windows.
 - Treat it as the current best balanced milestone, not as a fully robust final strategy.
+
+## Recent Rolling Comparison
+
+I also ran a smaller recent-window comparison over the last 45 complete Taiwan days, using rolling 30-day windows (`17` windows total) around `wildcat_30d_balanced_v1`.
+
+Best observed result in that local neighborhood was still the base preset:
+
+- `wildcat_30d_balanced_v1`: `5 / 17` windows met `avg>=20 and MaxDD<=30`
+
+Nearby tweaks such as:
+
+- tighter giveback
+- tighter floor lock
+- slightly longer hold
+- larger partial exit
+- slightly looser/tighter S5 thresholds
+
+did not improve the recent rolling hit count beyond the base preset in that local search.
+
+## Wildcat V2 Adverse Guard
+
+New preset:
+
+- `wildcat_v2_adverse_guard`
+
+The first attempted v2 regime guard was too restrictive and killed S1 frequency. The useful structural improvement was instead an early adverse-exit guard:
+
+- if a position is still open after `10` bars
+- and unrealized loss is worse than `0.0007` of current notional
+- close early as `ADVERSE_EXIT`
+
+Command:
+
+```powershell
+python scripts\backtest_wildcat_s1s5.py --preset wildcat_v2_adverse_guard --align-taipei-days --days 30 --target-daily-usdc 20 --json-output reports\wildcat_v2_adverse_guard_30d_aligned.json
+```
+
+Latest 30-day result:
+
+- Avg: `22.8601 USDC/day`
+- MaxDD: `29.0570 USDC`
+- Total PnL: `+685.8035 USDC`
+- Hit days `>=20`: `18/30`
+- Worst day: `+2.2160 USDC`
+
+Rolling report:
+
+- [reports/wildcat_v2_adverse_guard_rolling.json](/C:/Users/jack_shih/Desktop/cry3/reports/wildcat_v2_adverse_guard_rolling.json)
+
+Using the last 60 complete Taiwan days:
+
+- Rolling 7d windows: `55`
+  - avg of avg daily pnl: `22.4888`
+  - avg max drawdown: `22.6269`
+  - max rolling 7d drawdown: `29.9272`
+  - windows meeting `avg>=20 and MaxDD<=30`: `36 / 55`
+- Rolling 30d windows: `32`
+  - avg of avg daily pnl: `21.1783`
+  - avg max drawdown: `29.5234`
+  - max rolling 30d drawdown: `29.9272`
+  - windows meeting `avg>=20 and MaxDD<=30`: `26 / 32`
+
+Interpretation:
+
+- This is a clear improvement over `wildcat_30d_balanced_v1`.
+- Rolling 30d hit rate improved from `5 / 32` to `26 / 32`.
+- Every rolling 30d window stayed below `MaxDD <= 30`.
+- Remaining weakness is avg: the weakest rolling 30d avg is `19.6811`, just under the `20` line.
 
 ## Preset Parameters
 

@@ -96,6 +96,17 @@ class WildcatParams:
     rescue_rsi_short_min: float = 44.0
     allow_duplicate_layers: bool = False
     max_duplicate_layers: int = 1
+    regime_guard_enabled: bool = False
+    s1_max_trend_share_60: float = 0.62
+    s1_max_vwap_slope_atr: float = 0.18
+    s1_max_ema_spread_atr: float = 0.85
+    loss_cluster_guard_enabled: bool = False
+    loss_cluster_window_bars: int = 240
+    loss_cluster_limit: int = 2
+    loss_cluster_cooldown_bars: int = 90
+    adverse_exit_enabled: bool = False
+    adverse_exit_bars: int = 10
+    adverse_exit_loss_pct: float = 0.0009
 
 
 @dataclass
@@ -162,11 +173,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--focused-preset",
-        choices=["wildcat_converged_v1", "wildcat_30d_balanced_v1"],
+        choices=["wildcat_converged_v1", "wildcat_30d_balanced_v1", "wildcat_v2_regime_guard", "wildcat_v2_adverse_guard"],
         default=None,
         help="Search only local DD/weak-day refinements around a named preset.",
     )
-    parser.add_argument("--preset", choices=["wildcat_converged_v1", "wildcat_30d_balanced_v1"], default=None, help="Run a fixed named wildcat preset instead of searching variants.")
+    parser.add_argument("--preset", choices=["wildcat_converged_v1", "wildcat_30d_balanced_v1", "wildcat_v2_regime_guard", "wildcat_v2_adverse_guard"], default=None, help="Run a fixed named wildcat preset instead of searching variants.")
     parser.add_argument("--json-output", default=None, help="Optional report path. Defaults to reports/wildcat_s1s5_<days>d.json")
     parser.add_argument("--dump-trades", action="store_true", help="Include all trades in the JSON artifact for deeper analysis.")
     args = parser.parse_args()
@@ -437,6 +448,130 @@ def preset_params(
             rescue_rsi_short_min=40.0,
             allow_duplicate_layers=False,
             max_duplicate_layers=1,
+        ),
+        "wildcat_v2_regime_guard": WildcatParams(
+            label="wildcat_v2_regime_guard",
+            s1_tp=0.0012,
+            s1_sl=0.0018,
+            s2_tp=0.0028,
+            s2_sl=0.0015,
+            s3_tp=0.0026,
+            s3_sl=0.0016,
+            s4_tp=0.0035,
+            s4_sl=0.0013,
+            s5_tp=0.0018,
+            s5_sl=0.0014,
+            s1_rsi_long_max=38.0,
+            s1_rsi_short_min=62.0,
+            s5_long_d_max=31.0,
+            s5_short_d_min=69.0,
+            range_edge_atr_margin=0.20,
+            min_vol_ratio=0.22,
+            strict_body_ratio=0.12,
+            breakout_vol_ratio=1.25,
+            breakout_body_ratio=0.24,
+            breakout_atr_margin=0.08,
+            cooldown_bars=5,
+            max_holding_bars=20,
+            entry_fee_rate=0.0,
+            tp_exit_fee_rate=0.0,
+            sl_exit_fee_rate=0.0,
+            target_daily_usdc=target_daily_usdc,
+            leverage_options=leverage_options,
+            enabled_strategies=("S1_BB_RSI", "S5_Stoch"),
+            score_floor=0.0,
+            max_open_positions=2,
+            recovery_enabled=True,
+            recovery_steps=3,
+            recovery_trigger_pct=0.0009,
+            recovery_notional_scale=1.0,
+            recovery_tp_shrink=0.45,
+            partial_exit_pct=0.40,
+            partial_tp_pct=0.0005,
+            daily_target_stop=True,
+            daily_profit_target_usdc=40.0,
+            daily_floor_lock_usdc=24.0,
+            daily_giveback_usdc=4.0,
+            catchup_enabled=True,
+            catchup_start_hour=12,
+            catchup_vwap_atr=0.18,
+            catchup_rsi_long_max=52.0,
+            catchup_rsi_short_min=48.0,
+            rescue_hour=14,
+            rescue_vwap_atr=0.06,
+            rescue_rsi_long_max=60.0,
+            rescue_rsi_short_min=40.0,
+            allow_duplicate_layers=False,
+            max_duplicate_layers=1,
+            regime_guard_enabled=True,
+            s1_max_trend_share_60=0.58,
+            s1_max_vwap_slope_atr=0.14,
+            s1_max_ema_spread_atr=0.72,
+            loss_cluster_guard_enabled=True,
+            loss_cluster_window_bars=240,
+            loss_cluster_limit=2,
+            loss_cluster_cooldown_bars=100,
+            adverse_exit_enabled=True,
+            adverse_exit_bars=10,
+            adverse_exit_loss_pct=0.0008,
+        ),
+        "wildcat_v2_adverse_guard": WildcatParams(
+            label="wildcat_v2_adverse_guard",
+            s1_tp=0.0012,
+            s1_sl=0.0018,
+            s2_tp=0.0028,
+            s2_sl=0.0015,
+            s3_tp=0.0026,
+            s3_sl=0.0016,
+            s4_tp=0.0035,
+            s4_sl=0.0013,
+            s5_tp=0.0018,
+            s5_sl=0.0014,
+            s1_rsi_long_max=38.0,
+            s1_rsi_short_min=62.0,
+            s5_long_d_max=31.0,
+            s5_short_d_min=69.0,
+            range_edge_atr_margin=0.20,
+            min_vol_ratio=0.22,
+            strict_body_ratio=0.12,
+            breakout_vol_ratio=1.25,
+            breakout_body_ratio=0.24,
+            breakout_atr_margin=0.08,
+            cooldown_bars=5,
+            max_holding_bars=20,
+            entry_fee_rate=0.0,
+            tp_exit_fee_rate=0.0,
+            sl_exit_fee_rate=0.0,
+            target_daily_usdc=target_daily_usdc,
+            leverage_options=leverage_options,
+            enabled_strategies=("S1_BB_RSI", "S5_Stoch"),
+            score_floor=0.0,
+            max_open_positions=2,
+            recovery_enabled=True,
+            recovery_steps=3,
+            recovery_trigger_pct=0.0009,
+            recovery_notional_scale=1.0,
+            recovery_tp_shrink=0.45,
+            partial_exit_pct=0.40,
+            partial_tp_pct=0.0005,
+            daily_target_stop=True,
+            daily_profit_target_usdc=40.0,
+            daily_floor_lock_usdc=24.0,
+            daily_giveback_usdc=4.0,
+            catchup_enabled=True,
+            catchup_start_hour=12,
+            catchup_vwap_atr=0.18,
+            catchup_rsi_long_max=52.0,
+            catchup_rsi_short_min=48.0,
+            rescue_hour=14,
+            rescue_vwap_atr=0.06,
+            rescue_rsi_long_max=60.0,
+            rescue_rsi_short_min=40.0,
+            allow_duplicate_layers=False,
+            max_duplicate_layers=1,
+            adverse_exit_enabled=True,
+            adverse_exit_bars=10,
+            adverse_exit_loss_pct=0.0007,
         ),
     }
     if name not in presets:
@@ -768,6 +903,8 @@ def run_backtest(
         "S5_Stoch": RollingWinRate(20, 0.34),
     }
     cooldown_until = {key: 0 for key in STRATEGIES}
+    side_cooldown_until = {(strategy, side): 0 for strategy in STRATEGIES for side in ("LONG", "SHORT")}
+    bad_exit_indices: dict[tuple[str, str], list[int]] = {(strategy, side): [] for strategy in STRATEGIES for side in ("LONG", "SHORT")}
     trades: list[dict] = []
     positions: list[Position] = []
     rejected: dict[str, int] = {}
@@ -787,8 +924,16 @@ def run_backtest(
                 daily_pnl_state[day_key] = daily_pnl_state.get(day_key, 0.0) + exit_trade["pnl"]
                 daily_peak_state[day_key] = max(daily_peak_state.get(day_key, 0.0), daily_pnl_state[day_key])
                 rolling[position.strategy].record(exit_trade["pnl"] > 0)
-                if exit_trade["exit_reason"] in {"SL", "MAX_HOLD_LOSS"}:
+                if exit_trade["exit_reason"] in {"SL", "MAX_HOLD_LOSS", "ADVERSE_EXIT"}:
                     cooldown_until[position.strategy] = i + params.cooldown_bars
+                    if params.loss_cluster_guard_enabled:
+                        key = (position.strategy, position.side)
+                        window_start = i - params.loss_cluster_window_bars
+                        bad_exit_indices[key] = [idx for idx in bad_exit_indices[key] if idx >= window_start]
+                        bad_exit_indices[key].append(i)
+                        if len(bad_exit_indices[key]) >= params.loss_cluster_limit:
+                            side_cooldown_until[key] = i + params.loss_cluster_cooldown_bars
+                            rejected["loss_cluster_cooldown_set"] = rejected.get("loss_cluster_cooldown_set", 0) + 1
             else:
                 next_positions.append(position)
         positions = next_positions
@@ -824,6 +969,9 @@ def run_backtest(
                 continue
             if i < cooldown_until[candidate.strategy]:
                 rejected["cooldown"] = rejected.get("cooldown", 0) + 1
+                continue
+            if i < side_cooldown_until[(candidate.strategy, candidate.side)]:
+                rejected["loss_cluster_cooldown"] = rejected.get("loss_cluster_cooldown", 0) + 1
                 continue
             if params.rolling_gate and not rolling[candidate.strategy].allow():
                 rejected["rolling_wr"] = rejected.get("rolling_wr", 0) + 1
@@ -883,11 +1031,24 @@ def build_features(candles: list[dict]) -> dict:
         elif prices[i] < ema_trend[i] and slope < -0.06:
             trend[i] = "down"
 
+    vwap_slope_atr = [0.0] * len(candles)
+    ema_spread_atr = [0.0] * len(candles)
+    trend_share_60 = [0.0] * len(candles)
+    for i in range(60, len(candles)):
+        atr_val = atr[i] if atr[i] and atr[i] > 0 else 1.0
+        vwap_slope_atr[i] = abs(vwap[i] - vwap[i - 20]) / atr_val
+        ema_spread_atr[i] = abs(ema_fast[i] - ema_slow[i]) / atr_val
+        recent_trends = trend[i - 59 : i + 1]
+        trend_share_60[i] = sum(1 for state in recent_trends if state in {"up", "down"}) / len(recent_trends)
+
     return {
         "prices": prices,
         "atr": atr,
         "atr_pct": atr_pct,
         "trend": trend,
+        "vwap_slope_atr": vwap_slope_atr,
+        "ema_spread_atr": ema_spread_atr,
+        "trend_share_60": trend_share_60,
         "ema_fast": ema_fast,
         "ema_slow": ema_slow,
         "ema_trend": ema_trend,
@@ -931,7 +1092,9 @@ def build_candidates(
         tp_adj, sl_adj = adaptive_offsets(tp, sl, side, vol_state, trend, params)
         candidates.append(Candidate(strategy, side, score + hour_boost, tp_adj, sl_adj, reasons))
 
-    if trend == "range" and vol_state in {"low", "normal"} and vol_ratio >= params.min_vol_ratio and body_ratio >= params.strict_body_ratio:
+    s1_allowed = s1_regime_allowed(f, i, params)
+
+    if s1_allowed and trend == "range" and vol_state in {"low", "normal"} and vol_ratio >= params.min_vol_ratio and body_ratio >= params.strict_body_ratio:
         if price <= f["bb_lower"][i] + params.range_edge_atr_margin * atr_val and f["rsi"][i] <= params.s1_rsi_long_max:
             stretch = max(0.0, (f["bb_lower"][i] - price) / atr_val)
             relax_penalty = max(0.0, f["rsi"][i] - 32) * 0.35 + params.range_edge_atr_margin * 14
@@ -977,7 +1140,7 @@ def build_candidates(
             relax_penalty = max(0.0, 76 - f["stoch_d"][i]) * 0.3 + params.range_edge_atr_margin * 10
             add("S5_Stoch", "SHORT", 66 + (max(f["stoch_d"][i], 76) - 76) * 0.5 - relax_penalty, params.s5_tp, params.s5_sl, ["stoch_cross_down", "range_reversion"])
 
-    if catchup and vol_ratio >= params.min_vol_ratio * 0.45 and body_ratio >= max(0.04, params.strict_body_ratio * 0.45):
+    if catchup and s1_allowed and vol_ratio >= params.min_vol_ratio * 0.45 and body_ratio >= max(0.04, params.strict_body_ratio * 0.45):
         vwap_atr = params.rescue_vwap_atr if rescue else params.catchup_vwap_atr
         rsi_long_max = params.rescue_rsi_long_max if rescue else params.catchup_rsi_long_max
         rsi_short_min = params.rescue_rsi_short_min if rescue else params.catchup_rsi_short_min
@@ -1003,6 +1166,16 @@ def build_candidates(
             )
 
     return candidates
+
+
+def s1_regime_allowed(f: dict, i: int, params: WildcatParams) -> bool:
+    if not params.regime_guard_enabled:
+        return True
+    return (
+        f["trend_share_60"][i] <= params.s1_max_trend_share_60
+        and f["vwap_slope_atr"][i] <= params.s1_max_vwap_slope_atr
+        and f["ema_spread_atr"][i] <= params.s1_max_ema_spread_atr
+    )
 
 
 def adaptive_offsets(tp: float, sl: float, side: str, vol: str, trend: str, params: WildcatParams) -> tuple[float, float]:
@@ -1056,6 +1229,12 @@ def maybe_exit(candle: dict, c_time: datetime, i: int, pos: Position, params: Wi
             return close_trade(c_time, i, pos, pos.sl_price, params.sl_exit_fee_rate, "SL")
         if candle["low"] <= pos.tp_price:
             return close_trade(c_time, i, pos, pos.tp_price, params.tp_exit_fee_rate, "TP")
+    if (
+        params.adverse_exit_enabled
+        and i - pos.entry_index >= params.adverse_exit_bars
+        and unrealized_pnl(candle["close"], pos) <= -pos.notional_usdc * params.adverse_exit_loss_pct
+    ):
+        return close_trade(c_time, i, pos, candle["close"], params.sl_exit_fee_rate, "ADVERSE_EXIT")
     if i - pos.entry_index >= params.max_holding_bars:
         reason = "MAX_HOLD_WIN" if unrealized_pnl(candle["close"], pos) >= 0 else "MAX_HOLD_LOSS"
         return close_trade(c_time, i, pos, candle["close"], params.tp_exit_fee_rate, reason)

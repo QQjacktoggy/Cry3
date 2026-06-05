@@ -1,0 +1,1032 @@
+{
+  "generated_at": "2026-06-05T14:22:53.200143+08:00",
+  "source_days": 46,
+  "window_days": 30,
+  "window_count": 17,
+  "candidates": [
+    {
+      "label": "wildcat_30d_balanced_v1",
+      "meets30": 5,
+      "window_count": 17,
+      "avg_of_avg_daily": 18.8804,
+      "avg_of_max_drawdown": 41.7331,
+      "windows": [
+        {
+          "start": "2026-04-21",
+          "end": "2026-05-20",
+          "avg_daily_pnl_usdc": 18.3627,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-04-22",
+          "end": "2026-05-21",
+          "avg_daily_pnl_usdc": 18.6568,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-04-23",
+          "end": "2026-05-22",
+          "avg_daily_pnl_usdc": 18.1942,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-04-24",
+          "end": "2026-05-23",
+          "avg_daily_pnl_usdc": 17.9779,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-04-25",
+          "end": "2026-05-24",
+          "avg_daily_pnl_usdc": 17.6146,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-04-26",
+          "end": "2026-05-25",
+          "avg_daily_pnl_usdc": 17.3502,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-04-27",
+          "end": "2026-05-26",
+          "avg_daily_pnl_usdc": 16.8889,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-04-28",
+          "end": "2026-05-27",
+          "avg_daily_pnl_usdc": 17.7839,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-04-29",
+          "end": "2026-05-28",
+          "avg_daily_pnl_usdc": 18.5368,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-04-30",
+          "end": "2026-05-29",
+          "avg_daily_pnl_usdc": 18.5719,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-05-01",
+          "end": "2026-05-30",
+          "avg_daily_pnl_usdc": 18.3958,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-05-02",
+          "end": "2026-05-31",
+          "avg_daily_pnl_usdc": 19.7935,
+          "max_drawdown_usdc": 27.2349,
+          "met": false
+        },
+        {
+          "start": "2026-05-03",
+          "end": "2026-06-01",
+          "avg_daily_pnl_usdc": 20.2489,
+          "max_drawdown_usdc": 27.2349,
+          "met": true
+        },
+        {
+          "start": "2026-05-04",
+          "end": "2026-06-02",
+          "avg_daily_pnl_usdc": 20.484,
+          "max_drawdown_usdc": 27.2349,
+          "met": true
+        },
+        {
+          "start": "2026-05-05",
+          "end": "2026-06-03",
+          "avg_daily_pnl_usdc": 20.468,
+          "max_drawdown_usdc": 27.2349,
+          "met": true
+        },
+        {
+          "start": "2026-05-06",
+          "end": "2026-06-04",
+          "avg_daily_pnl_usdc": 21.0266,
+          "max_drawdown_usdc": 27.2349,
+          "met": true
+        },
+        {
+          "start": "2026-05-07",
+          "end": "2026-06-05",
+          "avg_daily_pnl_usdc": 20.6123,
+          "max_drawdown_usdc": 27.2349,
+          "met": true
+        }
+      ]
+    },
+    {
+      "label": "b_s5_32_68",
+      "meets30": 5,
+      "window_count": 17,
+      "avg_of_avg_daily": 18.8422,
+      "avg_of_max_drawdown": 41.7331,
+      "windows": [
+        {
+          "start": "2026-04-21",
+          "end": "2026-05-20",
+          "avg_daily_pnl_usdc": 18.1023,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-04-22",
+          "end": "2026-05-21",
+          "avg_daily_pnl_usdc": 18.3998,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-04-23",
+          "end": "2026-05-22",
+          "avg_daily_pnl_usdc": 18.1899,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-04-24",
+          "end": "2026-05-23",
+          "avg_daily_pnl_usdc": 17.973,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-04-25",
+          "end": "2026-05-24",
+          "avg_daily_pnl_usdc": 17.6097,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-04-26",
+          "end": "2026-05-25",
+          "avg_daily_pnl_usdc": 17.3452,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-04-27",
+          "end": "2026-05-26",
+          "avg_daily_pnl_usdc": 16.884,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-04-28",
+          "end": "2026-05-27",
+          "avg_daily_pnl_usdc": 17.779,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-04-29",
+          "end": "2026-05-28",
+          "avg_daily_pnl_usdc": 18.5319,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-04-30",
+          "end": "2026-05-29",
+          "avg_daily_pnl_usdc": 18.567,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-05-01",
+          "end": "2026-05-30",
+          "avg_daily_pnl_usdc": 18.4127,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-05-02",
+          "end": "2026-05-31",
+          "avg_daily_pnl_usdc": 19.7648,
+          "max_drawdown_usdc": 27.2349,
+          "met": false
+        },
+        {
+          "start": "2026-05-03",
+          "end": "2026-06-01",
+          "avg_daily_pnl_usdc": 20.2325,
+          "max_drawdown_usdc": 27.2349,
+          "met": true
+        },
+        {
+          "start": "2026-05-04",
+          "end": "2026-06-02",
+          "avg_daily_pnl_usdc": 20.4677,
+          "max_drawdown_usdc": 27.2349,
+          "met": true
+        },
+        {
+          "start": "2026-05-05",
+          "end": "2026-06-03",
+          "avg_daily_pnl_usdc": 20.4516,
+          "max_drawdown_usdc": 27.2349,
+          "met": true
+        },
+        {
+          "start": "2026-05-06",
+          "end": "2026-06-04",
+          "avg_daily_pnl_usdc": 21.0102,
+          "max_drawdown_usdc": 27.2349,
+          "met": true
+        },
+        {
+          "start": "2026-05-07",
+          "end": "2026-06-05",
+          "avg_daily_pnl_usdc": 20.5959,
+          "max_drawdown_usdc": 27.2349,
+          "met": true
+        }
+      ]
+    },
+    {
+      "label": "b_floor24_g3",
+      "meets30": 5,
+      "window_count": 17,
+      "avg_of_avg_daily": 18.4449,
+      "avg_of_max_drawdown": 41.7331,
+      "windows": [
+        {
+          "start": "2026-04-21",
+          "end": "2026-05-20",
+          "avg_daily_pnl_usdc": 17.7938,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-04-22",
+          "end": "2026-05-21",
+          "avg_daily_pnl_usdc": 18.0878,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-04-23",
+          "end": "2026-05-22",
+          "avg_daily_pnl_usdc": 17.7378,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-04-24",
+          "end": "2026-05-23",
+          "avg_daily_pnl_usdc": 17.3457,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-04-25",
+          "end": "2026-05-24",
+          "avg_daily_pnl_usdc": 16.9825,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-04-26",
+          "end": "2026-05-25",
+          "avg_daily_pnl_usdc": 16.718,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-04-27",
+          "end": "2026-05-26",
+          "avg_daily_pnl_usdc": 16.2567,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-04-28",
+          "end": "2026-05-27",
+          "avg_daily_pnl_usdc": 17.1517,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-04-29",
+          "end": "2026-05-28",
+          "avg_daily_pnl_usdc": 18.2348,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-04-30",
+          "end": "2026-05-29",
+          "avg_daily_pnl_usdc": 18.372,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-05-01",
+          "end": "2026-05-30",
+          "avg_daily_pnl_usdc": 18.1958,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-05-02",
+          "end": "2026-05-31",
+          "avg_daily_pnl_usdc": 19.5936,
+          "max_drawdown_usdc": 27.2349,
+          "met": false
+        },
+        {
+          "start": "2026-05-03",
+          "end": "2026-06-01",
+          "avg_daily_pnl_usdc": 20.0489,
+          "max_drawdown_usdc": 27.2349,
+          "met": true
+        },
+        {
+          "start": "2026-05-04",
+          "end": "2026-06-02",
+          "avg_daily_pnl_usdc": 20.2841,
+          "max_drawdown_usdc": 27.2349,
+          "met": true
+        },
+        {
+          "start": "2026-05-05",
+          "end": "2026-06-03",
+          "avg_daily_pnl_usdc": 20.268,
+          "max_drawdown_usdc": 27.2349,
+          "met": true
+        },
+        {
+          "start": "2026-05-06",
+          "end": "2026-06-04",
+          "avg_daily_pnl_usdc": 20.4535,
+          "max_drawdown_usdc": 27.2349,
+          "met": true
+        },
+        {
+          "start": "2026-05-07",
+          "end": "2026-06-05",
+          "avg_daily_pnl_usdc": 20.0392,
+          "max_drawdown_usdc": 27.2349,
+          "met": true
+        }
+      ]
+    },
+    {
+      "label": "b_s5_31_69_g3",
+      "meets30": 5,
+      "window_count": 17,
+      "avg_of_avg_daily": 18.4449,
+      "avg_of_max_drawdown": 41.7331,
+      "windows": [
+        {
+          "start": "2026-04-21",
+          "end": "2026-05-20",
+          "avg_daily_pnl_usdc": 17.7938,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-04-22",
+          "end": "2026-05-21",
+          "avg_daily_pnl_usdc": 18.0878,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-04-23",
+          "end": "2026-05-22",
+          "avg_daily_pnl_usdc": 17.7378,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-04-24",
+          "end": "2026-05-23",
+          "avg_daily_pnl_usdc": 17.3457,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-04-25",
+          "end": "2026-05-24",
+          "avg_daily_pnl_usdc": 16.9825,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-04-26",
+          "end": "2026-05-25",
+          "avg_daily_pnl_usdc": 16.718,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-04-27",
+          "end": "2026-05-26",
+          "avg_daily_pnl_usdc": 16.2567,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-04-28",
+          "end": "2026-05-27",
+          "avg_daily_pnl_usdc": 17.1517,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-04-29",
+          "end": "2026-05-28",
+          "avg_daily_pnl_usdc": 18.2348,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-04-30",
+          "end": "2026-05-29",
+          "avg_daily_pnl_usdc": 18.372,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-05-01",
+          "end": "2026-05-30",
+          "avg_daily_pnl_usdc": 18.1958,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-05-02",
+          "end": "2026-05-31",
+          "avg_daily_pnl_usdc": 19.5936,
+          "max_drawdown_usdc": 27.2349,
+          "met": false
+        },
+        {
+          "start": "2026-05-03",
+          "end": "2026-06-01",
+          "avg_daily_pnl_usdc": 20.0489,
+          "max_drawdown_usdc": 27.2349,
+          "met": true
+        },
+        {
+          "start": "2026-05-04",
+          "end": "2026-06-02",
+          "avg_daily_pnl_usdc": 20.2841,
+          "max_drawdown_usdc": 27.2349,
+          "met": true
+        },
+        {
+          "start": "2026-05-05",
+          "end": "2026-06-03",
+          "avg_daily_pnl_usdc": 20.268,
+          "max_drawdown_usdc": 27.2349,
+          "met": true
+        },
+        {
+          "start": "2026-05-06",
+          "end": "2026-06-04",
+          "avg_daily_pnl_usdc": 20.4535,
+          "max_drawdown_usdc": 27.2349,
+          "met": true
+        },
+        {
+          "start": "2026-05-07",
+          "end": "2026-06-05",
+          "avg_daily_pnl_usdc": 20.0392,
+          "max_drawdown_usdc": 27.2349,
+          "met": true
+        }
+      ]
+    },
+    {
+      "label": "b_p45",
+      "meets30": 0,
+      "window_count": 17,
+      "avg_of_avg_daily": 19.3092,
+      "avg_of_max_drawdown": 43.6848,
+      "windows": [
+        {
+          "start": "2026-04-21",
+          "end": "2026-05-20",
+          "avg_daily_pnl_usdc": 19.0,
+          "max_drawdown_usdc": 49.6008,
+          "met": false
+        },
+        {
+          "start": "2026-04-22",
+          "end": "2026-05-21",
+          "avg_daily_pnl_usdc": 19.3517,
+          "max_drawdown_usdc": 49.6008,
+          "met": false
+        },
+        {
+          "start": "2026-04-23",
+          "end": "2026-05-22",
+          "avg_daily_pnl_usdc": 18.8938,
+          "max_drawdown_usdc": 49.6008,
+          "met": false
+        },
+        {
+          "start": "2026-04-24",
+          "end": "2026-05-23",
+          "avg_daily_pnl_usdc": 18.661,
+          "max_drawdown_usdc": 49.6008,
+          "met": false
+        },
+        {
+          "start": "2026-04-25",
+          "end": "2026-05-24",
+          "avg_daily_pnl_usdc": 18.2444,
+          "max_drawdown_usdc": 49.6008,
+          "met": false
+        },
+        {
+          "start": "2026-04-26",
+          "end": "2026-05-25",
+          "avg_daily_pnl_usdc": 18.0006,
+          "max_drawdown_usdc": 49.6008,
+          "met": false
+        },
+        {
+          "start": "2026-04-27",
+          "end": "2026-05-26",
+          "avg_daily_pnl_usdc": 17.2741,
+          "max_drawdown_usdc": 49.6008,
+          "met": false
+        },
+        {
+          "start": "2026-04-28",
+          "end": "2026-05-27",
+          "avg_daily_pnl_usdc": 18.1521,
+          "max_drawdown_usdc": 49.6008,
+          "met": false
+        },
+        {
+          "start": "2026-04-29",
+          "end": "2026-05-28",
+          "avg_daily_pnl_usdc": 18.7349,
+          "max_drawdown_usdc": 49.6008,
+          "met": false
+        },
+        {
+          "start": "2026-04-30",
+          "end": "2026-05-29",
+          "avg_daily_pnl_usdc": 18.8753,
+          "max_drawdown_usdc": 49.6008,
+          "met": false
+        },
+        {
+          "start": "2026-05-01",
+          "end": "2026-05-30",
+          "avg_daily_pnl_usdc": 18.6636,
+          "max_drawdown_usdc": 49.6008,
+          "met": false
+        },
+        {
+          "start": "2026-05-02",
+          "end": "2026-05-31",
+          "avg_daily_pnl_usdc": 20.0405,
+          "max_drawdown_usdc": 32.8387,
+          "met": false
+        },
+        {
+          "start": "2026-05-03",
+          "end": "2026-06-01",
+          "avg_daily_pnl_usdc": 20.5613,
+          "max_drawdown_usdc": 32.8387,
+          "met": false
+        },
+        {
+          "start": "2026-05-04",
+          "end": "2026-06-02",
+          "avg_daily_pnl_usdc": 20.8504,
+          "max_drawdown_usdc": 32.8387,
+          "met": false
+        },
+        {
+          "start": "2026-05-05",
+          "end": "2026-06-03",
+          "avg_daily_pnl_usdc": 20.8384,
+          "max_drawdown_usdc": 32.8387,
+          "met": false
+        },
+        {
+          "start": "2026-05-06",
+          "end": "2026-06-04",
+          "avg_daily_pnl_usdc": 21.4028,
+          "max_drawdown_usdc": 32.8387,
+          "met": false
+        },
+        {
+          "start": "2026-05-07",
+          "end": "2026-06-05",
+          "avg_daily_pnl_usdc": 20.7108,
+          "max_drawdown_usdc": 32.8387,
+          "met": false
+        }
+      ]
+    },
+    {
+      "label": "b_floor25_g4",
+      "meets30": 0,
+      "window_count": 17,
+      "avg_of_avg_daily": 19.2759,
+      "avg_of_max_drawdown": 42.7352,
+      "windows": [
+        {
+          "start": "2026-04-21",
+          "end": "2026-05-20",
+          "avg_daily_pnl_usdc": 18.7296,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-04-22",
+          "end": "2026-05-21",
+          "avg_daily_pnl_usdc": 19.0236,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-04-23",
+          "end": "2026-05-22",
+          "avg_daily_pnl_usdc": 18.561,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-04-24",
+          "end": "2026-05-23",
+          "avg_daily_pnl_usdc": 18.3447,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-04-25",
+          "end": "2026-05-24",
+          "avg_daily_pnl_usdc": 17.9508,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-04-26",
+          "end": "2026-05-25",
+          "avg_daily_pnl_usdc": 17.6863,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-04-27",
+          "end": "2026-05-26",
+          "avg_daily_pnl_usdc": 17.225,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-04-28",
+          "end": "2026-05-27",
+          "avg_daily_pnl_usdc": 18.12,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-04-29",
+          "end": "2026-05-28",
+          "avg_daily_pnl_usdc": 18.8729,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-04-30",
+          "end": "2026-05-29",
+          "avg_daily_pnl_usdc": 19.0235,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-05-01",
+          "end": "2026-05-30",
+          "avg_daily_pnl_usdc": 18.857,
+          "max_drawdown_usdc": 49.6412,
+          "met": false
+        },
+        {
+          "start": "2026-05-02",
+          "end": "2026-05-31",
+          "avg_daily_pnl_usdc": 20.2548,
+          "max_drawdown_usdc": 30.0742,
+          "met": false
+        },
+        {
+          "start": "2026-05-03",
+          "end": "2026-06-01",
+          "avg_daily_pnl_usdc": 20.7102,
+          "max_drawdown_usdc": 30.0742,
+          "met": false
+        },
+        {
+          "start": "2026-05-04",
+          "end": "2026-06-02",
+          "avg_daily_pnl_usdc": 20.9453,
+          "max_drawdown_usdc": 30.0742,
+          "met": false
+        },
+        {
+          "start": "2026-05-05",
+          "end": "2026-06-03",
+          "avg_daily_pnl_usdc": 20.9292,
+          "max_drawdown_usdc": 30.0742,
+          "met": false
+        },
+        {
+          "start": "2026-05-06",
+          "end": "2026-06-04",
+          "avg_daily_pnl_usdc": 21.4879,
+          "max_drawdown_usdc": 30.0742,
+          "met": false
+        },
+        {
+          "start": "2026-05-07",
+          "end": "2026-06-05",
+          "avg_daily_pnl_usdc": 20.9683,
+          "max_drawdown_usdc": 30.0742,
+          "met": false
+        }
+      ]
+    },
+    {
+      "label": "b_hold21_floor25",
+      "meets30": 0,
+      "window_count": 17,
+      "avg_of_avg_daily": 18.3348,
+      "avg_of_max_drawdown": 45.8371,
+      "windows": [
+        {
+          "start": "2026-04-21",
+          "end": "2026-05-20",
+          "avg_daily_pnl_usdc": 18.7951,
+          "max_drawdown_usdc": 53.8495,
+          "met": false
+        },
+        {
+          "start": "2026-04-22",
+          "end": "2026-05-21",
+          "avg_daily_pnl_usdc": 19.0863,
+          "max_drawdown_usdc": 53.8495,
+          "met": false
+        },
+        {
+          "start": "2026-04-23",
+          "end": "2026-05-22",
+          "avg_daily_pnl_usdc": 18.4659,
+          "max_drawdown_usdc": 53.8495,
+          "met": false
+        },
+        {
+          "start": "2026-04-24",
+          "end": "2026-05-23",
+          "avg_daily_pnl_usdc": 18.0084,
+          "max_drawdown_usdc": 53.8495,
+          "met": false
+        },
+        {
+          "start": "2026-04-25",
+          "end": "2026-05-24",
+          "avg_daily_pnl_usdc": 17.6126,
+          "max_drawdown_usdc": 53.8495,
+          "met": false
+        },
+        {
+          "start": "2026-04-26",
+          "end": "2026-05-25",
+          "avg_daily_pnl_usdc": 17.149,
+          "max_drawdown_usdc": 53.8495,
+          "met": false
+        },
+        {
+          "start": "2026-04-27",
+          "end": "2026-05-26",
+          "avg_daily_pnl_usdc": 16.5201,
+          "max_drawdown_usdc": 53.8495,
+          "met": false
+        },
+        {
+          "start": "2026-04-28",
+          "end": "2026-05-27",
+          "avg_daily_pnl_usdc": 17.056,
+          "max_drawdown_usdc": 53.8495,
+          "met": false
+        },
+        {
+          "start": "2026-04-29",
+          "end": "2026-05-28",
+          "avg_daily_pnl_usdc": 17.5419,
+          "max_drawdown_usdc": 53.8495,
+          "met": false
+        },
+        {
+          "start": "2026-04-30",
+          "end": "2026-05-29",
+          "avg_daily_pnl_usdc": 17.7124,
+          "max_drawdown_usdc": 53.8495,
+          "met": false
+        },
+        {
+          "start": "2026-05-01",
+          "end": "2026-05-30",
+          "avg_daily_pnl_usdc": 17.538,
+          "max_drawdown_usdc": 53.8495,
+          "met": false
+        },
+        {
+          "start": "2026-05-02",
+          "end": "2026-05-31",
+          "avg_daily_pnl_usdc": 19.156,
+          "max_drawdown_usdc": 31.1319,
+          "met": false
+        },
+        {
+          "start": "2026-05-03",
+          "end": "2026-06-01",
+          "avg_daily_pnl_usdc": 19.3533,
+          "max_drawdown_usdc": 31.1319,
+          "met": false
+        },
+        {
+          "start": "2026-05-04",
+          "end": "2026-06-02",
+          "avg_daily_pnl_usdc": 19.5912,
+          "max_drawdown_usdc": 31.1319,
+          "met": false
+        },
+        {
+          "start": "2026-05-05",
+          "end": "2026-06-03",
+          "avg_daily_pnl_usdc": 19.5301,
+          "max_drawdown_usdc": 31.1319,
+          "met": false
+        },
+        {
+          "start": "2026-05-06",
+          "end": "2026-06-04",
+          "avg_daily_pnl_usdc": 19.9804,
+          "max_drawdown_usdc": 31.1319,
+          "met": false
+        },
+        {
+          "start": "2026-05-07",
+          "end": "2026-06-05",
+          "avg_daily_pnl_usdc": 18.595,
+          "max_drawdown_usdc": 31.2263,
+          "met": false
+        }
+      ]
+    },
+    {
+      "label": "b_hold21",
+      "meets30": 0,
+      "window_count": 17,
+      "avg_of_avg_daily": 18.0922,
+      "avg_of_max_drawdown": 45.8371,
+      "windows": [
+        {
+          "start": "2026-04-21",
+          "end": "2026-05-20",
+          "avg_daily_pnl_usdc": 18.5264,
+          "max_drawdown_usdc": 53.8495,
+          "met": false
+        },
+        {
+          "start": "2026-04-22",
+          "end": "2026-05-21",
+          "avg_daily_pnl_usdc": 18.8176,
+          "max_drawdown_usdc": 53.8495,
+          "met": false
+        },
+        {
+          "start": "2026-04-23",
+          "end": "2026-05-22",
+          "avg_daily_pnl_usdc": 18.1972,
+          "max_drawdown_usdc": 53.8495,
+          "met": false
+        },
+        {
+          "start": "2026-04-24",
+          "end": "2026-05-23",
+          "avg_daily_pnl_usdc": 17.7397,
+          "max_drawdown_usdc": 53.8495,
+          "met": false
+        },
+        {
+          "start": "2026-04-25",
+          "end": "2026-05-24",
+          "avg_daily_pnl_usdc": 17.3439,
+          "max_drawdown_usdc": 53.8495,
+          "met": false
+        },
+        {
+          "start": "2026-04-26",
+          "end": "2026-05-25",
+          "avg_daily_pnl_usdc": 16.8802,
+          "max_drawdown_usdc": 53.8495,
+          "met": false
+        },
+        {
+          "start": "2026-04-27",
+          "end": "2026-05-26",
+          "avg_daily_pnl_usdc": 16.2514,
+          "max_drawdown_usdc": 53.8495,
+          "met": false
+        },
+        {
+          "start": "2026-04-28",
+          "end": "2026-05-27",
+          "avg_daily_pnl_usdc": 17.0254,
+          "max_drawdown_usdc": 53.8495,
+          "met": false
+        },
+        {
+          "start": "2026-04-29",
+          "end": "2026-05-28",
+          "avg_daily_pnl_usdc": 17.2732,
+          "max_drawdown_usdc": 53.8495,
+          "met": false
+        },
+        {
+          "start": "2026-04-30",
+          "end": "2026-05-29",
+          "avg_daily_pnl_usdc": 17.4437,
+          "max_drawdown_usdc": 53.8495,
+          "met": false
+        },
+        {
+          "start": "2026-05-01",
+          "end": "2026-05-30",
+          "avg_daily_pnl_usdc": 17.2693,
+          "max_drawdown_usdc": 53.8495,
+          "met": false
+        },
+        {
+          "start": "2026-05-02",
+          "end": "2026-05-31",
+          "avg_daily_pnl_usdc": 18.8873,
+          "max_drawdown_usdc": 31.1319,
+          "met": false
+        },
+        {
+          "start": "2026-05-03",
+          "end": "2026-06-01",
+          "avg_daily_pnl_usdc": 19.0686,
+          "max_drawdown_usdc": 31.1319,
+          "met": false
+        },
+        {
+          "start": "2026-05-04",
+          "end": "2026-06-02",
+          "avg_daily_pnl_usdc": 19.3066,
+          "max_drawdown_usdc": 31.1319,
+          "met": false
+        },
+        {
+          "start": "2026-05-05",
+          "end": "2026-06-03",
+          "avg_daily_pnl_usdc": 19.2454,
+          "max_drawdown_usdc": 31.1319,
+          "met": false
+        },
+        {
+          "start": "2026-05-06",
+          "end": "2026-06-04",
+          "avg_daily_pnl_usdc": 19.6957,
+          "max_drawdown_usdc": 31.1319,
+          "met": false
+        },
+        {
+          "start": "2026-05-07",
+          "end": "2026-06-05",
+          "avg_daily_pnl_usdc": 18.595,
+          "max_drawdown_usdc": 31.2263,
+          "met": false
+        }
+      ]
+    }
+  ]
+}
