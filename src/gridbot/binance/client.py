@@ -251,6 +251,8 @@ class BinanceFuturesClient:
         quantity: float | str,
         price: float,
         client_order_id: str | None = None,
+        post_only: bool = False,
+        position_side: str | None = None,
     ) -> dict:
         """POST /fapi/v1/order — reduce-only limit order."""
         tick_size = await self._price_tick_size(symbol)
@@ -258,11 +260,15 @@ class BinanceFuturesClient:
             "symbol": symbol,
             "side": side,
             "type": "LIMIT",
-            "timeInForce": "GTC",
+            "timeInForce": "GTX" if post_only else "GTC",
             "quantity": quantity,
             "price": _format_tick_price(price, tick_size),
-            "reduceOnly": "true",
         }
+        hedge_position_side = position_side if position_side in {"LONG", "SHORT"} else None
+        if hedge_position_side:
+            params["positionSide"] = hedge_position_side
+        else:
+            params["reduceOnly"] = "true"
         if client_order_id:
             params["newClientOrderId"] = client_order_id
         return await self.client.futures_create_order(**params)
