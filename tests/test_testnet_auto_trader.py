@@ -117,17 +117,24 @@ class FakeClient:
         return order
 
 
+class FakeMessage:
+    def __init__(self, message_id=456):
+        self.message_id = message_id
+
+
 class FakeBot:
     def __init__(self):
         self.messages = []
 
     async def send_message(self, **kwargs):
         self.messages.append(kwargs)
+        return FakeMessage()
 
 
 class FakeTelegramApp:
     def __init__(self):
         self.bot = FakeBot()
+        self.bot_data = {}
 
 
 def _settings(**kwargs):
@@ -256,6 +263,72 @@ async def test_auto_trader_high_return_label_uses_high_return_live_wrapper(monke
     assert "Testnet 高報酬 Router 原始 Entry 掛單" in telegram.bot.messages[0]["text"]
     assert "策略：<b>orb_long</b>" in telegram.bot.messages[0]["text"]
     assert "ETHUSDC" in trader._pending_entries
+
+
+@pytest.mark.asyncio
+async def test_auto_trader_wildcat_label_uses_wildcat_live_wrapper(monkeypatch):
+    client = FakeClient()
+    telegram = FakeTelegramApp()
+    trader = TestnetAutoTrader(
+        _settings(
+            testnet_strategy_label="wildcat_v2_adverse_guard",
+            testnet_telegram_signal_only=True,
+            testnet_order_notional_usdc=300,
+            testnet_order_leverage=10,
+        ),
+        client,
+        telegram,
+    )
+
+    from src.gridbot.strategy.wildcat_live import WildcatLiveDecision
+
+    def fake_wildcat_signal(candles, *, today_pnl_usdc=0.0, today_peak_usdc=None, target_daily_usdc=20.0, notional_usdc=1000.0, leverage=75):
+        signal = SignalPlan(
+            action="PLAN_LONG",
+            confidence=90,
+            score=90,
+            symbol="ETHUSDC",
+            price=2100,
+            rsi=45,
+            atr=25,
+            support=2050,
+            vwap=2090,
+            entries=[2100],
+            stop_loss=2070,
+            take_profits=[2150],
+            planned_notional_usdc=notional_usdc,
+            leverage_cap=leverage,
+            reasons=["wildcat S1 trigger"],
+        )
+        return WildcatLiveDecision(
+            signal=signal,
+            strategy="wildcat_v2_adverse_guard",
+            side="long",
+            tp_pct=0.03,
+            sl_pct=0.03,
+            partial_exit_pct=0.5,
+            partial_tp_pct=0.015,
+            recovery_steps=2,
+            recovery_trigger_pct=0.01,
+            recovery_tp_shrink=0.5,
+            adverse_exit_bars=12,
+            adverse_exit_loss_pct=0.01,
+            max_holding_bars=24,
+            params_label="wildcat_regime",
+        )
+
+    monkeypatch.setattr(
+        "src.gridbot.strategy.wildcat_live.generate_wildcat_v2_adverse_guard_live_decision",
+        fake_wildcat_signal,
+    )
+
+    await trader.run_cycle()
+
+    # Under signal_only, no orders are actually placed, but a telegram alert is sent
+    assert len(client.orders) == 0
+    assert telegram.bot.messages
+    assert "做多訊號" in telegram.bot.messages[0]["text"]
+    assert "策略：<b>wildcat_v2_adverse_guard</b>" in telegram.bot.messages[0]["text"]
 
 
 @pytest.mark.asyncio

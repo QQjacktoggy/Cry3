@@ -933,6 +933,50 @@ class TestnetAutoTrader:
         candles: list[Candle],
         today_net: float,
     ) -> LiveDecisionContext:
+        if self._settings.testnet_strategy_label == "wildcat_v2_adverse_guard":
+            from src.gridbot.strategy.wildcat_live import generate_wildcat_v2_adverse_guard_live_decision
+            decision = generate_wildcat_v2_adverse_guard_live_decision(
+                candles=candles,
+                today_pnl_usdc=today_net,
+                target_daily_usdc=self._settings.testnet_equity_usdc * 0.03,
+                notional_usdc=self._settings.testnet_order_notional_usdc,
+                leverage=self._settings.testnet_order_leverage,
+            )
+            if decision is None:
+                return LiveDecisionContext(
+                    signal=SignalPlan(
+                        action="WAIT",
+                        confidence=0,
+                        score=0,
+                        symbol=symbol,
+                        price=candles[-1].close,
+                        rsi=None,
+                        atr=None,
+                        support=None,
+                        vwap=None,
+                        reasons=["wildcat: no active signal (S1 BB/RSI and S5 Stoch inactive or not triggered)"],
+                    ),
+                    strategy="wildcat_wait",
+                    regime="blocked",
+                    risk_mode="blocked",
+                    market_playbook="blocked",
+                    allocator_state="blocked",
+                    allocator_profile="blocked",
+                    allocator_scale=0.0,
+                    max_holding_bars=0,
+                )
+            return LiveDecisionContext(
+                signal=decision.signal,
+                strategy=decision.strategy,
+                regime=decision.params_label,
+                risk_mode="wildcat",
+                market_playbook=decision.side,
+                allocator_state="active",
+                allocator_profile="wildcat",
+                allocator_scale=1.0,
+                max_holding_bars=decision.max_holding_bars,
+            )
+
         if self._settings.testnet_strategy_label == "winrate_optimized_portfolio":
             from src.gridbot.strategy.winrate_optimized_portfolio import (
                 explain_winrate_optimized_portfolio_no_signal,
