@@ -43,6 +43,14 @@ class FakeTelegramApp:
         self.bot = FakeBot()
 
 
+class FakeTradeRepo:
+    def __init__(self, trades=None):
+        self.trades = trades or []
+
+    async def get_trades(self, symbol, since_ms=0, grid_only=False, limit=1000):
+        return list(self.trades)
+
+
 class FakeClient:
     def __init__(self):
         self.position = None
@@ -271,3 +279,54 @@ async def test_finish_flat_run_updates_summary_from_orders_and_trades():
     assert fields["commission_usdc"] == pytest.approx(0.05)
     assert telegram.bot.messages
     assert "已實現損益：<b>$-0.2500</b>" in telegram.bot.messages[-1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_finish_flat_run_merges_db_trade_commission_fallback():
+    client = FakeClient()
+    client.all_orders = [
+        {"orderId": 2001, "clientOrderId": "cry3mn_test_entry", "origQty": "0.126", "status": "FILLED", "updateTime": 10},
+        {"orderId": 2002, "clientOrderId": "cry3mn_test_tp1", "origQty": "0.05", "status": "FILLED", "updateTime": 20},
+        {"orderId": 2003, "clientOrderId": "cry3mn_test_tp2", "origQty": "0.076", "status": "FILLED", "updateTime": 30},
+    ]
+    from src.gridbot.binance.models import FuturesTrade
+
+    client.user_trades = [
+        FuturesTrade(11, 2002, "ETHUSDC", "SELL", 101.0, 0.05, 5.05, 0.05, 0.0, "USDC", 20, "BOTH", True, False),
+        FuturesTrade(12, 2003, "ETHUSDC", "SELL", 101.2, 0.076, 7.6912, 0.08602, 0.0, "USDC", 30, "BOTH", True, False),
+    ]
+    trade_repo = FakeTradeRepo(
+        trades=[
+            {
+                "trade_id": 11,
+                "order_id": 2002,
+                "symbol": "ETHUSDC",
+                "qty": 0.05,
+                "realized_pnl": 0.05,
+                "commission": 0.002,
+                "commission_asset": "USDC",
+                "time_ms": 20,
+            },
+            {
+                "trade_id": 12,
+                "order_id": 2003,
+                "symbol": "ETHUSDC",
+                "qty": 0.076,
+                "realized_pnl": 0.08602,
+                "commission": 0.003,
+                "commission_asset": "USDC",
+                "time_ms": 30,
+            },
+        ]
+    )
+    repo = FakeRepo()
+    telegram = FakeTelegramApp()
+    manager = MainnetOneRunManager(_settings(), client, repo, trade_repo=trade_repo, telegram_app=telegram)
+    run = _run(exit_reason="TP", armed_at_ms=1, qty=0.126)
+
+    await manager._finish_flat_run(run, "flat_detected")
+
+    _, fields = repo.updated[-1]
+    assert fields["realized_pnl_usdc"] == pytest.approx(0.13602)
+    assert fields["commission_usdc"] == pytest.approx(0.005)
+    assert "手續費：<b>$0.0050</b>" in telegram.bot.messages[-1]["text"]

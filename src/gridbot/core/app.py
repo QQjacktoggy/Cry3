@@ -476,6 +476,7 @@ class App:
                 settings=self.settings,
                 client=self.mainnet_binance,
                 repo=self.mainnet_run_repo,
+                trade_repo=self.trade_repo,
                 telegram_app=self.telegram_app,
             )
             if self.telegram_app:

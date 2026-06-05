@@ -14,7 +14,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from config.settings import Settings
 from src.gridbot.binance.client import BinanceFuturesClient
 from src.gridbot.binance.models import PositionInfo
-from src.gridbot.storage.repositories import MainnetRunRepository
+from src.gridbot.storage.repositories import FuturesTradeRepository, MainnetRunRepository
 from src.gridbot.strategy.long_pullback import Candle
 from src.gridbot.strategy.wildcat_live import WildcatLiveDecision, generate_wildcat_v2_adverse_guard_live_decision
 from src.gridbot.utils.logging import get_logger
@@ -42,10 +42,12 @@ class MainnetOneRunManager:
         client: BinanceFuturesClient,
         repo: MainnetRunRepository,
         telegram_app=None,
+        trade_repo: FuturesTradeRepository | None = None,
     ) -> None:
         self._settings = settings
         self._client = client
         self._repo = repo
+        self._trade_repo = trade_repo
         self._telegram_app = telegram_app
         self._protection_sent: set[str] = set()
         self._partial_taken: set[str] = set()
@@ -589,11 +591,11 @@ class MainnetOneRunManager:
         orders, trades = await self._load_run_orders_and_trades(run)
         qty = 0.0
         for trade in trades:
-            qty = max(qty, float(trade.qty))
+            qty = max(qty, float(trade["qty"]))
         for order in orders:
             qty = max(qty, abs(float(order.get("origQty") or 0.0)))
-        realized_pnl = sum(float(trade.realized_pnl) for trade in trades)
-        commission = sum(float(trade.commission) for trade in trades)
+        realized_pnl = sum(float(trade["realized_pnl"]) for trade in trades)
+        commission = sum(float(trade["commission"]) for trade in trades)
         exit_reason = self._infer_flat_exit_reason(run, orders)
         return {
             "qty": qty,
@@ -602,7 +604,7 @@ class MainnetOneRunManager:
             "exit_reason": exit_reason,
         }
 
-    async def _load_run_orders_and_trades(self, run: dict) -> tuple[list[dict], list]:
+    async def _load_run_orders_and_trades(self, run: dict) -> tuple[list[dict], list[dict[str, float | int | str]]]:
         start_time = max(0, int(run.get("armed_at_ms") or 0) - 60_000)
         orders = await self._client.get_all_orders(run["symbol"], start_time=start_time, limit=1000)
         matching_orders = [
@@ -610,9 +612,63 @@ class MainnetOneRunManager:
             if str(order.get("clientOrderId") or "").startswith(run["run_id"])
         ]
         order_ids = {int(order.get("orderId", 0) or 0) for order in matching_orders}
-        trades = await self._client.get_user_trades(run["symbol"], start_time=start_time, limit=1000)
-        matching_trades = [trade for trade in trades if int(trade.order_id) in order_ids]
-        return matching_orders, matching_trades
+        api_trades = await self._client.get_user_trades(run["symbol"], start_time=start_time, limit=1000)
+        matching_trades = [
+            self._normalize_api_trade(trade)
+            for trade in api_trades
+            if int(trade.order_id) in order_ids
+        ]
+        if self._trade_repo:
+            db_trades = await self._trade_repo.get_trades(run["symbol"], since_ms=start_time, grid_only=False, limit=1000)
+            matching_trades.extend(
+                self._normalize_db_trade(trade)
+                for trade in db_trades
+                if int(trade.get("order_id") or 0) in order_ids
+            )
+        return matching_orders, self._merge_trade_records(matching_trades)
+
+    def _normalize_api_trade(self, trade) -> dict[str, float | int | str]:
+        return {
+            "trade_id": int(trade.trade_id),
+            "order_id": int(trade.order_id),
+            "qty": float(trade.qty),
+            "realized_pnl": float(trade.realized_pnl),
+            "commission": float(trade.commission),
+            "time_ms": int(trade.time_ms),
+            "commission_asset": str(trade.commission_asset),
+        }
+
+    def _normalize_db_trade(self, trade: dict) -> dict[str, float | int | str]:
+        return {
+            "trade_id": int(trade.get("trade_id") or 0),
+            "order_id": int(trade.get("order_id") or 0),
+            "qty": float(trade.get("qty") or 0.0),
+            "realized_pnl": float(trade.get("realized_pnl") or 0.0),
+            "commission": float(trade.get("commission") or 0.0),
+            "time_ms": int(trade.get("time_ms") or 0),
+            "commission_asset": str(trade.get("commission_asset") or ""),
+        }
+
+    def _merge_trade_records(
+        self,
+        trades: list[dict[str, float | int | str]],
+    ) -> list[dict[str, float | int | str]]:
+        merged: dict[tuple[int, int], dict[str, float | int | str]] = {}
+        for trade in trades:
+            key = (int(trade["trade_id"]), int(trade["order_id"]))
+            current = merged.get(key)
+            if current is None:
+                merged[key] = dict(trade)
+                continue
+            current["qty"] = max(float(current["qty"]), float(trade["qty"]))
+            current["time_ms"] = max(int(current["time_ms"]), int(trade["time_ms"]))
+            if not float(current["realized_pnl"]) and float(trade["realized_pnl"]):
+                current["realized_pnl"] = float(trade["realized_pnl"])
+            if not float(current["commission"]) and float(trade["commission"]):
+                current["commission"] = float(trade["commission"])
+            if not str(current["commission_asset"]) and str(trade["commission_asset"]):
+                current["commission_asset"] = str(trade["commission_asset"])
+        return sorted(merged.values(), key=lambda trade: (int(trade["time_ms"]), int(trade["trade_id"])))
 
     def _infer_flat_exit_reason(self, run: dict, orders: list[dict]) -> str | None:
         latest_filled = None
