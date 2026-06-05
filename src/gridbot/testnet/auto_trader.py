@@ -943,6 +943,7 @@ class TestnetAutoTrader:
                 leverage=self._settings.testnet_order_leverage,
             )
             if decision is None:
+                from src.gridbot.strategy.wildcat_live import explain_wildcat_no_signal
                 return LiveDecisionContext(
                     signal=SignalPlan(
                         action="WAIT",
@@ -954,7 +955,12 @@ class TestnetAutoTrader:
                         atr=None,
                         support=None,
                         vwap=None,
-                        reasons=["wildcat: no active signal (S1 BB/RSI and S5 Stoch inactive or not triggered)"],
+                        reasons=explain_wildcat_no_signal(
+                            candles=candles,
+                            today_pnl_usdc=today_net,
+                            target_daily_usdc=self._settings.testnet_equity_usdc * 0.03,
+                            leverage=self._settings.testnet_order_leverage,
+                        ),
                     ),
                     strategy="wildcat_wait",
                     regime="blocked",

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -e
+set -u
 
 VM_NAME="cry3jack"
 VM_ZONE="asia-east1-a"

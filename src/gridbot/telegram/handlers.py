@@ -754,6 +754,19 @@ async def cmd_signal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             else:
                 lines.append("  • 無特定描述")
 
+            if settings.testnet_strategy_label == "wildcat_v2_adverse_guard":
+                from src.gridbot.strategy.wildcat_live import explain_wildcat_no_signal
+                reasons = explain_wildcat_no_signal(
+                    candles=candles,
+                    today_pnl_usdc=today_net,
+                    target_daily_usdc=float(getattr(settings, "testnet_equity_usdc", 150.0)) * 0.03,
+                    leverage=int(getattr(settings, "testnet_order_leverage", 75)),
+                )
+                lines.append("")
+                lines.append("🧭 <b>Wildcat 子邏輯即時狀態列表</b>")
+                for r in reasons:
+                    lines.append(f"  • {r}")
+
             if settings.testnet_strategy_label == "winrate_optimized_portfolio":
                 status = describe_winrate_optimized_portfolio_status(
                     candles=candles,

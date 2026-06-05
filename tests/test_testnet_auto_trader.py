@@ -331,6 +331,30 @@ async def test_auto_trader_wildcat_label_uses_wildcat_live_wrapper(monkeypatch):
     assert "策略：<b>wildcat_v2_adverse_guard</b>" in telegram.bot.messages[0]["text"]
 
 
+def test_explain_wildcat_no_signal():
+    from src.gridbot.strategy.wildcat_live import explain_wildcat_no_signal
+    from src.gridbot.strategy.long_pullback import Candle
+
+    # Need at least 160 candles
+    candles = []
+    for i in range(160):
+        candles.append(Candle(
+            open_time_ms=i * 60000,
+            open=2000.0,
+            high=2010.0,
+            low=1990.0,
+            close=2000.0,
+            volume=100.0,
+            quote_volume=200000.0,
+        ))
+
+    reasons = explain_wildcat_no_signal(candles)
+    assert len(reasons) >= 3
+    assert "市場特徵" in reasons[0]
+    assert "S1_BB_RSI" in reasons[1]
+    assert "S5_Stoch" in reasons[2]
+
+
 @pytest.mark.asyncio
 async def test_auto_trader_applies_entry_tolerance_to_limit_price(monkeypatch):
     client = FakeClient()
