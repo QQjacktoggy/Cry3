@@ -887,7 +887,7 @@ class MainnetOneRunManager:
             return False
 
         # Build set of desired prices (with qty > 0) for validation
-        desired_prices = {price for _, _, price in desired_orders if float(qty) > 1e-9}
+        desired_prices = {price for _, qty, price in desired_orders if float(qty) > 1e-9}
 
         # All existing orders must have valid prices (subset of desired)
         existing_prices = {float(o.get("price", 0) or 0) for o in existing_orders}
