@@ -57,10 +57,10 @@ git reset --hard origin/$BRANCH
 echo \"HEAD: \$(git log -1 --oneline)\"
 
 echo '==> [vm] Installing deps if needed'
-if [ -d .venv ]; then
-  source .venv/bin/activate
+if [ -d testnet/.venv ]; then
+  source testnet/.venv/bin/activate
 fi
-.venv/bin/pip install -e . --quiet
+testnet/.venv/bin/pip install -e . --quiet
 
 echo '==> [vm] Checking systemd service'
 if systemctl list-unit-files | grep -q \"^${SERVICE_NAME}.service\"; then
