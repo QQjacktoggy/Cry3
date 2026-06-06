@@ -1,0 +1,27 @@
+# Ensure all source files use LF line endings
+*.py        text eol=lf
+*.sh        text eol=lf
+*.md        text eol=lf
+*.txt       text eol=lf
+*.json      text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.toml      text eol=lf
+*.cfg       text eol=lf
+*.ini       text eol=lf
+*.env       text eol=lf
+Dockerfile  text eol=lf
+Makefile    text eol=lf
+
+# Binary files (don't touch)
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.ico       binary
+*.pdf       binary
+*.zip       binary
+*.tar.gz    binary
+*.db        binary
+*.pyc       binary
+*.pyo       binary
