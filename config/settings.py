@@ -159,8 +159,12 @@ class Settings(BaseSettings):
     mainnet_partial_exit_pct: float = 0.40
     mainnet_partial_tp_pct: float = 0.0005
     mainnet_recovery_enabled: bool = True
-    mainnet_recovery_steps: int = 3
-    mainnet_recovery_trigger_pct: float = 0.0009
+    # Recovery (DCA) settings — reduced from 3 steps to 1, with
+    # tighter trigger (0.09% -> 0.05%) so the first averaging happens
+    # closer to entry, yielding a better average price and limiting
+    # the maximum notional exposure to 2x the base (400 USDC).
+    mainnet_recovery_steps: int = 1
+    mainnet_recovery_trigger_pct: float = 0.0005
     mainnet_recovery_tp_shrink: float = 0.45
     mainnet_adverse_exit_bars: int = 10
     mainnet_adverse_exit_loss_pct: float = 0.0007
@@ -192,6 +196,13 @@ class Settings(BaseSettings):
     # This means we accept the taker fee risk to get the position open.
     # Set to False to let the run expire on GTX rejection (old behaviour).
     mainnet_entry_fallback_to_gtc: bool = False
+    # Stop-loss maker + market fallback settings.
+    # When SL is triggered, first try a reduce-only GTX limit at the
+    # stop_loss price for up to mainnet_sl_maker_ttl_seconds.
+    # If not filled within TTL, fall back to a market order.
+    mainnet_sl_use_maker: bool = True
+    mainnet_sl_maker_ttl_seconds: int = 10
+    mainnet_sl_fallback_to_market: bool = True
 
     @property
     def mainnet_effective_entry_notional_usdc(self) -> float:

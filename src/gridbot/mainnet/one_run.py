@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from dataclasses import asdict, dataclass
@@ -942,18 +943,129 @@ class MainnetOneRunManager:
         return sl_price > 0 and hit_sl
 
     async def _close_position(self, symbol: str, side: str, qty: float, reason: str, run: dict) -> None:
+        """Close position.  For SL reason, try reduce-only GTX maker at
+        stop_loss first (if enabled), with TTL fallback to market.
+        Other reasons (ADVERSE_EXIT, MAX_HOLD_*) go straight to market.
+        """
         await self._cancel_take_profit_orders(symbol, run["run_id"])
         qty_str = await self._client.format_quantity(symbol, qty)
+        run_id = run["run_id"]
+
+        if reason == "SL" and self._settings.mainnet_sl_use_maker:
+            # Try maker SL at stop_loss price.
+            signal = json.loads(run.get("signal_json") or "{}")
+            sl_price = float(signal.get("stop_loss") or 0.0)
+            if sl_price > 0:
+                await self._place_stop_loss_maker(
+                    symbol=symbol,
+                    side=side,
+                    qty_str=qty_str,
+                    sl_price=sl_price,
+                    run_id=run_id,
+                    reason=reason,
+                    run=run,
+                )
+                return
+
+        # Non-SL or maker disabled / sl_price unavailable → market order
         order = await self._client.create_market_order(
             symbol,
             side,
             qty_str,
             reduce_only=True,
-            client_order_id=f"{run['run_id']}_close",
+            client_order_id=f"{run_id}_close",
         )
-        await self._repo.log_event(run["run_id"], "close_submitted", {"reason": reason, "order": order})
-        await self._repo.update_run(run["run_id"], status="CLOSING", exit_reason=reason)
-        await self._notify(f"🏁 Mainnet one-run 已送出平倉：<code>{escape(run['run_id'])}</code> reason=<b>{escape(reason)}</b>")
+        await self._repo.log_event(run_id, "close_submitted", {"reason": reason, "order": order})
+        await self._repo.update_run(run_id, status="CLOSING", exit_reason=reason)
+        await self._notify(f"🏁 Mainnet one-run 已送出平倉：<code>{escape(run_id)}</code> reason=<b>{escape(reason)}</b>")
+
+    async def _place_stop_loss_maker(
+        self,
+        symbol: str,
+        side: str,
+        qty_str: str,
+        sl_price: float,
+        run_id: str,
+        reason: str,
+        run: dict,
+    ) -> None:
+        """Place a reduce-only GTX limit order at stop_loss price.
+        Wait up to mainnet_sl_maker_ttl_seconds for fill.
+        If not filled, cancel and fall back to market order.
+        """
+        ttl_seconds = self._settings.mainnet_sl_maker_ttl_seconds
+        client_order_id = f"{run_id}_sl"
+        s = self._settings
+
+        try:
+            order = await self._client.create_reduce_only_limit_order(
+                symbol=symbol,
+                side=side,
+                quantity=qty_str,
+                price=sl_price,
+                client_order_id=client_order_id,
+                post_only=True,  # GTX
+            )
+        except BinanceAPIException as exc:
+            if exc.code == -5022 and s.mainnet_tp_fallback_to_gtc:
+                # SL rejected as post-only — fallback to market immediately.
+                logger.warning("sl_maker_rejected_fallback_market", run_id=run_id, error=str(exc)[:200])
+            else:
+                raise
+
+            # Fall through to market order
+            order = await self._client.create_market_order(
+                symbol, side, qty_str, reduce_only=True, client_order_id=f"{run_id}_close"
+            )
+            await self._repo.log_event(run_id, "close_submitted", {"reason": reason, "order": order})
+            await self._repo.update_run(run_id, status="CLOSING", exit_reason=reason)
+            await self._notify(f"🏁 Mainnet one-run 已送出平倉（SL maker 被拒，市價）：<code>{escape(run_id)}</code> reason=<b>{escape(reason)}</b>")
+            return
+
+        # Log the maker SL order
+        await self._repo.log_event(
+            run_id, "sl_maker_placed", {"order": order, "sl_price": sl_price, "ttl_seconds": ttl_seconds}
+        )
+        await self._notify(
+            f"🛑 <b>Stop-Loss Maker 已掛單</b>\n"
+            f"Run：<code>{escape(run_id)}</code>\n"
+            f"價格：<b>${sl_price:.4f}</b> | Qty：<code>{qty_str}</code>\n"
+            f"等待 <b>{ttl_seconds}s</b> 若未成交將送市價單"
+        )
+
+        # Wait for TTL, polling open orders
+        deadline = time.time() + ttl_seconds
+        while time.time() < deadline:
+            await asyncio.sleep(1)
+            open_orders = await self._client.get_open_orders(symbol)
+            still_open = any(int(row.get("orderId", 0)) == int(order.get("orderId", 0) or 0) for row in open_orders)
+            position = await self._client.get_position(symbol)
+            if not still_open or (position and abs(position.position_amt) < abs(float(run.get("qty") or 0)) * 0.1):
+                # Filled or position mostly closed
+                await self._repo.log_event(run_id, "sl_maker_filled", {"order": order})
+                await self._notify(f"✅ <b>Stop-Loss Maker 成交</b>\nRun：<code>{escape(run_id)}</code>")
+                await self._repo.update_run(run_id, status="CLOSING", exit_reason=reason)
+                return
+
+        # TTL expired — cancel and fallback to market
+        try:
+            order_id = int(order.get("orderId", 0) or 0)
+            if order_id:
+                await self._client.cancel_order(symbol, order_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("sl_maker_cancel_failed", run_id=run_id, error=str(exc)[:200])
+
+        # Fallback to market
+        market_order = await self._client.create_market_order(
+            symbol, side, qty_str, reduce_only=True, client_order_id=f"{run_id}_close"
+        )
+        await self._repo.log_event(run_id, "close_submitted", {"reason": reason, "order": market_order})
+        await self._repo.log_event(run_id, "sl_maker_fallback_market", {"maker_order_id": order.get("orderId")})
+        await self._repo.update_run(run_id, status="CLOSING", exit_reason=reason)
+        await self._notify(
+            f"⚡ <b>Stop-Loss TTL 過期，已送市價單</b>\n"
+            f"Run：<code>{escape(run_id)}</code> reason=<b>{escape(reason)}</b>"
+        )
 
     async def _cancel_take_profit_orders(self, symbol: str, run_id: str) -> None:
         open_orders = await self._client.get_open_orders(symbol)
