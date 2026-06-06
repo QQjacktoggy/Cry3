@@ -63,8 +63,8 @@ fi
 testnet/.venv/bin/pip install -e . --quiet
 
 echo '==> [vm] Checking systemd service'
-if systemctl list-unit-files | grep -q \"^${SERVICE_NAME}.service\"; then
-  echo \"==> [vm] Restarting $SERVICE_NAME (systemd)\"
+if [ -f /etc/systemd/system/${SERVICE_NAME}.service ] || [ -f /usr/lib/systemd/system/${SERVICE_NAME}.service ]; then
+  echo "==> [vm] Restarting ${SERVICE_NAME} (systemd)"
   sudo systemctl restart \"$SERVICE_NAME\"
   
   for i in \$(seq 1 $HEALTH_CHECK_TIMEOUT); do
