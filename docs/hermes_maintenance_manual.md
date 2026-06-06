@@ -204,6 +204,12 @@ Cry3 是 Binance Futures 交易機器人，現在主要有兩個運行面向：
 - `testnet/data/gridbot_testnet.db`
 - `testnet/logs/`
 
+補充：
+- 目前 VM 上 bot 的實際 working directory 會落在 `/home/jack_shih`
+- `config/settings.py` 的 `db_path` 目前是相對路徑 `testnet/data/gridbot_testnet.db`
+- 因此實際被打開的是 `/home/jack_shih/testnet/data/gridbot_testnet.db`
+- 接手時查 `mainnet_runs` / `mainnet_run_events`，請優先查這份 DB，不要只看 `/home/jack_shih/cry3/testnet/data/gridbot_testnet.db`
+
 ### 6.4 systemd 狀態
 
 `cry3.service` 仍存在，但這段維護期間不可靠，原因：
@@ -262,6 +268,93 @@ Cry3 是 Binance Futures 交易機器人，現在主要有兩個運行面向：
 3. 本機 `pytest` 環境不穩
    - 這台維護機器曾出現 `aiohttp` import 問題
    - 所以有些測試只能做語法檢查或針對性驗證，無法保證每次本地都能完整跑綠
+
+4. 2026-06-06 補充：`mainnet one-run` 持倉計時修正已先同步到 VM runtime，但尚未推到 GitHub 主線
+   - 本地最新 commit：`6bf5c42 fix: start mainnet one-run hold timer after entry fill`
+   - 修正內容：`max_holding_bars` 與 `ADVERSE_EXIT` 改成從 `entry_filled` 開始計時
+   - VM 已重新拉起 bot 並吃到這版 runtime
+   - 但 `origin/main` 尚未更新，接手時請先對帳本地、VM、GitHub 三方版本再決定 merge / rebase / push
+
+5. 2026-06-06 補充：`testnet` 訊號與 `mainnet` 真實可執行性可能存在時間差
+   - 目前 `/signal` 顯示的即時診斷是以 testnet / 即時策略資料源為主
+   - `mainnet one-run` 則在 mainnet 實盤環境下重新取 K 線與判斷
+   - 因此 testnet 訊號不一定 1:1 等同 mainnet 可成交訊號，尤其在快速波動時，訊號與實盤掛單間可能出現延遲或偏移
+   - 後續若要提升 one-run 可靠度，建議評估「建議開單區間」是否加入額外 buffer，避免訊號太貼近邊界時掛單失真或成交不穩
+
+6. 2026-06-06 補充：`mainnet one-run` 仍可能遇到 GTX / Post-Only (`-5022`) 拒單
+   - 錯誤訊息範例：`APIError(code=-5022): Due to the order could not be executed as maker, the Post Only order will be rejected.`
+   - 這通常不是策略訊號本身錯誤，而是 entry / TP / DCA 掛單價格太貼近當下 bid/ask，送到 Binance 時已經不再是純 maker
+   - 現行行為：
+     - entry 先嘗試 `GTX` maker
+     - TP / DCA 也優先 `GTX`
+     - 若 `mainnet_entry_fallback_to_gtc=False`，entry 在重試後仍被拒就會直接讓 run 失敗
+   - 後續接手者要優先確認：
+     - 是否要在 entry / TP / DCA 加大 `buffer / slippage_bps`
+     - 是否要允許 `mainnet_entry_fallback_to_gtc=True`
+     - 是否要把 `limit_tolerance`、`mainnet_entry_slippage_bps`、`mainnet_tp_slippage_bps`、`mainnet_dca_slippage_bps` 做成更明確的風控規則
+
+7. 2026-06-06 補充：近期實單樣本可直接拿來當排查案例
+   - `cry3mn_1780720295120`
+     - `entry_placed` → `entry_filled` → 多次 `take_profit_synced`
+     - 中途觸發 `recovery_entry_placed`（DCA #1）
+     - 後續 TP 會隨倉位縮小而反覆重掛，最後因 `SL` 直接 `close_submitted`
+     - 這筆可用來觀察：
+       - partial TP 後的 TP 重同步
+       - DCA 後 TP qty / price 重算
+       - 最終平倉前是否仍保留部分 TP 碎單
+   - `cry3mn_1780720542104`
+     - `entry_placed` 後沒有及時成交
+     - 最後因 `entry_ttl_expired` 被取消
+     - 可用來檢查 maker entry 在震盪或追價過慢時的掛單壽命
+   - `cry3mn_1780720685933`
+     - `entry_rejected`，原因是 `slippage_exceeded`
+     - 具體訊息：`GTX retry attempt 2: slippage 8.05 bps exceeds tolerance 8.0 bps`
+     - 可用來檢查 `mainnet_entry_slippage_bps` 與訊號貼價程度
+   - `cry3mn_1780720697481`
+     - 最新一筆 `ENTRY_PENDING`
+     - 代表 entry maker 已掛出，但尚未成交
+     - 可用來確認目前 live runtime 的 `ENTRY_PENDING` → `RUNNING` 轉換是否正常
+
+8. 2026-06-06 補充：新一批樣本顯示 run 分布已變成「TP / SL / TTL / GTX 拒單」四類混合
+   - `cry3mn_1780724499770`
+     - `SHORT`，先成交、再同步 TP、再 `DCA #1`、最後因 `SL` 平倉
+     - 可用來觀察：
+       - SHORT 方向的 TP 重同步是否與 LONG 一致
+       - DCA 後 TP 是否會在短時間內反覆縮量 / 重掛
+   - `cry3mn_1780724396380`
+     - `SHORT`，先成交、再同步 TP、再 `DCA #1`、最後因 `SL` 平倉
+     - 與上一筆類似，屬於「先 partial / DCA，再被 stop」的典型案例
+   - `cry3mn_1780723448304`
+     - `SHORT`，成交後沒有再觸發 DCA，最後以 `TP` 收斂完成
+     - 可用來對照「正常止盈完成」與「反覆重掛 TP」之間的差異
+   - `cry3mn_1780723432263`
+     - `entry_rejected`，原因是 `slippage_exceeded`
+     - 具體訊息：`GTX retry attempt 2: slippage 9.89 bps exceeds tolerance 8.0 bps`
+     - 表示訊號可用，但 entry 太貼，超過當前 8 bps 容忍度
+   - `cry3mn_1780721444475`
+     - `LONG`，成交後直接靠 TP 完成，沒有 DCA
+     - 這是較乾淨的 TP 完成樣本
+   - `cry3mn_1780721315425`
+     - `LONG`，成交後觸發 DCA #1，最後因 `SL` 平倉
+     - 與 `cry3mn_1780720295120` 類似，屬於完整的 partial + DCA + SL 流程
+   - `cry3mn_1780721176723`
+     - `ENTRY_EXPIRED`
+     - 表示 entry maker 掛出後一直沒成交，最後 TTL 到期取消
+   - `cry3mn_1780721066069`
+     - `LONG`，成交後出現 DCA #1，最後因 `SL` 平倉
+     - 這筆可對照 DCA 後 TP qty 被重算的行為
+   - `cry3mn_1780720906513`
+     - `LONG`，成交後多次重同步 TP，但沒有 DCA，最後直接完成
+     - 可用來觀察「只重掛 TP、不補 DCA」的樣本
+   - `cry3mn_1780720760056`
+     - `LONG`，成交後多次重同步 TP，最後完成
+     - 可用來觀察 TP 碎單與 completed 收斂是否穩定
+   - `cry3mn_1780720697481`
+     - 目前仍是 `ENTRY_PENDING`
+     - 代表 entry maker 已掛出但尚未成交，仍可持續觀察
+   - `cry3mn_1780720685933`
+     - `ENTRY_REJECTED`
+     - 原因是 `GTX` 重試後仍超過 8 bps 容忍度，屬於 maker-first 與價格貼近度衝突的代表案例
 
 ## 8. 最近關鍵 commit
 
