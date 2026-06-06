@@ -142,9 +142,20 @@ class Settings(BaseSettings):
     mainnet_one_run_manage_interval_seconds: int = 10
     mainnet_one_run_signal_timeout_minutes: int = 60
     mainnet_entry_order_ttl_seconds: int = 45
+    # Conservative entry requote (cancel + replace) settings.  When a
+    # maker entry has been on the book for at least
+    # mainnet_entry_requote_min_age_seconds and the mark price has
+    # drifted by more than mainnet_entry_max_deviation_bps, the bot
+    # may cancel and replace the order at a fresh passive price.  It
+    # may requote up to mainnet_entry_reprice_max_updates times, with
+    # at least mainnet_entry_reprice_interval_seconds between
+    # requotes.  All limits are best-effort — the existing TTL
+    # (mainnet_entry_order_ttl_seconds) and slippage
+    # (mainnet_entry_slippage_bps) still apply.
     mainnet_entry_reprice_interval_seconds: int = 10
     mainnet_entry_reprice_max_updates: int = 3
     mainnet_entry_max_deviation_bps: float = 8.0
+    mainnet_entry_requote_min_age_seconds: int = 22
     mainnet_partial_exit_pct: float = 0.40
     mainnet_partial_tp_pct: float = 0.0005
     mainnet_recovery_enabled: bool = True

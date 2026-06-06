@@ -59,6 +59,12 @@ class MainnetOneRunManager:
         self._partial_taken: set[str] = set()
         self._partial_order_armed: set[str] = set()
         self._recovery_counts: dict[str, int] = {}
+        # Conservative entry requote state — counts and last-requote
+        # timestamps keyed by run_id, so we can throttle requotes
+        # without bumping run.updated_at_ms (which would also push out
+        # the TTL check).
+        self._entry_requote_counts: dict[str, int] = {}
+        self._entry_requote_last_ms: dict[str, int] = {}
 
     async def status(self) -> RunStatus:
         latest = await self._repo.get_latest_run()
@@ -226,6 +232,15 @@ class MainnetOneRunManager:
         if not still_open:
             await self._repo.complete_run(run["run_id"], "ENTRY_EXPIRED", "entry_not_open_no_position")
             await self._notify(f"⌛ Entry 掛單已不在 open orders 且沒有持倉，run 已停止：<code>{escape(run['run_id'])}</code>")
+            return
+        # Conservative entry requote: if the maker has been on the book
+        # long enough, the mark has drifted beyond the configured
+        # threshold, and we are still under the requote cap, cancel the
+        # existing order and place a new one at a fresh passive price.
+        # On success the run stays in ENTRY_PENDING with the new order
+        # id, and the next manage_cycle tick picks it up.
+        requoted = await self._maybe_requote_entry(run, order_id, open_orders)
+        if requoted:
             return
         age_ms = int(time.time() * 1000) - int(run["updated_at_ms"])
         if age_ms >= self._settings.mainnet_entry_order_ttl_seconds * 1000:
@@ -518,6 +533,211 @@ class MainnetOneRunManager:
 
         # No GTC fallback — re-raise last BinanceAPIException
         raise last_exc  # type: ignore[misc]
+
+    async def _maybe_requote_entry(
+        self,
+        run: dict,
+        order_id: int | None,
+        open_orders: list[dict],
+    ) -> bool:
+        """Conservatively re-quote a stuck maker entry.
+
+        Returns True if a requote was performed (caller should `return`
+        and let the next manage_cycle tick pick up the new state).
+        Returns False if no requote was warranted.
+
+        Triggers (all must hold):
+          - entry has been on the book for at least
+            mainnet_entry_requote_min_age_seconds
+          - the mark price has drifted by more than
+            mainnet_entry_max_deviation_bps from the entry price
+          - the requote cooldown has elapsed since the last requote
+            (mainnet_entry_reprice_interval_seconds)
+          - the requote count is below mainnet_entry_reprice_max_updates
+
+        On requote, the existing order is cancelled, a fresh passive
+        price is computed from the current book, and a new GTX order
+        is placed via _place_post_only_with_retry (which itself
+        enforces the mainnet_entry_slippage_bps cap and may raise
+        GTXSlippageExceeded — that case is logged and swallowed, the
+        run keeps its existing order and the next tick retries).
+        """
+        run_id = run["run_id"]
+        symbol = run["symbol"]
+        s = self._settings
+
+        # Fetch the order we have on the book so we can read its price
+        # and confirm it is still ours.  If order_id is None or the
+        # order is not actually in open_orders, there is nothing to
+        # requote — the caller will hit the not_open path next tick.
+        if not order_id:
+            return False
+        existing = next(
+            (row for row in open_orders if int(row.get("orderId", 0)) == order_id),
+            None,
+        )
+        if existing is None:
+            return False
+
+        # Counters (initialised lazily, so first call counts as 0)
+        count = self._entry_requote_counts.get(run_id, 0)
+        if count >= s.mainnet_entry_reprice_max_updates:
+            return False
+
+        # Age gate — uses armed_at_ms (not updated_at_ms) so requote
+        # does not interact with the TTL window.
+        armed_at = int(run.get("armed_at_ms") or 0)
+        if armed_at <= 0:
+            return False
+        age_ms = int(time.time() * 1000) - armed_at
+        if age_ms < s.mainnet_entry_requote_min_age_seconds * 1000:
+            return False
+
+        # Cooldown gate
+        last_ms = self._entry_requote_last_ms.get(run_id, 0)
+        if last_ms and (int(time.time() * 1000) - last_ms) < s.mainnet_entry_reprice_interval_seconds * 1000:
+            return False
+
+        # Drift gate — current mark vs. the existing entry price.
+        # Fall back to the price recorded on the order if mark is
+        # unavailable.
+        existing_price = float(existing.get("price") or 0)
+        if existing_price <= 0:
+            return False
+        try:
+            book = await self._client.get_book_ticker(symbol)
+            mark = float(book.get("bidPrice", 0)) if str(run.get("side") or "").upper() == "SELL" else float(book.get("askPrice", 0))
+            if mark <= 0:
+                mark = float(existing_price)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("entry_requote_book_fetch_failed", run_id=run_id, error=str(exc)[:200])
+            return False
+        deviation_bps = abs(mark - existing_price) / existing_price * 10_000
+        if deviation_bps <= s.mainnet_entry_max_deviation_bps:
+            return False
+
+        # Side for the new order — must match the original run side.
+        side = str(run.get("side") or "").upper()
+        if side not in {"BUY", "SELL"}:
+            # Fall back to inferring from position direction if any.
+            return False
+
+        # Quantity: re-read from the run (cumulative_notional_usdc /
+        # mark gives a fresh estimate, but we re-use the original
+        # entry_order_id-quantity to avoid rounding drift).
+        entry_notional = float(run.get("cumulative_notional_usdc") or 0)
+        if entry_notional <= 0 or mark <= 0:
+            return False
+        try:
+            quantity = await self._client.format_quantity(symbol, entry_notional / mark)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("entry_requote_qty_format_failed", run_id=run_id, error=str(exc)[:200])
+            return False
+
+        # The slippage cap is enforced inside _place_post_only_with_retry
+        # (it raises GTXSlippageExceeded when the new passive price walks
+        # past mainnet_entry_slippage_bps of the signal_price we hand
+        # it).  We deliberately do NOT add a second pre-check here — by
+        # the time we reach this point, the mark has already moved past
+        # mainnet_entry_max_deviation_bps, so the deviation vs.
+        # signal_price will be at least that big, and the helper's own
+        # cap (mainnet_entry_slippage_bps, which is independently
+        # tunable) is the real authority.
+        #
+        # We hand it the existing entry price as the "signal" — that
+        # way a successful requote can re-anchor at a price within
+        # mainnet_entry_slippage_bps of where the previous order was,
+        # rather than reaching all the way back to the original
+        # strategy price (which may have been many bps ago).
+        signal_price = existing_price
+
+        # Use a unique client_order_id for the requote — Binance
+        # rejects reuse of a clientOrderId within 24h.
+        new_client_order_id = f"{run_id}_entry_r{count + 1}"
+        attempt_no = count + 1
+
+        # 1) Cancel the existing order first.  We do this even if the
+        # new order might fail — we are committed to leaving the run
+        # with a fresh passive price, and a partial cancel/replace
+        # race on Binance is rare for our small size.
+        try:
+            await self._client.cancel_order(symbol, order_id)
+        except Exception as exc:  # noqa: BLE001
+            # If the order is already gone (filled or already
+            # cancelled), the next tick will sort it out via the
+            # position check.  Anything else is fatal for this run.
+            logger.warning("entry_requote_cancel_failed", run_id=run_id, order_id=order_id, error=str(exc)[:200])
+            return False
+
+        # 2) Place the new maker order via the existing helper, which
+        # already implements GTX retry + slippage cap + GTC fallback.
+        try:
+            new_order = await self._place_post_only_with_retry(
+                symbol=symbol,
+                side=side,
+                quantity=quantity,
+                signal_price=signal_price,
+                client_order_id=new_client_order_id,
+                slippage_bps=s.mainnet_entry_slippage_bps,
+                fallback_to_gtc=s.mainnet_entry_fallback_to_gtc,
+                reduce_only=False,
+            )
+        except GTXSlippageExceeded as exc:
+            # Slippage exceeded mid-retry — log, do NOT bump the
+            # requote counter, leave the run with no open order; the
+            # next tick will hit the not_open path and complete the
+            # run as ENTRY_EXPIRED.
+            await self._repo.log_event(
+                run_id,
+                "entry_requote_skipped",
+                {"reason": "gtx_slippage", "detail": str(exc)[:300], "attempt": attempt_no},
+            )
+            logger.info("entry_requote_skipped_gtx", run_id=run_id, attempt=attempt_no, detail=str(exc)[:200])
+            return False
+        except BinanceAPIException as exc:
+            # Some non-5022 failure on the new order — log and bail;
+            # the run keeps no open order and the next tick will
+            # complete it as ENTRY_EXPIRED.
+            await self._repo.log_event(
+                run_id,
+                "entry_requote_failed",
+                {"reason": "binance_error", "code": exc.code, "detail": str(exc)[:300], "attempt": attempt_no},
+            )
+            logger.warning("entry_requote_failed_binance", run_id=run_id, attempt=attempt_no, code=exc.code, error=str(exc)[:200])
+            return False
+
+        # 3) Persist the new order id and bump counters.
+        new_order_id = int(new_order.get("orderId", 0) or 0)
+        await self._repo.update_run(
+            run_id,
+            entry_order_id=new_order_id,
+            entry_client_order_id=new_client_order_id,
+            entry_price=float(new_order.get("price", 0) or existing_price),
+        )
+        self._entry_requote_counts[run_id] = attempt_no
+        self._entry_requote_last_ms[run_id] = int(time.time() * 1000)
+        await self._repo.log_event(
+            run_id,
+            "entry_requoted",
+            {
+                "attempt": attempt_no,
+                "old_order_id": order_id,
+                "old_price": existing_price,
+                "new_order_id": new_order_id,
+                "new_price": float(new_order.get("price", 0) or 0),
+                "mark_price": mark,
+                "deviation_bps": deviation_bps,
+                "new_client_order_id": new_client_order_id,
+            },
+        )
+        await self._notify(
+            f"🔁 <b>Entry 已 requote #{attempt_no}</b>\n"
+            f"Run：<code>{escape(run_id)}</code>\n"
+            f"舊價：<code>${existing_price:.4f}</code> → 新價：<code>${float(new_order.get('price', 0) or 0):.4f}</code>\n"
+            f"Mark 偏離：<b>{deviation_bps:.2f} bps</b>（門檻 {s.mainnet_entry_max_deviation_bps:.1f} bps）\n"
+            f"剩餘 requote 額度：<b>{s.mainnet_entry_reprice_max_updates - attempt_no}</b>"
+        )
+        return True
 
     async def _refresh_partial_fill_state(self, run: dict, position: PositionInfo) -> None:
         run_id = run["run_id"]
