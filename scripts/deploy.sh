@@ -60,7 +60,7 @@ echo '==> [vm] Installing deps if needed'
 if [ -d .venv ]; then
   source .venv/bin/activate
 fi
-pip install -e . --quiet
+.venv/bin/pip install -e . --quiet
 
 echo '==> [vm] Checking systemd service'
 if systemctl list-unit-files | grep -q \"^${SERVICE_NAME}.service\"; then
