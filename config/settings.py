@@ -162,8 +162,12 @@ class Settings(BaseSettings):
     mainnet_gtx_retry_attempts: int = 3
     # Maximum slippage (in basis points) from the original signal price that
     # is acceptable when re-quoting after a GTX rejection.
-    # Entry: 8 bps = 0.08% — matches mainnet_entry_max_deviation_bps default.
-    mainnet_entry_slippage_bps: float = 8.0
+    # Entry: 12 bps = 0.12% — relaxed from 8 bps after observing 3 real
+    # ENTRY_REJECTED runs (8.05, 9.89 bps) in June 2026. The cost is ~0.04%
+    # of additional slippage per filled entry (max), which is well under
+    # the expected per-trade TP target (~0.13-0.22 USDC on 200 USDC
+    # notional) and improves the signal-to-fill rate materially.
+    mainnet_entry_slippage_bps: float = 12.0
     # TP / DCA: slightly tighter — these are exit/averaging orders, not
     # time-sensitive entries, so we allow less chase.
     mainnet_tp_slippage_bps: float = 5.0
