@@ -18,9 +18,7 @@ BRANCH="main"
 LOG_FILE="/home/jack_shih/cry3_manual.log"
 HEALTH_CHECK_TIMEOUT=30
 
-echo "==> [local] Pushing to origin/$BRANCH"
-git push origin "$BRANCH"
-
+echo "==> [local] Push to origin should be done BEFORE running deploy"
 echo "==> [vm] Deploying to $VM_NAME ($VM_ZONE)"
 
 gcloud compute ssh "$VM_NAME" --zone="$VM_ZONE" --command="
