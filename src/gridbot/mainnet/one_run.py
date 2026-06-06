@@ -328,10 +328,11 @@ class MainnetOneRunManager:
             )
         except GTXSlippageExceeded as exc:
             # Entry rejected — slippage exceeded tolerance, stop this run
-            await self._repo.complete_run(run["run_id"], "ENTRY_REJECTED", "slippage_exceeded")
+            err_detail = str(exc)[:500]
+            await self._repo.complete_run(run["run_id"], "ENTRY_REJECTED", "slippage_exceeded", err_detail)
             await self._repo.log_event(run["run_id"], "entry_rejected", {
                 "reason": "slippage_exceeded",
-                "detail": str(exc)[:500],
+                "detail": err_detail,
             })
             await self._notify(
                 "⚠️ <b>Mainnet one-run entry 被拒</b>\n"
