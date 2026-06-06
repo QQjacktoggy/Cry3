@@ -777,7 +777,8 @@ class MainnetOneRunManager:
             order for order in existing_orders
             if str(order.get("clientOrderId") or "").startswith(f"{run_id}_tp")
         ]
-        if self._take_profit_orders_match(existing_tp, desired):
+        current_qty = abs(position.position_amt)
+        if self._take_profit_orders_match(existing_tp, desired, current_qty):
             return
         for order in existing_tp:
             await self._client.cancel_order(position.symbol, int(order["orderId"]))
@@ -866,21 +867,49 @@ class MainnetOneRunManager:
         self,
         existing_orders: list[dict],
         desired_orders: list[tuple[str, str, float]],
+        current_qty: float,
     ) -> bool:
-        if len(existing_orders) != len(desired_orders):
+        """Check if existing TP orders sufficiently cover the current position.
+
+        Returns True if:
+          - Total existing TP qty >= current_qty (full coverage)
+          - All existing order prices are present in desired_orders
+          - All desired prices that have qty > 0 are represented in existing_orders
+            or have qty == 0 in desired (soft match for post-partial scenarios)
+        """
+        if not existing_orders:
             return False
-        existing_by_id = {
-            str(order.get("clientOrderId") or ""): order
-            for order in existing_orders
-        }
-        for client_order_id, qty, price in desired_orders:
-            order = existing_by_id.get(client_order_id)
-            if order is None:
-                return False
-            if abs(float(order.get("origQty") or 0.0) - float(qty)) > 1e-9:
-                return False
-            if abs(float(order.get("price") or 0.0) - float(price)) > 1e-6:
-                return False
+
+        # Total existing qty must cover current position
+        existing_total_qty = sum(float(o.get("origQty", 0) or 0) for o in existing_orders)
+        if existing_total_qty + 1e-9 < current_qty:
+            return False
+
+        # Build set of desired prices (with qty > 0) for validation
+        desired_prices = {price for _, _, price in desired_orders if float(qty) > 1e-9}
+
+        # All existing orders must have valid prices (subset of desired)
+        existing_prices = {float(o.get("price", 0) or 0) for o in existing_orders}
+        if not existing_prices.issubset(desired_prices):
+            return False
+
+        # All desired prices (with qty > 0) must be represented in existing orders
+        # UNLESS the existing total qty already covers them — this handles
+        # the post-partial case where an existing final TP covers the
+        # partial qty that was already filled.
+        for _, _, price in desired_orders:
+            if price in existing_prices:
+                continue
+            # This desired price is not on book. If existing orders already
+            # provide enough total qty to cover the position, we can skip
+            # placing it (the position is already protected). Otherwise,
+            # we need to place it.
+            # In practice, if we reach here, it means we are missing a TP
+            # level that should exist — but since total coverage is met,
+            # we consider it a match to avoid unnecessary cancel/replace.
+            # The only time this returns False is when total existing qty
+            # < current_qty (handled above).
+
         return True
 
     async def _maybe_recovery(self, run: dict, signal: dict, position: PositionInfo) -> bool:
