@@ -8,6 +8,8 @@ set -euo pipefail
 #   - 只走 systemd（cry3.service），失敗即報錯退出，不 fallback 混用
 #   - 健康檢查：進程存活 + log 更新 + SQLite 寫入
 #   - Log 統一輸出到 /home/jack_shih/cry3_manual.log
+#   - 本地執行：gcloud compute ssh 到 VM
+#   - VM 內部直接執行：不走 gcloud
 # ============================================================
 
 VM_NAME="cry3jack"
@@ -18,10 +20,34 @@ BRANCH="main"
 LOG_FILE="/home/jack_shih/cry3_manual.log"
 HEALTH_CHECK_TIMEOUT=30
 
+# ============================================================
+# 偵測執行環境：本地 vs VM 內部
+# ============================================================
+if [ -f /etc/google_compute_engine ] || [ -f /sys/class/dmi/id/product_name ] && grep -q "Google" /sys/class/dmi/id/product_name 2>/dev/null; then
+    # 在 GCP VM 內部
+    ON_VM=1
+    SSH_PREFIX=""
+else
+    # 本地機器
+    ON_VM=0
+    SSH_PREFIX="gcloud compute ssh \"$VM_NAME\" --zone=\"$VM_ZONE\" --command="
+fi
+
+run_on_vm() {
+    if [ $ON_VM -eq 1 ]; then
+        bash -c "$1"
+    else
+        $SSH_PREFIX "$1"
+    fi
+}
+
 echo "==> [local] Push to origin should be done BEFORE running deploy"
 echo "==> [vm] Deploying to $VM_NAME ($VM_ZONE)"
 
-gcloud compute ssh "$VM_NAME" --zone="$VM_ZONE" --command="
+# ------------------------------------------------------------------
+# 在 VM 上執行的部署邏輯
+# ------------------------------------------------------------------
+DEPLOY_SCRIPT="
 set -euo pipefail
 
 echo '==> [vm] Fetching latest code'
@@ -34,7 +60,6 @@ echo '==> [vm] Installing deps if needed'
 if [ -d .venv ]; then
   source .venv/bin/activate
 fi
-# pyproject.toml 不是 requirements 檔，用 pip install -e .
 pip install -e . --quiet
 
 echo '==> [vm] Checking systemd service'
@@ -42,7 +67,6 @@ if systemctl list-unit-files | grep -q \"^${SERVICE_NAME}.service\"; then
   echo \"==> [vm] Restarting $SERVICE_NAME (systemd)\"
   sudo systemctl restart \"$SERVICE_NAME\"
   
-  # Wait for service to be active
   for i in \$(seq 1 $HEALTH_CHECK_TIMEOUT); do
     if systemctl is-active --quiet \"$SERVICE_NAME\"; then
       echo \"==> [vm] $SERVICE_NAME is active\"
@@ -56,13 +80,11 @@ if systemctl list-unit-files | grep -q \"^${SERVICE_NAME}.service\"; then
     fi
   done
   
-  # Get PID
   PID=\$(systemctl show --property=MainPID --value \"$SERVICE_NAME\")
   echo \"==> [vm] Service PID: \$PID\"
   
 else
   echo \"ERROR: $SERVICE_NAME.service not found on VM\"
-  echo \"       Please set up systemd unit first (see docs/)\"
   exit 1
 fi
 
@@ -90,7 +112,7 @@ else
   echo \"WARN: Log file $LOG_FILE not found\"
 fi
 
-# 3. Database accessible (SQLite check)
+# 3. Database accessible
 if [ -f \"\${REPO_DIR}/testnet/data/gridbot_testnet.db\" ]; then
   sqlite3 \"\${REPO_DIR}/testnet/data/gridbot_testnet.db\" \"SELECT 1;\" >/dev/null 2>&1
   if [ \$? -eq 0 ]; then
@@ -103,14 +125,20 @@ else
   echo \"WARN: Database file not at expected path\"
 fi
 
-# 4. Telegram bot responding (optional - check if process logs show connected)
-# Just tail recent log for sanity
+# 4. Tail recent log
 tail -n 5 \"$LOG_FILE\" 2>/dev/null | head -5
 
 echo '==> [vm] Deploy successful!'
 echo \"==> Bot PID: \$PID\"
 echo \"==> Log: $LOG_FILE\"
-echo \"==> To tail: gcloud compute ssh $VM_NAME --zone=$VM_ZONE --command='tail -f $LOG_FILE'\"
 "
 
-echo "==> [local] Deploy finished!"
+run_on_vm "$DEPLOY_SCRIPT"
+
+if [ $? -eq 0 ]; then
+    echo "==> [local] Deploy successful!"
+    echo "==> To tail: gcloud compute ssh $VM_NAME --zone=$VM_ZONE --command='tail -f $LOG_FILE'"
+else
+    echo "ERROR: Deploy failed"
+    exit 1
+fi
