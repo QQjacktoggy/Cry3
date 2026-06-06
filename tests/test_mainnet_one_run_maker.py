@@ -10,6 +10,7 @@ class FakeRepo:
         self.updated = []
         self.events = []
         self.completed = []
+        self.first_event_time = {}
 
     async def get_latest_run(self):
         return None
@@ -28,6 +29,9 @@ class FakeRepo:
 
     async def complete_run(self, run_id, status, exit_reason=None, error=None):
         self.completed.append((run_id, status, exit_reason, error))
+
+    async def get_first_event_time(self, run_id, event_type):
+        return self.first_event_time.get((run_id, event_type))
 
 
 class FakeBot:
@@ -247,6 +251,33 @@ async def test_run_running_stop_loss_closes_with_market_and_cancels_tp_orders():
     assert client.market_orders[0]["side"] == "SELL"
     assert telegram.bot.messages
     assert "reason=<b>SL</b>" in telegram.bot.messages[-1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_run_running_max_hold_counts_from_entry_fill_not_arm_time():
+    import time
+
+    client = FakeClient()
+    client.position = PositionInfo(
+        symbol="ETHUSDC",
+        position_amt=0.12,
+        entry_price=100.0,
+        mark_price=100.2,
+        unrealized_pnl=0.02,
+        liquidation_price=80.0,
+        leverage=75,
+        margin_type="cross",
+    )
+    repo = FakeRepo()
+    run_id = "cry3mn_test"
+    repo.first_event_time[(run_id, "entry_filled")] = int(time.time() * 1000) - 5 * 60_000
+    manager = MainnetOneRunManager(_settings(), client, repo, FakeTelegramApp())
+    run = _run(run_id=run_id, armed_at_ms=int(time.time() * 1000) - 25 * 60_000, signal_json='{"side":"LONG","take_profit":101.0,"stop_loss":99.0}', avg_entry_price=100.0)
+
+    await manager._run_running(run)
+
+    assert client.market_orders == []
+    assert not repo.completed
 
 
 @pytest.mark.asyncio

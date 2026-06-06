@@ -556,6 +556,17 @@ class MainnetRunRepository:
             (run_id, limit),
         )
 
+    async def get_first_event_time(self, run_id: str, event_type: str) -> int | None:
+        row = await self._db.fetchone(
+            """SELECT MIN(event_time_ms) AS event_time_ms
+            FROM mainnet_run_events
+            WHERE run_id = ? AND event_type = ?""",
+            (run_id, event_type),
+        )
+        if not row or row["event_time_ms"] is None:
+            return None
+        return int(row["event_time_ms"])
+
 
 class ConfigRepository:
     def __init__(self, db: Database) -> None:

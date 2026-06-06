@@ -260,7 +260,8 @@ class MainnetOneRunManager:
         qty = current_qty
         sl_price = float(signal.get("stop_loss") or 0.0)
         close_side = "SELL" if position.position_amt > 0 else "BUY"
-        run_age_bars = max(0, int((int(time.time() * 1000) - int(run["armed_at_ms"])) / 60_000))
+        hold_start_ms = await self._get_hold_start_ms(run)
+        run_age_bars = max(0, int((int(time.time() * 1000) - hold_start_ms) / 60_000))
 
         await self._refresh_partial_fill_state(run, position)
         await self._sync_take_profit_orders(run, position, signal)
@@ -278,6 +279,15 @@ class MainnetOneRunManager:
         if run_age_bars >= self._settings.mainnet_max_holding_bars:
             reason = "MAX_HOLD_WIN" if position.unrealized_pnl >= 0 else "MAX_HOLD_LOSS"
             await self._close_position(symbol, close_side, qty, reason, run)
+
+    async def _get_hold_start_ms(self, run: dict) -> int:
+        cached = run.get("_hold_start_ms")
+        if cached is not None:
+            return int(cached)
+        entry_filled_at_ms = await self._repo.get_first_event_time(run["run_id"], "entry_filled")
+        hold_start_ms = int(entry_filled_at_ms or run.get("armed_at_ms") or int(time.time() * 1000))
+        run["_hold_start_ms"] = hold_start_ms
+        return hold_start_ms
 
     async def _place_entry(self, run: dict, decision: WildcatLiveDecision) -> None:
         await self._ensure_fee_guard(run["symbol"])
