@@ -71,6 +71,12 @@ class MainnetOneRunManager:
         # currently active run counts as the first).
         self._loop_total: int = 0
         self._loop_completed: int = 0
+        # Cooldown tracker for loop chains: key = (side, strategy_label),
+        # value = cooldown_until_ms.  After an SL exit, the same side +
+        # strategy combination is blocked for the configured duration so
+        # we do not chain into an identical losing setup.
+        self._loop_cooldowns: dict[tuple[str, str], int] = {}
+        self._loop_cooldown_minutes: int = self._settings.mainnet_loop_cooldown_minutes
 
     async def status(self) -> RunStatus:
         latest = await self._repo.get_latest_run()
@@ -1212,6 +1218,16 @@ class MainnetOneRunManager:
         position_label = (
             f" ({self._loop_completed}/{self._loop_total})" if in_loop else ""
         )
+        # If SL exit and we are in a loop, set cooldown for this
+        # (side, strategy_label) so the chain-arm skips the next same
+        # signal.
+        from_loop_chain = run.get("params", {}).get("actor") == "telegram_loop" or in_loop
+        if from_loop_chain and exit_reason == "SL":
+            side = str((run.get("params") or {}).get("side") or run.get("side") or "").upper()
+            strategy = run.get("strategy_label") or ""
+            if side and strategy:
+                cooldown_until = int(time.time() * 1000) + self._loop_cooldown_minutes * 60_000
+                self._loop_cooldowns[(side, strategy)] = cooldown_until
         loop_footer = ""
         if in_loop and self._loop_completed < self._loop_total:
             remaining = self._loop_total - self._loop_completed
@@ -1239,51 +1255,79 @@ class MainnetOneRunManager:
         # next wildcat signal.
         if in_loop and self._loop_completed < self._loop_total:
             try:
-                # Chain-arm: build a new run directly.  Bypasses the
-                # "already have active run" guard and the
-                # preflight-not-needed-for-loop path.  We DO still call
-                # preflight — if it fails, the loop is aborted safely.
-                preflight_error = await self._preflight()
-                if preflight_error:
-                    await self._notify(
-                        f"❌ <b>Loop 自動 arm 失敗</b>\n"
-                        f"前一個 run：<code>{escape(run['run_id'])}</code>\n"
-                        f"原因：<code>{escape(preflight_error[:300])}</code>\n"
-                        "Loop 已中止，請手動確認。"
-                    )
-                    self._loop_total = 0
-                    self._loop_completed = 0
-                else:
-                    next_run_id = f"{self._settings.mainnet_client_order_prefix}_{int(time.time() * 1000)}"
-                    next_index = self._loop_completed + 1
-                    next_params = {
-                        "actor": "telegram_loop",
-                        "symbol": self._settings.mainnet_symbol,
-                        "strategy": self._settings.mainnet_strategy_label,
-                        "equity_cap_usdc": self._settings.mainnet_equity_cap_usdc,
-                        "initial_notional_usdc": self._settings.mainnet_effective_entry_notional_usdc,
-                        "max_cumulative_notional_usdc": self._settings.mainnet_effective_max_cumulative_notional_usdc,
-                        "leverage": self._settings.mainnet_leverage,
-                        "maker_first": True,
-                        "loop_count": self._loop_total,
-                        "loop_index": next_index,
-                    }
-                    await self._repo.create_run(
-                        {
-                            "run_id": next_run_id,
+                # Check cooldown: if the previous run exited via SL, the
+                # same (side, strategy) may still be in cooldown.  In that
+                # case we skip one arm cycle — the loop still has remaining
+                # runs in counter but we wait for the cooldown to expire
+                # before chaining the next run.
+                now_ms = int(time.time() * 1000)
+                side = str((run.get("params") or {}).get("side") or run.get("side") or "").upper()
+                strategy = run.get("strategy_label") or ""
+                cooldown_key = (side, strategy)
+                cooldown_remaining = 0
+                if side and strategy:
+                    cooldown_until = self._loop_cooldowns.get(cooldown_key, 0)
+                    if cooldown_until > now_ms:
+                        cooldown_remaining = (cooldown_until - now_ms) // 1000
+                        logger.info(
+                            "mainnet_one_run_loop_cooldown_skip",
+                            side=side,
+                            strategy=strategy,
+                            cooldown_remaining_seconds=cooldown_remaining,
+                            completed=self._loop_completed,
+                            total=self._loop_total,
+                        )
+                        await self._notify(
+                            f"⏳ <b>Cooldown 中，跳過 arm</b>\\n"
+                            f"方向：<b>{escape(side)}</b> / 策略：<b>{escape(strategy)}</b>\\n"
+                            f"冷卻剩 <b>{cooldown_remaining}s</b>，完成後才 arm 下一 run。\\n"
+                            f"目前進度：<b>{self._loop_completed}/{self._loop_total}</b>\\n"
+                            "Loop 保留中，cooldown 到期後自動繼續。"
+                        )
+                if cooldown_remaining == 0:
+                    # Proceed with chain-arm: build a new run directly.
+                    # Bypasses the "already have active run" guard.
+                    preflight_error = await self._preflight()
+                    if preflight_error:
+                        await self._notify(
+                            f"❌ <b>Loop 自動 arm 失敗</b>\n"
+                            f"前一個 run：<code>{escape(run['run_id'])}</code>\n"
+                            f"原因：<code>{escape(preflight_error[:300])}</code>\n"
+                            "Loop 已中止，請手動確認。"
+                        )
+                        self._loop_total = 0
+                        self._loop_completed = 0
+                    else:
+                        next_run_id = f"{self._settings.mainnet_client_order_prefix}_{int(time.time() * 1000)}"
+                        next_index = self._loop_completed + 1
+                        next_params = {
+                            "actor": "telegram_loop",
                             "symbol": self._settings.mainnet_symbol,
-                            "strategy_label": self._settings.mainnet_strategy_label,
-                            "status": "ARMED",
-                            "params": next_params,
+                            "strategy": self._settings.mainnet_strategy_label,
+                            "equity_cap_usdc": self._settings.mainnet_equity_cap_usdc,
+                            "initial_notional_usdc": self._settings.mainnet_effective_entry_notional_usdc,
+                            "max_cumulative_notional_usdc": self._settings.mainnet_effective_max_cumulative_notional_usdc,
+                            "leverage": self._settings.mainnet_leverage,
+                            "maker_first": True,
+                            "loop_count": self._loop_total,
+                            "loop_index": next_index,
                         }
-                    )
-                    await self._repo.log_event(next_run_id, "armed", next_params)
-                    await self._notify(
-                        f"🔄 <b>Loop 自動 arm 下一個 run</b>\n"
-                        f"✅ Mainnet one-run 已啟動 ({next_index}/{self._loop_total})\n"
-                        f"Run：<code>{escape(next_run_id)}</code>\n"
-                        f"接下來只會等待下一個 wildcat 訊號；沒訊號時不會下單。"
-                    )
+                        await self._repo.create_run(
+                            {
+                                "run_id": next_run_id,
+                                "symbol": self._settings.mainnet_symbol,
+                                "strategy_label": self._settings.mainnet_strategy_label,
+                                "status": "ARMED",
+                                "params": next_params,
+                            }
+                        )
+                        await self._repo.log_event(next_run_id, "armed", next_params)
+                        await self._notify(
+                            f"🔄 <b>Loop 自動 arm 下一個 run</b>\n"
+                            f"✅ Mainnet one-run 已啟動 ({next_index}/{self._loop_total})\n"
+                            f"Run：<code>{escape(next_run_id)}</code>\n"
+                            f"接下來只會等待下一個 wildcat 訊號；沒訊號時不會下單。"
+                        )
             except Exception as exc:  # noqa: BLE001
                 logger.error(
                     "mainnet_one_run_loop_chain_failed",

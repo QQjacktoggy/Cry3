@@ -204,6 +204,11 @@ class Settings(BaseSettings):
     mainnet_sl_maker_ttl_seconds: int = 10
     mainnet_sl_fallback_to_market: bool = True
 
+    # Loop cooldown: after an SL exit in a loop chain, the same
+    # (side, strategy_label) combination is blocked for N minutes so
+    # we do not chain into an identical losing setup.
+    mainnet_loop_cooldown_minutes: int = 5
+
     @property
     def mainnet_effective_entry_notional_usdc(self) -> float:
         """Clamp one-run single-ticket notional to the configured equity cap."""
