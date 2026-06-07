@@ -222,6 +222,20 @@ class MainnetOneRunManager:
                 {"entry_price": position.entry_price, "qty": abs(position.position_amt)},
             )
             await self._sync_take_profit_orders(run, position, json.loads(run.get("signal_json") or "{}"))
+            # Place initial stop-loss maker order if enabled
+            if self._settings.mainnet_sl_use_maker:
+                signal = json.loads(run.get("signal_json") or "{}")
+                sl_price = float(signal.get("stop_loss") or 0.0)
+                if sl_price > 0:
+                    await self._place_stop_loss_maker(
+                        symbol=symbol,
+                        side="SELL" if position.position_amt > 0 else "BUY",
+                        qty_str=await self._client.format_quantity(symbol, abs(position.position_amt)),
+                        sl_price=sl_price,
+                        run_id=run["run_id"],
+                        reason="SL",
+                        run=run,
+                    )
             await self._notify(
                 "✅ <b>Mainnet one-run 已成交</b>\n"
                 f"Run：<code>{escape(run['run_id'])}</code>\n"
@@ -258,6 +272,27 @@ class MainnetOneRunManager:
             return
         current_qty = abs(position.position_amt)
         if abs(current_qty - float(run.get("qty") or 0.0)) > 1e-9:
+            # DCA filled - update SL maker to new average entry price
+            await self._cancel_stop_loss_order(symbol, run["run_id"])
+            if self._settings.mainnet_sl_use_maker:
+                signal = json.loads(run.get("signal_json") or "{}")
+                sl_pct = float(signal.get("wildcat", {}).get("sl_pct") or 0.0)
+                if sl_pct > 0:
+                    new_avg_entry = position.entry_price
+                    if new_avg_entry > 0:
+                        if position.position_direction == "LONG":
+                            new_sl = new_avg_entry * (1 - sl_pct)
+                        else:
+                            new_sl = new_avg_entry * (1 + sl_pct)
+                        await self._place_stop_loss_maker(
+                            symbol=symbol,
+                            side="SELL" if position.position_amt > 0 else "BUY",
+                            qty_str=await self._client.format_quantity(symbol, current_qty),
+                            sl_price=new_sl,
+                            run_id=run["run_id"],
+                            reason="SL",
+                            run=run,
+                        )
             await self._repo.update_run(run["run_id"], qty=current_qty)
             run["qty"] = current_qty
         if run["status"] == "CLOSING":
@@ -989,9 +1024,11 @@ class MainnetOneRunManager:
         stop_loss first (if enabled), with TTL fallback to market.
         Other reasons (ADVERSE_EXIT, MAX_HOLD_*) go straight to market.
         """
-        await self._cancel_take_profit_orders(symbol, run["run_id"])
-        qty_str = await self._client.format_quantity(symbol, qty)
         run_id = run["run_id"]
+        # Cancel all open orders (TP + SL) for this run
+        await self._cancel_take_profit_orders(symbol, run_id)
+        await self._cancel_stop_loss_order(symbol, run_id)
+        qty_str = await self._client.format_quantity(symbol, qty)
 
         if reason == "SL" and self._settings.mainnet_sl_use_maker:
             # Try maker SL at stop_loss price.
@@ -1114,6 +1151,12 @@ class MainnetOneRunManager:
         for order in open_orders:
             client_order_id = str(order.get("clientOrderId") or "")
             if client_order_id.startswith(f"{run_id}_tp"):
+                await self._client.cancel_order(symbol, int(order["orderId"]))
+
+    async def _cancel_stop_loss_order(self, symbol: str, run_id: str) -> None:
+        open_orders = await self._client.get_open_orders(symbol)
+        for order in open_orders:
+            if str(order.get("clientOrderId") or "") == f"{run_id}_sl":
                 await self._client.cancel_order(symbol, int(order["orderId"]))
 
     async def _finish_flat_run(self, run: dict, reason: str) -> None:
