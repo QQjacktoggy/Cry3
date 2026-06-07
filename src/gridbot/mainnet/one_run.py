@@ -66,6 +66,11 @@ class MainnetOneRunManager:
         # the TTL check).
         self._entry_requote_counts: dict[str, int] = {}
         self._entry_requote_last_ms: dict[str, int] = {}
+        # Loop state: when user arms N>1 runs, we chain automatic re-arms
+        # after each run completes.  remaining = runs left to arm (the
+        # currently active run counts as the first).
+        self._loop_total: int = 0
+        self._loop_completed: int = 0
 
     async def status(self) -> RunStatus:
         latest = await self._repo.get_latest_run()
@@ -104,11 +109,13 @@ class MainnetOneRunManager:
             )
         return RunStatus("\n".join(lines), self._buttons(active=False))
 
-    async def arm(self, actor: str = "telegram") -> str:
+    async def arm(self, actor: str = "telegram", loop_count: int = 1) -> str:
         if not self._settings.mainnet_one_run_enabled:
             return "❌ Mainnet one-run 尚未啟用。請設定 MAINNET_ONE_RUN_ENABLED=true。"
         if not self._settings.mainnet_api_key or not self._settings.mainnet_api_secret:
             return "❌ 尚未設定 MAINNET_API_KEY / MAINNET_API_SECRET。"
+        if loop_count < 1:
+            return "❌ loop_count 必須 >= 1。"
         active = await self._repo.get_active_run()
         if active:
             return f"⚠️ 已有 active run：<code>{escape(active['run_id'])}</code>，狀態 <b>{escape(active['status'])}</b>。"
@@ -122,6 +129,14 @@ class MainnetOneRunManager:
             return preflight_error
 
         run_id = f"{self._settings.mainnet_client_order_prefix}_{int(time.time() * 1000)}"
+        # Set up loop state on the FIRST run of a chain only.  When arm()
+        # is invoked from _finish_flat_run (loop chain), we keep the
+        # existing loop_total / loop_completed and only bump the
+        # remaining counter implicitly.
+        is_chain = actor == "telegram_loop"
+        if not is_chain:
+            self._loop_total = int(loop_count)
+            self._loop_completed = 0
         params = {
             "actor": actor,
             "symbol": self._settings.mainnet_symbol,
@@ -131,6 +146,7 @@ class MainnetOneRunManager:
             "max_cumulative_notional_usdc": self._settings.mainnet_effective_max_cumulative_notional_usdc,
             "leverage": self._settings.mainnet_leverage,
             "maker_first": True,
+            "loop_count": int(loop_count),
         }
         await self._repo.create_run(
             {
@@ -142,6 +158,14 @@ class MainnetOneRunManager:
             }
         )
         await self._repo.log_event(run_id, "armed", params)
+        # For loop chains, show position (next/N) instead of (1/N).
+        if self._loop_total > 1:
+            next_index = (self._loop_completed + 1) if is_chain else 1
+            return (
+                f"✅ <b>Mainnet one-run 已啟動 ({next_index}/{self._loop_total})</b>\n"
+                f"Run：<code>{escape(run_id)}</code>\n"
+                f"接下來只會等待下一個 wildcat 訊號；沒訊號時不會下單。"
+            )
         return (
             "✅ <b>Mainnet one-run 已啟動</b>\n"
             f"Run：<code>{escape(run_id)}</code>\n"
@@ -152,6 +176,9 @@ class MainnetOneRunManager:
         active = await self._repo.get_active_run()
         if not active:
             return "目前沒有 active mainnet run。"
+        was_in_loop = self._loop_total > 0
+        loop_completed = self._loop_completed
+        loop_total = self._loop_total
         symbol = active["symbol"]
         try:
             for order in await self._client.get_open_orders(symbol):
@@ -162,6 +189,14 @@ class MainnetOneRunManager:
             logger.warning("mainnet_one_run_cancel_orders_failed", error=str(exc))
         await self._repo.complete_run(active["run_id"], "CANCELLED", "telegram_cancel")
         await self._repo.log_event(active["run_id"], "cancelled", {"source": "telegram"})
+        # Clear loop state on cancel
+        self._loop_total = 0
+        self._loop_completed = 0
+        if was_in_loop:
+            return (
+                f"🛑 已取消 run：<code>{escape(active['run_id'])}</code>。\n"
+                f"Loop 已中止（已完成 {loop_completed}/{loop_total}）。"
+            )
         return f"🛑 已取消 run：<code>{escape(active['run_id'])}</code>。"
 
     async def run_cycle(self) -> None:
@@ -1170,15 +1205,99 @@ class MainnetOneRunManager:
         )
         await self._repo.complete_run(run["run_id"], "COMPLETED", exit_reason)
         await self._repo.log_event(run["run_id"], "completed", {"reason": reason})
+        # Loop progress: increment completed and compute position label.
+        in_loop = self._loop_total > 0
+        if in_loop:
+            self._loop_completed += 1
+        position_label = (
+            f" ({self._loop_completed}/{self._loop_total})" if in_loop else ""
+        )
+        loop_footer = ""
+        if in_loop and self._loop_completed < self._loop_total:
+            remaining = self._loop_total - self._loop_completed
+            loop_footer = (
+                f"\n🔁 還剩 <b>{remaining}</b> 個 run，即將自動 arm 下一個。"
+            )
+        elif in_loop and self._loop_completed >= self._loop_total:
+            loop_footer = "\n🎯 全部 run 已完成，loop 結束。"
+            # Reset loop state at the end
+            self._loop_total = 0
+            self._loop_completed = 0
         await self._notify(
-            "🏁 <b>Mainnet one-run 已完成</b>\n"
+            f"🏁 <b>Mainnet one-run 已完成{position_label}</b>\n"
             f"Run：<code>{escape(run['run_id'])}</code>\n"
             f"結果：<code>{escape(str(exit_reason))}</code>\n"
             f"最大倉位：<code>{summary['qty']:.6f}</code>\n"
             f"已實現損益：<b>${summary['realized_pnl_usdc']:.4f}</b>\n"
             f"手續費：<b>${summary['commission_usdc']:.4f}</b>\n"
             "自動交易已回到待命，不會自動開下一單。"
+            f"{loop_footer}"
         )
+        # If loop continues, auto-arm the next run.  This must happen AFTER
+        # the COMPLETED notification so the user sees the prior run's
+        # summary first.  The new run will be ARMED; it will wait for the
+        # next wildcat signal.
+        if in_loop and self._loop_completed < self._loop_total:
+            try:
+                # Chain-arm: build a new run directly.  Bypasses the
+                # "already have active run" guard and the
+                # preflight-not-needed-for-loop path.  We DO still call
+                # preflight — if it fails, the loop is aborted safely.
+                preflight_error = await self._preflight()
+                if preflight_error:
+                    await self._notify(
+                        f"❌ <b>Loop 自動 arm 失敗</b>\n"
+                        f"前一個 run：<code>{escape(run['run_id'])}</code>\n"
+                        f"原因：<code>{escape(preflight_error[:300])}</code>\n"
+                        "Loop 已中止，請手動確認。"
+                    )
+                    self._loop_total = 0
+                    self._loop_completed = 0
+                else:
+                    next_run_id = f"{self._settings.mainnet_client_order_prefix}_{int(time.time() * 1000)}"
+                    next_index = self._loop_completed + 1
+                    next_params = {
+                        "actor": "telegram_loop",
+                        "symbol": self._settings.mainnet_symbol,
+                        "strategy": self._settings.mainnet_strategy_label,
+                        "equity_cap_usdc": self._settings.mainnet_equity_cap_usdc,
+                        "initial_notional_usdc": self._settings.mainnet_effective_entry_notional_usdc,
+                        "max_cumulative_notional_usdc": self._settings.mainnet_effective_max_cumulative_notional_usdc,
+                        "leverage": self._settings.mainnet_leverage,
+                        "maker_first": True,
+                        "loop_count": self._loop_total,
+                        "loop_index": next_index,
+                    }
+                    await self._repo.create_run(
+                        {
+                            "run_id": next_run_id,
+                            "symbol": self._settings.mainnet_symbol,
+                            "strategy_label": self._settings.mainnet_strategy_label,
+                            "status": "ARMED",
+                            "params": next_params,
+                        }
+                    )
+                    await self._repo.log_event(next_run_id, "armed", next_params)
+                    await self._notify(
+                        f"🔄 <b>Loop 自動 arm 下一個 run</b>\n"
+                        f"✅ Mainnet one-run 已啟動 ({next_index}/{self._loop_total})\n"
+                        f"Run：<code>{escape(next_run_id)}</code>\n"
+                        f"接下來只會等待下一個 wildcat 訊號；沒訊號時不會下單。"
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "mainnet_one_run_loop_chain_failed",
+                    run_id=run["run_id"],
+                    error=str(exc),
+                )
+                await self._notify(
+                    f"❌ <b>Loop 自動 arm 失敗</b>\n"
+                    f"前一個 run：<code>{escape(run['run_id'])}</code>\n"
+                    f"錯誤：<code>{escape(str(exc)[:300])}</code>\n"
+                    "Loop 已中止，請手動確認。"
+                )
+                self._loop_total = 0
+                self._loop_completed = 0
 
     async def _build_run_summary(self, run: dict) -> dict[str, float | str | None]:
         orders, trades = await self._load_run_orders_and_trades(run)
@@ -1291,7 +1410,14 @@ class MainnetOneRunManager:
             )
         return InlineKeyboardMarkup(
             [
-                [InlineKeyboardButton("啟動 mainnet one-run", callback_data="mainnet:arm")],
+                [
+                    InlineKeyboardButton("啟動 1 run", callback_data="mainnet:arm:1"),
+                    InlineKeyboardButton("啟動 3 runs", callback_data="mainnet:arm:3"),
+                ],
+                [
+                    InlineKeyboardButton("啟動 5 runs", callback_data="mainnet:arm:5"),
+                    InlineKeyboardButton("啟動 10 runs", callback_data="mainnet:arm:10"),
+                ],
                 [InlineKeyboardButton("查詢 one-run 狀態", callback_data="mainnet:status")],
             ]
         )

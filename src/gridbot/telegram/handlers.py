@@ -928,12 +928,21 @@ async def handle_mainnet_callback(update: Update, context: ContextTypes.DEFAULT_
         return
     data = query.data or ""
     await query.answer("處理中...")
-    if data == "mainnet:arm":
-        text = await manager.arm(actor="telegram")
-        await query.message.reply_text(text, parse_mode="HTML")
-        return
     if data == "mainnet:cancel":
         text = await manager.cancel()
+        await query.message.reply_text(text, parse_mode="HTML")
+        return
+    if data.startswith("mainnet:arm"):
+        # mainnet:arm (legacy) = 1 run; mainnet:arm:N = N runs
+        loop_count = 1
+        if data.startswith("mainnet:arm:"):
+            try:
+                loop_count = int(data.split(":")[-1])
+            except ValueError:
+                loop_count = 1
+        if loop_count < 1:
+            loop_count = 1
+        text = await manager.arm(actor="telegram", loop_count=loop_count)
         await query.message.reply_text(text, parse_mode="HTML")
         return
     status = await manager.status()
