@@ -158,14 +158,14 @@ HEAD:  bfb2c06
 ## 6. 已知待辦（未變更；待今晚維修）
 
 1. **退出順序不一致**: `mainnet_run_events` 最後事件是 `completed`（trigger=flat_detected），但 `mainnet_runs.exit_reason` 被蓋成 `TP`。
-   - 確認案例：`cry3mn_1780790738810`、`cry3mn_1780798188001`（2026-06-07）
+   - 確認案例：`cry3mn_1780790738810`、`cry3mn_1780798188001`（2026-06-07，LONG S1_BB_RSI score=70, entry 1584.6, qty 0.126, realized +0.2368, fee 0.0488）
    - 現象：在 TP 尚未吃到前先被 `flat_detected` 收盤，但覆蓋邏輯最後把 `exit_reason` 寫成 `TP`
 2. **DCA 失敗通知誤報**: Telegram 先送 `⚠️ DCA #1 掛單失敗`，緊接著又補 `🧩 DCA #1 已掛`。
-   - 確認案例：`cry3mn_1780798188001`；DB 顯示 DCA #1 實際已掛上 Binance（orderId 68193833862, GTX 1583.66）
+   - 確認案例：`cry3mn_1780798188001`；DB 顯示 DCA #1 實際已掛上 Binance（orderId 68193833862, GTX 1583.66, cumulative notional 400 USDC）
    - 可能原因：`_maybe_recovery()` 與 `_sync_take_profit_orders()` 在同一 cycle 內競速，state 刷新造成短暫不一致
-3. **TP sync 仍然過密**: 單一 run 內仍有十幾到數十次 `take_profit_synced`（例如 `cry3mn_1780798188001` 約 30 次，partial 從 0.05 逐次縮到 0.001）。
-   - 今日 commit `bfb2c06` 只是容忍錯誤，沒有減少必要性
-   - 需後續評估 match algo 是否能更穩定判別「真的需要 sync」還是「只是 partial 被正常吃掉」
+3. **TP sync 仍然過密**: 單一 run 內約 30 次 `take_profit_synced`（`cry3mn_1780798188001` 從 entry_filled 到 completed 共 31 次 sync，partial 從 0.126 → 0.001 逐步縮小）。
+   - 今日 commit `bfb2c06` 只是容忍 cancel error，沒有減少必要性
+   - 根因仍是 match algo 在 partial 被正常吃掉時頻繁觸發 rebuild
 4. **DB 資料遷移**: 異常路徑 `/home/jack_shih/cry3/testnet/testnet/data/gridbot_testnet.db` 內有歷史 run（`cry3mn_1780790738810`, `cry3mn_1780791973100`）。如需回填主 DB，可寫一次性 migrate script。
 5. **cry3.service / deploy.sh**: 目前仍靠 nohup 手動管理，尚未整理成 systemd 穩定流程。
 
