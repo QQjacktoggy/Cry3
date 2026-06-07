@@ -122,7 +122,6 @@ class MainnetOneRunManager:
                         f"方向：<b>{escape(str(active.get('side') or '-'))}</b>",
                     ]
                 )
-                return RunStatus("\n".join(lines), self._buttons(active=True))
             if latest:
                 lines.extend(
                     [
@@ -132,7 +131,9 @@ class MainnetOneRunManager:
                         f"結果：<code>{escape(str(latest.get('exit_reason') or '-'))}</code>",
                     ]
                 )
-            return RunStatus("\n".join(lines), self._buttons(active=False))
+            markup = self._buttons(active=bool(active))
+            logger.info("mainnet_status_reply", has_markup=markup is not None, active=bool(active), loop_total=self._loop_total)
+            return RunStatus("\n".join(lines), markup)
 
     async def arm(self, actor: str = "telegram", loop_count: int = 1) -> str:
         if not self._settings.mainnet_one_run_enabled:
