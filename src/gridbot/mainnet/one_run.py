@@ -782,7 +782,19 @@ class MainnetOneRunManager:
         if self._take_profit_orders_match(existing_tp, desired, current_qty):
             return
         for order in existing_tp:
-            await self._client.cancel_order(position.symbol, int(order["orderId"]))
+            try:
+                await self._client.cancel_order(position.symbol, int(order["orderId"]))
+            except BinanceAPIException as exc:
+                if exc.code in {-2011, -2022}:
+                    logger.info(
+                        "tp_cancel_order_not_found",
+                        run_id=run_id,
+                        order_id=int(order["orderId"]),
+                        code=exc.code,
+                        msg=exc.message,
+                    )
+                else:
+                    raise
         for client_order_id, qty, price in desired:
             try:
                 await self._client.create_reduce_only_limit_order(
