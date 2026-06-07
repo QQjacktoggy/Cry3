@@ -79,41 +79,60 @@ class MainnetOneRunManager:
         self._loop_cooldown_minutes: int = self._settings.mainnet_loop_cooldown_minutes
 
     async def status(self) -> RunStatus:
-        latest = await self._repo.get_latest_run()
-        active = await self._repo.get_active_run()
-        entry_notional = self._settings.mainnet_effective_entry_notional_usdc
-        entry_margin = self._settings.mainnet_effective_entry_margin_usdc
-        lines = [
-            "🧪 <b>Mainnet One-Run 驗證</b>",
-            f"狀態：<b>{'已啟用' if self._settings.mainnet_one_run_enabled else '未啟用'}</b>",
-            f"交易對：<code>{escape(self._settings.mainnet_symbol)}</code>",
-            f"策略：<code>{escape(self._settings.mainnet_strategy_label)}</code>",
-            f"資金上限：<b>${self._settings.mainnet_equity_cap_usdc:.2f} USDC</b>",
-            f"單筆名目/槓桿：<b>${entry_notional:.2f}</b> / <b>{self._settings.mainnet_leverage}x</b>",
-            f"預估保證金：<b>${entry_margin:.4f} USDC</b>",
-            "",
-            "訊號仍會照常推送；按下啟動後，只會把下一個符合條件的 wildcat 訊號接成一個自動 run。",
-        ]
-        if active:
-            lines.extend(
-                [
-                    "",
-                    f"目前 active run：<code>{escape(active['run_id'])}</code>",
-                    f"狀態：<b>{escape(active['status'])}</b>",
-                    f"方向：<b>{escape(str(active.get('side') or '-'))}</b>",
-                ]
-            )
-            return RunStatus("\n".join(lines), self._buttons(active=True))
-        if latest:
-            lines.extend(
-                [
-                    "",
-                    f"最近 run：<code>{escape(latest['run_id'])}</code>",
-                    f"狀態：<b>{escape(latest['status'])}</b>",
-                    f"結果：<code>{escape(str(latest.get('exit_reason') or '-'))}</code>",
-                ]
-            )
-        return RunStatus("\n".join(lines), self._buttons(active=False))
+            latest = await self._repo.get_latest_run()
+            active = await self._repo.get_active_run()
+            entry_notional = self._settings.mainnet_effective_entry_notional_usdc
+            entry_margin = self._settings.mainnet_effective_entry_margin_usdc
+            lines = [
+                "🧪 <b>Mainnet One-Run 驗證</b>",
+                f"狀態：<b>{'已啟用' if self._settings.mainnet_one_run_enabled else '未啟用'}</b>",
+                f"交易對：<code>{escape(self._settings.mainnet_symbol)}</code>",
+                f"策略：<code>{escape(self._settings.mainnet_strategy_label)}</code>",
+                f"資金上限：<b>${self._settings.mainnet_equity_cap_usdc:.2f} USDC</b>",
+                f"單筆名目/槓桿：<b>${entry_notional:.2f}</b> / <b>{self._settings.mainnet_leverage}x</b>",
+                f"預估保證金：<b>${entry_margin:.4f}</b>",
+                "",
+                "訊號仍會照常推送；按下啟動後，只會把下一個符合條件的 wildcat 訊號接成一個自動 run。",
+            ]
+            if self._loop_total > 0:
+                lines.append("")
+                lines.append(
+                    f"🔁 <b>Loop 進行中：{self._loop_completed}/{self._loop_total}</b>"
+                )
+                if self._loop_cooldowns:
+                    now_ms = int(time.time() * 1000)
+                    active_cooldowns = [
+                        (k, v - now_ms)
+                        for k, v in self._loop_cooldowns.items()
+                        if v > now_ms
+                    ]
+                    if active_cooldowns:
+                        lines.append("⏳ <b>Cooldown 倒數：</b>")
+                        for (side, strat), remaining_ms in active_cooldowns[:5]:
+                            remaining_s = int(remaining_ms // 1000)
+                            lines.append(
+                                f"   • {side} {strat}: <b>{remaining_s}s</b>"
+                            )
+            if active:
+                lines.extend(
+                    [
+                        "",
+                        f"目前 active run：<code>{escape(active['run_id'])}</code>",
+                        f"狀態：<b>{escape(active['status'])}</b>",
+                        f"方向：<b>{escape(str(active.get('side') or '-'))}</b>",
+                    ]
+                )
+                return RunStatus("\n".join(lines), self._buttons(active=True))
+            if latest:
+                lines.extend(
+                    [
+                        "",
+                        f"最近 run：<code>{escape(latest['run_id'])}</code>",
+                        f"狀態：<b>{escape(latest['status'])}</b>",
+                        f"結果：<code>{escape(str(latest.get('exit_reason') or '-'))}</code>",
+                    ]
+                )
+            return RunStatus("\n".join(lines), self._buttons(active=False))
 
     async def arm(self, actor: str = "telegram", loop_count: int = 1) -> str:
         if not self._settings.mainnet_one_run_enabled:
@@ -204,6 +223,38 @@ class MainnetOneRunManager:
                 f"Loop 已中止（已完成 {loop_completed}/{loop_total}）。"
             )
         return f"🛑 已取消 run：<code>{escape(active['run_id'])}</code>。"
+
+    async def stop_loop(self) -> str:
+        """Stop the loop chain without cancelling the current run.
+
+        Clears loop counter, loop completions, and all cooldowns.  The
+        currently active run (if any) is left alone — only future
+        chain-arms are suppressed.  Use this to recover from a stuck
+        loop state (e.g. after a previous run FAILED before chain-arm
+        could fire).
+        """
+        if self._loop_total == 0:
+            return "目前沒有進行中的 loop。"
+        was_in_loop_total = self._loop_total
+        was_completed = self._loop_completed
+        n_cooldowns = len(
+            [v for v in self._loop_cooldowns.values() if v > int(time.time() * 1000)]
+        )
+        self._loop_total = 0
+        self._loop_completed = 0
+        self._loop_cooldowns.clear()
+        logger.info(
+            "mainnet_one_run_loop_stopped",
+            completed=was_completed,
+            total=was_in_loop_total,
+            cooldowns_cleared=n_cooldowns,
+        )
+        return (
+            f"⏹ <b>Loop 已停止</b>\n"
+            f"先前進度：<b>{was_completed}/{was_in_loop_total}</b>\n"
+            f"Cooldown 已清空：<b>{n_cooldowns}</b> 項。\n"
+            "目前 active run 不受影響，會繼續執行到結束。"
+        )
 
     async def run_cycle(self) -> None:
         if not self._settings.mainnet_one_run_enabled:
@@ -1446,25 +1497,31 @@ class MainnetOneRunManager:
 
     def _buttons(self, active: bool) -> InlineKeyboardMarkup:
         if active:
-            return InlineKeyboardMarkup(
-                [
-                    [InlineKeyboardButton("查詢 one-run 狀態", callback_data="mainnet:status")],
-                    [InlineKeyboardButton("取消目前 one-run", callback_data="mainnet:cancel")],
-                ]
-            )
-        return InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton("啟動 1 run", callback_data="mainnet:arm:1"),
-                    InlineKeyboardButton("啟動 3 runs", callback_data="mainnet:arm:3"),
-                ],
-                [
-                    InlineKeyboardButton("啟動 5 runs", callback_data="mainnet:arm:5"),
-                    InlineKeyboardButton("啟動 10 runs", callback_data="mainnet:arm:10"),
-                ],
+            rows = [
                 [InlineKeyboardButton("查詢 one-run 狀態", callback_data="mainnet:status")],
+                [InlineKeyboardButton("取消目前 one-run", callback_data="mainnet:cancel")],
             ]
-        )
+            if self._loop_total > 0:
+                rows.append(
+                    [InlineKeyboardButton("⏹ 停止 loop（不取消目前 run）", callback_data="mainnet:stop_loop")]
+                )
+            return InlineKeyboardMarkup(rows)
+        rows: list[list[InlineKeyboardButton]] = [
+            [
+                InlineKeyboardButton("啟動 1 run", callback_data="mainnet:arm:1"),
+                InlineKeyboardButton("啟動 3 runs", callback_data="mainnet:arm:3"),
+            ],
+            [
+                InlineKeyboardButton("啟動 5 runs", callback_data="mainnet:arm:5"),
+                InlineKeyboardButton("啟動 10 runs", callback_data="mainnet:arm:10"),
+            ],
+            [InlineKeyboardButton("查詢 one-run 狀態", callback_data="mainnet:status")],
+        ]
+        if self._loop_total > 0:
+            rows.append(
+                [InlineKeyboardButton("⏹ 停止 loop", callback_data="mainnet:stop_loop")]
+            )
+        return InlineKeyboardMarkup(rows)
 
     async def _notify(self, text: str) -> None:
         if not self._telegram_app or not self._settings.telegram_chat_id_int:

@@ -932,6 +932,10 @@ async def handle_mainnet_callback(update: Update, context: ContextTypes.DEFAULT_
         text = await manager.cancel()
         await query.message.reply_text(text, parse_mode="HTML")
         return
+    if data == "mainnet:stop_loop":
+        text = await manager.stop_loop()
+        await query.message.reply_text(text, parse_mode="HTML")
+        return
     if data.startswith("mainnet:arm"):
         # mainnet:arm (legacy) = 1 run; mainnet:arm:N = N runs
         loop_count = 1
