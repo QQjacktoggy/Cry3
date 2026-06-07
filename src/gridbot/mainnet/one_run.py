@@ -1505,23 +1505,20 @@ class MainnetOneRunManager:
                 rows.append(
                     [InlineKeyboardButton("⏹ 停止 loop（不取消目前 run）", callback_data="mainnet:stop_loop")]
                 )
+                return InlineKeyboardMarkup(rows)
+            rows: list[list[InlineKeyboardButton]] = [
+                [
+                    InlineKeyboardButton("啟動 1 run", callback_data="mainnet:arm:1"),
+                    InlineKeyboardButton("啟動 3 runs", callback_data="mainnet:arm:3"),
+                ],
+                [
+                    InlineKeyboardButton("啟動 5 runs", callback_data="mainnet:arm:5"),
+                    InlineKeyboardButton("啟動 10 runs", callback_data="mainnet:arm:10"),
+                ],
+                [InlineKeyboardButton("查詢 one-run 狀態", callback_data="mainnet:status")],
+                [InlineKeyboardButton("⏹ 停止 loop", callback_data="mainnet:stop_loop")],
+            ]
             return InlineKeyboardMarkup(rows)
-        rows: list[list[InlineKeyboardButton]] = [
-            [
-                InlineKeyboardButton("啟動 1 run", callback_data="mainnet:arm:1"),
-                InlineKeyboardButton("啟動 3 runs", callback_data="mainnet:arm:3"),
-            ],
-            [
-                InlineKeyboardButton("啟動 5 runs", callback_data="mainnet:arm:5"),
-                InlineKeyboardButton("啟動 10 runs", callback_data="mainnet:arm:10"),
-            ],
-            [InlineKeyboardButton("查詢 one-run 狀態", callback_data="mainnet:status")],
-        ]
-        if self._loop_total > 0:
-            rows.append(
-                [InlineKeyboardButton("⏹ 停止 loop", callback_data="mainnet:stop_loop")]
-            )
-        return InlineKeyboardMarkup(rows)
 
     async def _notify(self, text: str) -> None:
         if not self._telegram_app or not self._settings.telegram_chat_id_int:
