@@ -842,6 +842,11 @@ async def cmd_mainnet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     """/mainnet — Mainnet one-run status and controls."""
     if not await _authorized(update, context):
         return
+    logger.info(
+        "telegram_cmd_mainnet_received",
+        chat_id=update.effective_chat.id if update.effective_chat else None,
+        user_id=update.effective_user.id if update.effective_user else None,
+    )
     manager = context.application.bot_data.get("mainnet_one_run_manager")
     if manager is None:
         await update.message.reply_text("❌ Mainnet one-run manager 尚未初始化。")
