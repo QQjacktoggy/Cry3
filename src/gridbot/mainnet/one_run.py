@@ -122,6 +122,13 @@ class MainnetOneRunManager:
                         f"方向：<b>{escape(str(active.get('side') or '-'))}</b>",
                     ]
                 )
+            # Determine if latest run is cancellable (not in terminal state)
+            terminal_states = {"COMPLETED", "FAILED", "CANCELLED"}
+            latest_cancellable = (
+                latest
+                and latest.get("status") not in terminal_states
+                and latest.get("run_id") != (active.get("run_id") if active else None)
+            )
             if latest:
                 lines.extend(
                     [
@@ -131,8 +138,14 @@ class MainnetOneRunManager:
                         f"結果：<code>{escape(str(latest.get('exit_reason') or '-'))}</code>",
                     ]
                 )
-            markup = self._buttons(active=bool(active))
-            logger.info("mainnet_status_reply", has_markup=markup is not None, active=bool(active), loop_total=self._loop_total)
+            markup = self._buttons(active=bool(active), show_cancel=latest_cancellable)
+            logger.info(
+                "mainnet_status_reply",
+                has_markup=markup is not None,
+                active=bool(active),
+                loop_total=self._loop_total,
+                latest_cancellable=latest_cancellable,
+            )
             return RunStatus("\n".join(lines), markup)
 
     async def arm(self, actor: str = "telegram", loop_count: int = 1) -> str:
@@ -1496,8 +1509,8 @@ class MainnetOneRunManager:
             return run.get("exit_reason")
         return run.get("exit_reason")
 
-    def _buttons(self, active: bool) -> InlineKeyboardMarkup:
-            logger.info("mainnet_buttons_enter", active=active, loop_total=self._loop_total)
+    def _buttons(self, active: bool, show_cancel: bool = False) -> InlineKeyboardMarkup:
+            logger.info("mainnet_buttons_enter", active=active, loop_total=self._loop_total, show_cancel=show_cancel)
             if active:
                 rows = [
                     [InlineKeyboardButton("查詢 one-run 狀態", callback_data="mainnet:status")],
@@ -1535,10 +1548,12 @@ class MainnetOneRunManager:
                     InlineKeyboardButton("啟動 10 runs", callback_data="mainnet:arm:10"),
                 ],
                 [InlineKeyboardButton("查詢 one-run 狀態", callback_data="mainnet:status")],
-                [InlineKeyboardButton("⏹ 停止 loop", callback_data="mainnet:stop_loop")],
             ]
+            if show_cancel:
+                rows.append([InlineKeyboardButton("取消目前 one-run", callback_data="mainnet:cancel")])
+            rows.append([InlineKeyboardButton("⏹ 停止 loop", callback_data="mainnet:stop_loop")])
             markup = InlineKeyboardMarkup(rows)
-            logger.info("mainnet_buttons_exit", active=active, path="idle", markup=markup is not None)
+            logger.info("mainnet_buttons_exit", active=active, path="idle", markup=markup is not None, show_cancel=show_cancel)
             return markup
 
     async def _notify(self, text: str) -> None:
