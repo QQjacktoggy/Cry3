@@ -185,7 +185,7 @@ def main() -> None:
         default=None,
         help="Search only local DD/weak-day refinements around a named preset.",
     )
-    parser.add_argument("--preset", choices=["wildcat_converged_v1", "wildcat_30d_balanced_v1", "wildcat_v2_regime_guard", "wildcat_v2_adverse_guard", "wildcat_v2ag_fees", "wildcat_v3_trend", "wildcat_v3_trend_rr", "wildcat_v3_trend_filt", "wildcat_v3_trend_filt2", "wildcat_v3_trend_cross", "wildcat_v3_trend_cont"], default=None, help="Run a fixed named wildcat preset instead of searching variants.")
+    parser.add_argument("--preset", choices=["wildcat_converged_v1", "wildcat_30d_balanced_v1", "wildcat_v2_regime_guard", "wildcat_v2_adverse_guard", "wildcat_v2ag_fees", "wildcat_v3_trend", "wildcat_v3_trend_rr", "wildcat_v3_trend_filt", "wildcat_v3_trend_filt2", "wildcat_v3_trend_cross", "wildcat_v3_trend_cont", "wildcat_v3_s3", "wildcat_v3_s4", "wildcat_v3_s3s4"], default=None, help="Run a fixed named wildcat preset instead of searching variants.")
     parser.add_argument("--json-output", default=None, help="Optional report path. Defaults to reports/wildcat_s1s5_<days>d.json")
     parser.add_argument("--dump-trades", action="store_true", help="Include all trades in the JSON artifact for deeper analysis.")
     args = parser.parse_args()
@@ -650,6 +650,30 @@ def preset_params(
         s2_min_trend_share_60=0.65,
         s2_min_ema_spread_atr=0.9,
         s2_require_cross=True,
+        **_realistic_fees,
+    )
+    # --- S3/S4 evaluation presets (2026-06-08) --------------------------------
+    # S3_EMA_MACD: EMA pullback + MACD flip in trending regime (trend pullback
+    #   entry, fires when trend != range and price touches EMA slow + MACD
+    #   crosses zero). Complements S1/S5 by capturing trend-pullback entries.
+    # S4_Donchian: Donchian channel breakout with high volume / body confirmation
+    #   (fires on momentum breakout, independent of trend regime).
+    presets["wildcat_v3_s3"] = replace(
+        _v2ag,
+        label="wildcat_v3_s3",
+        enabled_strategies=("S1_BB_RSI", "S5_Stoch", "S3_EMA_MACD"),
+        **_realistic_fees,
+    )
+    presets["wildcat_v3_s4"] = replace(
+        _v2ag,
+        label="wildcat_v3_s4",
+        enabled_strategies=("S1_BB_RSI", "S5_Stoch", "S4_Donchian"),
+        **_realistic_fees,
+    )
+    presets["wildcat_v3_s3s4"] = replace(
+        _v2ag,
+        label="wildcat_v3_s3s4",
+        enabled_strategies=("S1_BB_RSI", "S5_Stoch", "S3_EMA_MACD", "S4_Donchian"),
         **_realistic_fees,
     )
     if name not in presets:
