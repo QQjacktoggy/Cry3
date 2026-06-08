@@ -115,6 +115,10 @@ class WildcatParams:
     s2_min_trend_share_60: float = 0.0   # last-60-bar trending fraction floor
     s2_min_ema_spread_atr: float = 0.0   # |emaFast-emaSlow|/ATR floor
     s2_require_cross: bool = False        # drop continuation entries
+    # Live-accuracy guards (2026-06-08). Defaults off so existing presets are
+    # unchanged.  Set both to match the A-layer live bot behaviour.
+    entry_trend_guard_slope: float = 0.0  # >0 blocks counter-trend entries (live uses 0.03)
+    dca_regime_guard: bool = False        # True blocks DCA outside range or on opposing stoch cross
 
 
 @dataclass
@@ -185,7 +189,7 @@ def main() -> None:
         default=None,
         help="Search only local DD/weak-day refinements around a named preset.",
     )
-    parser.add_argument("--preset", choices=["wildcat_converged_v1", "wildcat_30d_balanced_v1", "wildcat_v2_regime_guard", "wildcat_v2_adverse_guard", "wildcat_v2ag_fees", "wildcat_v3_trend", "wildcat_v3_trend_rr", "wildcat_v3_trend_filt", "wildcat_v3_trend_filt2", "wildcat_v3_trend_cross", "wildcat_v3_trend_cont", "wildcat_v3_s3", "wildcat_v3_s4", "wildcat_v3_s3s4"], default=None, help="Run a fixed named wildcat preset instead of searching variants.")
+    parser.add_argument("--preset", choices=["wildcat_converged_v1", "wildcat_30d_balanced_v1", "wildcat_v2_regime_guard", "wildcat_v2_adverse_guard", "wildcat_v2ag_fees", "wildcat_v3_trend", "wildcat_v3_trend_rr", "wildcat_v3_trend_filt", "wildcat_v3_trend_filt2", "wildcat_v3_trend_cross", "wildcat_v3_trend_cont", "wildcat_v3_s3", "wildcat_v3_s4", "wildcat_v3_s3s4", "wildcat_v2ag_guarded", "wildcat_v3_cross_guarded"], default=None, help="Run a fixed named wildcat preset instead of searching variants.")
     parser.add_argument("--json-output", default=None, help="Optional report path. Defaults to reports/wildcat_s1s5_<days>d.json")
     parser.add_argument("--dump-trades", action="store_true", help="Include all trades in the JSON artifact for deeper analysis.")
     args = parser.parse_args()
@@ -652,6 +656,27 @@ def preset_params(
         s2_require_cross=True,
         **_realistic_fees,
     )
+    # --- Live-accuracy guarded presets (2026-06-08) --------------------------
+    # Adds A1 entry-trend guard (slope_block=0.03) to block counter-trend
+    # entries, mirroring the live bot's evaluate_entry_trend_guard.
+    # NOTE: dca_regime_guard is intentionally NOT enabled here. The live bot
+    # calls evaluate_dca_guard only ONCE per DCA event (single-shot decision),
+    # but the backtest's maybe_recover_position runs on EVERY bar — enabling
+    # the guard in the backtest blocks virtually all DCA and cascades into a
+    # catastrophic performance drop via cooldown buildup. Until the backtest
+    # has single-shot DCA timing, only the entry guard is modelled.
+    presets["wildcat_v2ag_guarded"] = replace(
+        _v2ag,
+        label="wildcat_v2ag_guarded",
+        entry_trend_guard_slope=0.03,
+        **_realistic_fees,
+    )
+    # Same guard applied to the best S2 rescue preset.
+    presets["wildcat_v3_cross_guarded"] = replace(
+        presets["wildcat_v3_trend_cross"],
+        label="wildcat_v3_cross_guarded",
+        entry_trend_guard_slope=0.03,
+    )
     # --- S3/S4 evaluation presets (2026-06-08) --------------------------------
     # S3_EMA_MACD: EMA pullback + MACD flip in trending regime (trend pullback
     #   entry, fires when trend != range and price touches EMA slow + MACD
@@ -1020,7 +1045,7 @@ def run_backtest(
 
         next_positions: list[Position] = []
         for position in positions:
-            exit_trade = maybe_exit(candle, c_time, i, position, params)
+            exit_trade = maybe_exit(candle, c_time, i, position, params, features)
             if exit_trade is not None:
                 trades.append(exit_trade)
                 daily_pnl_state[day_key] = daily_pnl_state.get(day_key, 0.0) + exit_trade["pnl"]
@@ -1271,6 +1296,19 @@ def build_candidates(
                 ["rescue_vwap_reversion" if rescue else "catchup_vwap_reversion", "rsi_soft_short"],
             )
 
+    # A1 entry trend guard: block counter-trend entries (mirrors live evaluate_entry_trend_guard).
+    # slope_block=0.03 is half the regime classifier's 0.06, catching the "soft trend" band
+    # that still gets labelled "range".  Default 0.0 = disabled (old preset behaviour unchanged).
+    if params.entry_trend_guard_slope > 0 and i >= 20:
+        sg = params.entry_trend_guard_slope
+        ema_t = f["ema_trend"][i]
+        bt_slope = (f["ema_slow"][i] - f["ema_slow"][i - 20]) / max(atr_val, 1e-8)
+        candidates = [
+            c for c in candidates
+            if not (c.side == "LONG" and price < ema_t and bt_slope < -sg)
+            and not (c.side == "SHORT" and price > ema_t and bt_slope > sg)
+        ]
+
     return candidates
 
 
@@ -1322,8 +1360,8 @@ def open_position(candle: dict, c_time: datetime, i: int, candidate: Candidate, 
     )
 
 
-def maybe_exit(candle: dict, c_time: datetime, i: int, pos: Position, params: WildcatParams) -> dict | None:
-    maybe_recover_position(candle, pos, params)
+def maybe_exit(candle: dict, c_time: datetime, i: int, pos: Position, params: WildcatParams, f: dict) -> dict | None:
+    maybe_recover_position(candle, pos, params, f, i)
     partial_exit_position(candle, pos, params)
     if pos.side == "LONG":
         if candle["low"] <= pos.sl_price:
@@ -1347,9 +1385,21 @@ def maybe_exit(candle: dict, c_time: datetime, i: int, pos: Position, params: Wi
     return None
 
 
-def maybe_recover_position(candle: dict, pos: Position, params: WildcatParams) -> None:
+def maybe_recover_position(candle: dict, pos: Position, params: WildcatParams, f: dict, i: int) -> None:
     if not params.recovery_enabled or pos.dca_count >= params.recovery_steps:
         return
+    # DCA regime guard: mirrors live evaluate_dca_guard.  Only average-down
+    # when the regime is still "range" and stochastic momentum is not crossing
+    # against the position.
+    if params.dca_regime_guard:
+        if f["trend"][i] != "range":
+            return
+        k, d = f["stoch_k"][i], f["stoch_d"][i]
+        k_p, d_p = f["stoch_k"][i - 1], f["stoch_d"][i - 1]
+        if pos.side == "SHORT" and k_p <= d_p and k > d:
+            return
+        if pos.side == "LONG" and k_p >= d_p and k < d:
+            return
     trigger_pct = params.recovery_trigger_pct * (pos.dca_count + 1)
     if pos.side == "LONG":
         trigger_price = pos.entry_price * (1 - trigger_pct)
