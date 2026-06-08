@@ -141,6 +141,20 @@ class WildcatParams:
     # if the move continues against us, DCA doubles the loss when the SL fires.
     # Strategies listed here never DCA even when recovery_enabled is True.
     no_dca_strategies: tuple[str, ...] = ()
+    # Trailing take-profit / profit-lock (2026-06-08). Defaults off so existing
+    # presets are unchanged.  Problem this solves: the runner (post-partial)
+    # only has a single fixed TP2.  A favorable swing that overshoots the
+    # partial but falls just short of TP2 then reverses gives the whole gain
+    # back (eventually exiting via SL / adverse / max_hold).  When enabled, we
+    # track the peak favorable excursion; once the peak reaches
+    # trail_arm_frac * tp_pct of the move, we arm a trailing stop that exits
+    # the remaining position if price retraces trail_giveback_frac of the run.
+    trail_enabled: bool = False
+    trail_arm_frac: float = 0.6       # arm once peak MFE >= this fraction of tp_pct
+    trail_giveback_frac: float = 0.30  # exit after retracing this fraction of the peak run
+    # Locking a gain usually needs an aggressive (taker) reduce-only exit, so we
+    # charge the taker fee in the backtest to stay conservative (lower bound).
+    trail_exit_fee_rate: float = 0.0004
 
 
 @dataclass
@@ -171,6 +185,11 @@ class Position:
     partial_taken: bool = False
     realized_pnl: float = 0.0
     realized_fees: float = 0.0
+    # Trailing take-profit state (see WildcatParams.trail_*). peak_price is the
+    # best favorable price seen since entry (high for LONG, low for SHORT);
+    # 0.0 means "not yet initialised" (lazily set to entry_price on first use).
+    peak_price: float = 0.0
+    trail_armed: bool = False
 
 
 class RollingWinRate:
@@ -211,7 +230,7 @@ def main() -> None:
         default=None,
         help="Search only local DD/weak-day refinements around a named preset.",
     )
-    parser.add_argument("--preset", choices=["wildcat_converged_v1", "wildcat_30d_balanced_v1", "wildcat_v2_regime_guard", "wildcat_v2_adverse_guard", "wildcat_v2ag_fees", "wildcat_v3_trend", "wildcat_v3_trend_rr", "wildcat_v3_trend_filt", "wildcat_v3_trend_filt2", "wildcat_v3_trend_cross", "wildcat_v3_trend_cont", "wildcat_v3_s3", "wildcat_v3_s4", "wildcat_v3_s3s4", "wildcat_v2ag_guarded", "wildcat_v3_cross_guarded", "wildcat_v3_s1high", "wildcat_v3_s6", "wildcat_v3_s7", "wildcat_v3_full_cover", "wildcat_v3_best_cover", "wildcat_v3_s6_nodca", "wildcat_v3_s6_tight", "wildcat_v3_s6_strict", "wildcat_v3_s6_cons"], default=None, help="Run a fixed named wildcat preset instead of searching variants.")
+    parser.add_argument("--preset", choices=["wildcat_converged_v1", "wildcat_30d_balanced_v1", "wildcat_v2_regime_guard", "wildcat_v2_adverse_guard", "wildcat_v2ag_fees", "wildcat_v3_trend", "wildcat_v3_trend_rr", "wildcat_v3_trend_filt", "wildcat_v3_trend_filt2", "wildcat_v3_trend_cross", "wildcat_v3_trend_cont", "wildcat_v3_s3", "wildcat_v3_s4", "wildcat_v3_s3s4", "wildcat_v2ag_guarded", "wildcat_v3_cross_guarded", "wildcat_v3_s1high", "wildcat_v3_s6", "wildcat_v3_s7", "wildcat_v3_full_cover", "wildcat_v3_best_cover", "wildcat_v3_s6_nodca", "wildcat_v3_s6_tight", "wildcat_v3_s6_strict", "wildcat_v3_s6_cons", "wildcat_v3_s2_wide_a", "wildcat_v3_s2_wide_b", "wildcat_v3_s2_wide_c", "wildcat_v3_s2_cont_strong", "wildcat_v3_trail_a", "wildcat_v3_trail_b", "wildcat_v3_trail_c", "wildcat_v3_trail_d"], default=None, help="Run a fixed named wildcat preset instead of searching variants.")
     parser.add_argument("--json-output", default=None, help="Optional report path. Defaults to reports/wildcat_s1s5_<days>d.json")
     parser.add_argument("--dump-trades", action="store_true", help="Include all trades in the JSON artifact for deeper analysis.")
     args = parser.parse_args()
@@ -753,6 +772,56 @@ def preset_params(
     # no DCA + tighter SL + stricter entry (most conservative).
     presets["wildcat_v3_s6_cons"] = replace(
         _s6base, label="wildcat_v3_s6_cons", s6_sl=0.0010, s6_vwap_atr=1.5,
+    )
+    # --- S2 widening sweep (2026-06-08) --------------------------------------
+    # Built on best_cover (S1+high vol, S5, S2 cross-only). Only the S2 strength
+    # gates change, to see if we can add trend-segment trades while keeping the
+    # high PF (current cross-only = 27 trades, PF 3.43).
+    _bc = presets["wildcat_v3_best_cover"]
+    # wide_a: looser gates (more trades, PF likely drops).
+    presets["wildcat_v3_s2_wide_a"] = replace(
+        _bc, label="wildcat_v3_s2_wide_a",
+        s2_min_trend_share_60=0.30, s2_min_ema_spread_atr=0.20,
+    )
+    # wide_b: mid-loosening.
+    presets["wildcat_v3_s2_wide_b"] = replace(
+        _bc, label="wildcat_v3_s2_wide_b",
+        s2_min_trend_share_60=0.35, s2_min_ema_spread_atr=0.25,
+    )
+    # wide_c: very loose (probe the floor of S2 edge).
+    presets["wildcat_v3_s2_wide_c"] = replace(
+        _bc, label="wildcat_v3_s2_wide_c",
+        s2_min_trend_share_60=0.25, s2_min_ema_spread_atr=0.15,
+    )
+    # cont: allow continuation entries again but ONLY in strong trends — tests
+    # whether mid-trend can be touched safely when the trend is strong enough.
+    presets["wildcat_v3_s2_cont_strong"] = replace(
+        _bc, label="wildcat_v3_s2_cont_strong",
+        s2_require_cross=False, s2_min_trend_share_60=0.45, s2_min_ema_spread_atr=0.40,
+    )
+    # --- Trailing take-profit sweep (2026-06-08) -----------------------------
+    # Built on the current best (wildcat_v3_s2_wide_c). Only the trailing
+    # profit-lock changes, to test whether locking near-miss runner gains
+    # (peak approaches but falls short of TP2 then reverses) lifts PnL without
+    # cutting too many winners short.  trail_arm_frac = peak MFE (as fraction of
+    # tp_pct) needed to arm; trail_giveback_frac = retracement of the run that
+    # triggers the lock-exit.
+    _wc = presets["wildcat_v3_s2_wide_c"]
+    presets["wildcat_v3_trail_a"] = replace(
+        _wc, label="wildcat_v3_trail_a",
+        trail_enabled=True, trail_arm_frac=0.6, trail_giveback_frac=0.30,
+    )
+    presets["wildcat_v3_trail_b"] = replace(
+        _wc, label="wildcat_v3_trail_b",
+        trail_enabled=True, trail_arm_frac=0.5, trail_giveback_frac=0.40,
+    )
+    presets["wildcat_v3_trail_c"] = replace(
+        _wc, label="wildcat_v3_trail_c",
+        trail_enabled=True, trail_arm_frac=0.7, trail_giveback_frac=0.25,
+    )
+    presets["wildcat_v3_trail_d"] = replace(
+        _wc, label="wildcat_v3_trail_d",
+        trail_enabled=True, trail_arm_frac=0.8, trail_giveback_frac=0.20,
     )
     # --- S3/S4 evaluation presets (2026-06-08) --------------------------------
     # S3_EMA_MACD: EMA pullback + MACD flip in trending regime (trend pullback
@@ -1474,6 +1543,31 @@ def maybe_exit(candle: dict, c_time: datetime, i: int, pos: Position, params: Wi
             return close_trade(c_time, i, pos, pos.sl_price, params.sl_exit_fee_rate, "SL")
         if candle["low"] <= pos.tp_price:
             return close_trade(c_time, i, pos, pos.tp_price, params.tp_exit_fee_rate, "TP")
+    if params.trail_enabled and pos.tp_pct > 0:
+        # Order matters: SL and the fixed TP2 are checked above first (so when a
+        # bar's range spans both the trail stop and TP2, TP2 wins — bigger gain).
+        # The trail stop is evaluated against the peak from PRIOR bars, then the
+        # peak is updated with the current bar — this avoids same-bar lookahead.
+        if pos.peak_price <= 0:
+            pos.peak_price = pos.entry_price
+        arm_mfe = pos.tp_pct * params.trail_arm_frac
+        keep = 1.0 - params.trail_giveback_frac
+        if pos.side == "LONG":
+            if pos.trail_armed:
+                trail_stop = pos.entry_price + (pos.peak_price - pos.entry_price) * keep
+                if candle["low"] <= trail_stop:
+                    return close_trade(c_time, i, pos, trail_stop, params.trail_exit_fee_rate, "TRAIL")
+            pos.peak_price = max(pos.peak_price, candle["high"])
+            if not pos.trail_armed and (pos.peak_price - pos.entry_price) / pos.entry_price >= arm_mfe:
+                pos.trail_armed = True
+        else:
+            if pos.trail_armed:
+                trail_stop = pos.entry_price - (pos.entry_price - pos.peak_price) * keep
+                if candle["high"] >= trail_stop:
+                    return close_trade(c_time, i, pos, trail_stop, params.trail_exit_fee_rate, "TRAIL")
+            pos.peak_price = min(pos.peak_price, candle["low"])
+            if not pos.trail_armed and (pos.entry_price - pos.peak_price) / pos.entry_price >= arm_mfe:
+                pos.trail_armed = True
     if (
         params.adverse_exit_enabled
         and i - pos.entry_index >= params.adverse_exit_bars

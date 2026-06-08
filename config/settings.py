@@ -169,6 +169,24 @@ class Settings(BaseSettings):
     mainnet_adverse_exit_bars: int = 10
     mainnet_adverse_exit_loss_pct: float = 0.0007
     mainnet_max_holding_bars: int = 20
+    # Trailing take-profit / profit-lock (2026-06-08). Mirrors the backtest
+    # wildcat_v3_trail_c preset (arm 0.7 / giveback 0.25), which lifted 30d
+    # PnL +320->+762 and cut MaxDD 45.8->15.8 by locking runner gains that
+    # spike toward TP2 then reverse instead of riding them back to SL.
+    # Backtest assumes a 1m-low fill; live samples mark every ~10s so realised
+    # gain will be somewhat lower — validate on testnet before trusting fully.
+    mainnet_trail_enabled: bool = True
+    mainnet_trail_arm_frac: float = 0.7      # arm once peak MFE >= this fraction of tp_pct
+    mainnet_trail_giveback_frac: float = 0.25  # lock-exit after retracing this fraction of the run
+    # TRAIL profit-lock exit fee optimisation (2026-06-08). The runner is in
+    # profit and not racing a stop, so the lock-exit can be a reduce-only
+    # POST_ONLY (maker, 0 USDC fee on ETHUSDC) instead of a market taker close.
+    # We place the maker exit at the passive top-of-book and poll for up to
+    # mainnet_trail_exit_maker_ttl_seconds; if it has not filled by then (price
+    # ran past), we cancel it and market-close the remainder. SL/ADVERSE/MAX_HOLD
+    # keep their guaranteed market close — only TRAIL uses this maker-first path.
+    mainnet_trail_exit_use_maker: bool = True
+    mainnet_trail_exit_maker_ttl_seconds: int = 8
     mainnet_client_order_prefix: str = "cry3mn"
 
     # GTX post-only rejection handling.
@@ -225,6 +243,10 @@ class Settings(BaseSettings):
     # (side, strategy_label) combination is blocked for N minutes so
     # we do not chain into an identical losing setup.
     mainnet_loop_cooldown_minutes: int = 5
+    # DCA guard cooldown: after the DCA risk guard blocks a recovery order,
+    # hold that block for this many seconds regardless of regime re-classification
+    # (prevents a brief range flicker from bypassing the guard within the window).
+    mainnet_dca_guard_cooldown_seconds: int = 300
 
     @property
     def mainnet_effective_entry_notional_usdc(self) -> float:

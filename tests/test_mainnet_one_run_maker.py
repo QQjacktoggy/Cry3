@@ -760,6 +760,151 @@ async def test_residual_dust_placed_as_postonly_maker_not_market():
 
 
 @pytest.mark.asyncio
+async def test_trailing_exit_locks_runner_gain_after_arm_then_retrace():
+    """Trailing TP: once peak MFE crosses arm_frac*tp_pct the lock arms; a
+    subsequent retrace past the giveback fraction market-closes the runner."""
+    import time as _time
+    client = FakeClient()
+    repo = FakeRepo()
+    manager = MainnetOneRunManager(
+        _settings(
+            mainnet_recovery_enabled=False,
+            mainnet_trail_enabled=True,
+            mainnet_trail_arm_frac=0.7,
+            mainnet_trail_giveback_frac=0.25,
+            mainnet_trail_exit_use_maker=False,  # test the pure market lock-exit
+        ),
+        client, repo, FakeTelegramApp(),
+    )
+    # tp_pct=0.01 → arm threshold = 0.007 (peak must reach 100.7).
+    run = _run(
+        signal_json='{"side":"LONG","take_profit":101.0,"stop_loss":99.0,"wildcat":{"tp_pct":0.01,"sl_pct":0.01}}',
+        avg_entry_price=100.0,
+        armed_at_ms=int(_time.time() * 1000),
+    )
+
+    def _pos(mark):
+        return PositionInfo(
+            symbol="ETHUSDC", position_amt=0.12, entry_price=100.0, mark_price=mark,
+            unrealized_pnl=(mark - 100.0) * 0.12, liquidation_price=80.0,
+            leverage=75, margin_type="cross",
+        )
+
+    # Cycle 1: peak spikes to 100.8 (MFE 0.8% >= 0.7%) → arms, no exit yet.
+    client.position = _pos(100.8)
+    await manager._run_running(run)
+    assert client.market_orders == []
+    assert run["run_id"] in manager._trail_armed
+
+    # Cycle 2: retrace to 100.5. trail_stop = 100 + (100.8-100)*0.75 = 100.6,
+    # mark 100.5 <= 100.6 → lock-exit via market close.
+    client.position = _pos(100.5)
+    await manager._run_running(run)
+    assert len(client.market_orders) == 1
+    assert client.market_orders[0]["side"] == "SELL"
+    assert any(c[1] == "TRAIL" for c in repo.completed) or any(
+        f.get("exit_reason") == "TRAIL" for _, f in repo.updated
+    )
+
+
+@pytest.mark.asyncio
+async def test_trailing_exit_does_not_fire_before_arm_threshold():
+    """A small favorable move below arm_frac*tp_pct must not arm or exit."""
+    import time as _time
+    client = FakeClient()
+    repo = FakeRepo()
+    manager = MainnetOneRunManager(
+        _settings(
+            mainnet_recovery_enabled=False,
+            mainnet_trail_enabled=True,
+            mainnet_trail_arm_frac=0.7,
+            mainnet_trail_giveback_frac=0.25,
+            mainnet_trail_exit_use_maker=False,  # test the pure market lock-exit
+        ),
+        client, repo, FakeTelegramApp(),
+    )
+    run = _run(
+        signal_json='{"side":"LONG","take_profit":101.0,"stop_loss":99.0,"wildcat":{"tp_pct":0.01,"sl_pct":0.01}}',
+        avg_entry_price=100.0,
+        armed_at_ms=int(_time.time() * 1000),
+    )
+    # MFE 0.3% < 0.7% arm threshold.
+    client.position = PositionInfo(
+        symbol="ETHUSDC", position_amt=0.12, entry_price=100.0, mark_price=100.3,
+        unrealized_pnl=0.036, liquidation_price=80.0, leverage=75, margin_type="cross",
+    )
+
+    await manager._run_running(run)
+
+    assert client.market_orders == []
+    assert run["run_id"] not in manager._trail_armed
+
+
+@pytest.mark.asyncio
+async def test_trail_maker_exit_fills_as_maker_no_taker(monkeypatch):
+    """TRAIL lock-exit: a reduce-only POST_ONLY (GTX) order is placed first;
+    when it fills (position goes flat within the TTL) no market taker order is
+    sent and the run is marked CLOSING with exit_reason TRAIL."""
+    from src.gridbot.mainnet import one_run as _mod
+
+    async def _no_sleep(*_a, **_k):
+        return None
+
+    monkeypatch.setattr(_mod.asyncio, "sleep", _no_sleep)
+
+    client = FakeClient()
+    repo = FakeRepo()
+    manager = MainnetOneRunManager(
+        _settings(
+            mainnet_recovery_enabled=False,
+            mainnet_trail_exit_use_maker=True,
+            mainnet_trail_exit_maker_ttl_seconds=1,
+        ),
+        client, repo, FakeTelegramApp(),
+    )
+    # Position is already flat → the first poll sees the maker fill.
+    client.position = None
+    run = _run(side="SHORT")
+
+    await manager._close_position("ETHUSDC", "BUY", 0.071, "TRAIL", run)
+
+    # A GTX (post-only) reduce-only order was placed, not a market order.
+    assert client.market_orders == []
+    assert any(o.get("timeInForce") == "GTX" for o in client.all_orders)
+    assert any(et == "trail_maker_filled" for _, et, _ in repo.events)
+    assert any(f.get("exit_reason") == "TRAIL" for _, f in repo.updated)
+
+
+@pytest.mark.asyncio
+async def test_trail_maker_exit_times_out_falls_back_to_market():
+    """If the maker exit does not fill within the TTL, it is cancelled and the
+    remainder is market-closed (guaranteed exit)."""
+    client = FakeClient()
+    client.position = PositionInfo(
+        symbol="ETHUSDC", position_amt=-0.071, entry_price=100.0, mark_price=100.2,
+        unrealized_pnl=-0.014, liquidation_price=120.0, leverage=75, margin_type="cross",
+    )
+    repo = FakeRepo()
+    manager = MainnetOneRunManager(
+        _settings(
+            mainnet_recovery_enabled=False,
+            mainnet_trail_exit_use_maker=True,
+            mainnet_trail_exit_maker_ttl_seconds=0,  # immediate timeout, no polling
+        ),
+        client, repo, FakeTelegramApp(),
+    )
+    run = _run(side="SHORT")
+
+    await manager._close_position("ETHUSDC", "BUY", 0.071, "TRAIL", run)
+
+    # Maker placed (GTX), timed out, then market-closed.
+    assert any(o.get("timeInForce") == "GTX" for o in client.all_orders)
+    assert len(client.market_orders) == 1
+    assert client.market_orders[0]["side"] == "BUY"
+    assert any(et == "trail_maker_timeout" for _, et, _ in repo.events)
+
+
+@pytest.mark.asyncio
 async def test_loop_defers_arm_during_cooldown_then_resumes_after_expiry():
     """Cooldown must not stall the loop: the arm is deferred while the cooldown
     is active, then resumed by _maybe_resume_pending_loop once it expires."""
@@ -848,6 +993,63 @@ async def test_dca_allowed_by_guard_places_order(monkeypatch):
 
     assert result is True
     assert any("_dca" in str(o.get("clientOrderId") or "") for o in client.all_orders)
+
+
+def _dca_short_position():
+    return PositionInfo(
+        symbol="ETHUSDC", position_amt=-0.119, entry_price=1675.32, mark_price=1677.0,
+        unrealized_pnl=-0.2, liquidation_price=2000.0, leverage=75, margin_type="cross",
+    )
+
+
+@pytest.mark.asyncio
+async def test_dca_guard_block_starts_cooldown_blocking_regime_flicker(monkeypatch):
+    """After the guard blocks once, a brief regime flip to 'range' must not let
+    a second DCA through within the cooldown window (the 12:00 UTC incident)."""
+    import src.gridbot.mainnet.one_run as orm
+    client = FakeClient()
+    client.position = _dca_short_position()
+    repo = FakeRepo()
+    manager = MainnetOneRunManager(
+        _settings(mainnet_recovery_enabled=True, mainnet_dca_guard_cooldown_seconds=300),
+        client, repo, FakeTelegramApp(),
+    )
+    run = _run(side="SHORT", qty=0.119)
+
+    # 1st call: guard blocks (trend) → records the cooldown timestamp.
+    monkeypatch.setattr(orm, "evaluate_dca_guard", lambda c, s: (False, "trend=down"))
+    assert await manager._maybe_recovery(run, {}, client.position) is False
+    assert run["run_id"] in manager._dca_block_times
+
+    # 2nd call moments later: regime flickers back to range, guard would now
+    # allow — but the cooldown must keep it blocked, so no DCA order is placed.
+    monkeypatch.setattr(orm, "evaluate_dca_guard", lambda c, s: (True, "range ok"))
+    assert await manager._maybe_recovery(run, {}, client.position) is False
+    assert all("_dca" not in str(o.get("clientOrderId") or "") for o in client.all_orders)
+    assert any(et == "dca_blocked_guard_cooldown" for _, et, _ in repo.events) or \
+        all("_dca" not in str(o.get("clientOrderId") or "") for o in client.all_orders)
+
+
+@pytest.mark.asyncio
+async def test_dca_blocked_after_partial_exit(monkeypatch):
+    """Once TP1 has partially closed the runner, DCA must never re-average into
+    the remaining position (the 12:29 UTC incident)."""
+    import src.gridbot.mainnet.one_run as orm
+    client = FakeClient()
+    client.position = _dca_short_position()
+    repo = FakeRepo()
+    manager = MainnetOneRunManager(
+        _settings(mainnet_recovery_enabled=True), client, repo, FakeTelegramApp()
+    )
+    run = _run(side="SHORT", qty=0.119)
+    # Guard would allow, but the run already booked a partial exit.
+    monkeypatch.setattr(orm, "evaluate_dca_guard", lambda c, s: (True, "range ok"))
+    manager._partial_exits.add(run["run_id"])
+
+    result = await manager._maybe_recovery(run, {}, client.position)
+
+    assert result is False
+    assert all("_dca" not in str(o.get("clientOrderId") or "") for o in client.all_orders)
 
 
 @pytest.mark.asyncio

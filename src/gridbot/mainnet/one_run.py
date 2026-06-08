@@ -65,6 +65,19 @@ class MainnetOneRunManager:
         self._partial_taken: set[str] = set()
         self._partial_order_armed: set[str] = set()
         self._recovery_counts: dict[str, int] = {}
+        # Trailing take-profit state, keyed by run_id.  _trail_peak holds the
+        # best favorable mark price seen since entry (highest for LONG, lowest
+        # for SHORT); _trail_armed marks runs whose peak has crossed the arm
+        # threshold so the lock-exit is live.  See _run_running.
+        self._trail_peak: dict[str, float] = {}
+        self._trail_armed: set[str] = set()
+        # DCA guard cooldown: maps run_id -> ms timestamp of last guard block.
+        # Prevents regime-flicker from bypassing the guard within the cooldown
+        # window (mainnet_dca_guard_cooldown_seconds).
+        self._dca_block_times: dict[str, int] = {}
+        # Partial-exit flag: once TP1 fires (qty shrinks), DCA is forbidden so
+        # we never average into a runner that already booked partial profit.
+        self._partial_exits: set[str] = set()
         # Conservative entry requote state — counts and last-requote
         # timestamps keyed by run_id, so we can throttle requotes
         # without bumping run.updated_at_ms (which would also push out
@@ -464,6 +477,7 @@ class MainnetOneRunManager:
             run["qty"] = current_qty
         elif abs(current_qty - prev_qty) > 1e-9:
             # Qty shrank (TP partial fills) — sync tracking only, do NOT touch SL
+            self._partial_exits.add(run["run_id"])
             await self._repo.update_run(run["run_id"], qty=current_qty)
             run["qty"] = current_qty
         if run["status"] == "CLOSING":
@@ -540,6 +554,8 @@ class MainnetOneRunManager:
         await self._refresh_partial_fill_state(run, position)
         await self._sync_take_profit_orders(run, position, signal)
         if await self._maybe_recovery(run, signal, position):
+            return
+        if await self._maybe_trailing_exit(run, signal, position, side, mark, entry, qty, close_side):
             return
         if self._hit_stop(side, mark, sl_price):
             await self._close_position(symbol, close_side, qty, "SL", run)
@@ -1215,6 +1231,24 @@ class MainnetOneRunManager:
         count = self._recovery_counts.get(run["run_id"], 0)
         if count >= self._settings.mainnet_recovery_steps:
             return False
+        # Block DCA after TP1 partial fill: never average into a runner that
+        # already booked partial profit.
+        if run["run_id"] in self._partial_exits:
+            logger.info("dca_blocked_partial_exit", run_id=run["run_id"])
+            return False
+        # Block DCA within cooldown after a guard block to prevent regime-flicker
+        # from briefly re-classifying the market as range and bypassing the guard.
+        cooldown_ms = self._settings.mainnet_dca_guard_cooldown_seconds * 1000
+        last_block_ms = self._dca_block_times.get(run["run_id"], 0)
+        if cooldown_ms > 0 and last_block_ms > 0:
+            now_ms = int(time.time() * 1000)
+            if now_ms - last_block_ms < cooldown_ms:
+                logger.info(
+                    "dca_blocked_guard_cooldown",
+                    run_id=run["run_id"],
+                    remaining_ms=cooldown_ms - (now_ms - last_block_ms),
+                )
+                return False
         entry_notional = self._settings.mainnet_effective_entry_notional_usdc
         cumulative = float(run.get("cumulative_notional_usdc") or entry_notional)
         if cumulative + entry_notional > self._settings.mainnet_effective_max_cumulative_notional_usdc:
@@ -1234,6 +1268,7 @@ class MainnetOneRunManager:
         candles = await self._load_candles(position.symbol)
         allow_dca, guard_reason = evaluate_dca_guard(candles, position.position_direction)
         if not allow_dca:
+            self._dca_block_times[run["run_id"]] = int(time.time() * 1000)
             logger.info(
                 "dca_blocked_by_guard",
                 run_id=run["run_id"],
@@ -1281,6 +1316,60 @@ class MainnetOneRunManager:
         await self._notify(f"🧩 Mainnet one-run 已掛 DCA maker 單 #{count + 1}：<code>{escape(run['run_id'])}</code>")
         return True
 
+    async def _maybe_trailing_exit(
+        self,
+        run: dict,
+        signal: dict,
+        position: PositionInfo,
+        side: str,
+        mark: float,
+        entry: float,
+        qty: float,
+        close_side: str,
+    ) -> bool:
+        """Lock a runner's gain when it spikes toward TP2 then reverses.
+
+        Mirrors the backtest wildcat_v3_trail_c logic: track the peak favorable
+        mark since entry; once the peak reaches arm_frac * tp_pct of the move,
+        arm a trailing stop that market-closes the remaining position if mark
+        retraces giveback_frac of the peak run.  The exchange-side TP2 fills on
+        its own if price reaches it first, so this only fires on the sub-TP
+        retracement path.  Returns True if a lock-exit was submitted.
+        """
+        if not self._settings.mainnet_trail_enabled:
+            return False
+        tp_pct = float(signal.get("wildcat", {}).get("tp_pct") or 0.0)
+        if tp_pct <= 0 or entry <= 0 or mark <= 0 or side not in {"LONG", "SHORT"}:
+            return False
+        run_id = run["run_id"]
+        peak = self._trail_peak.get(run_id)
+        arm_mfe = tp_pct * self._settings.mainnet_trail_arm_frac
+        keep = 1.0 - self._settings.mainnet_trail_giveback_frac
+
+        if side == "LONG":
+            # Check the lock against the peak from prior cycles BEFORE updating
+            # it with the current mark (no same-tick lookahead).
+            if run_id in self._trail_armed and peak is not None:
+                trail_stop = entry + (peak - entry) * keep
+                if mark <= trail_stop:
+                    await self._close_position(position.symbol, close_side, qty, "TRAIL", run)
+                    return True
+            new_peak = mark if peak is None else max(peak, mark)
+            self._trail_peak[run_id] = new_peak
+            if run_id not in self._trail_armed and (new_peak - entry) / entry >= arm_mfe:
+                self._trail_armed.add(run_id)
+        else:
+            if run_id in self._trail_armed and peak is not None:
+                trail_stop = entry - (entry - peak) * keep
+                if mark >= trail_stop:
+                    await self._close_position(position.symbol, close_side, qty, "TRAIL", run)
+                    return True
+            new_peak = mark if peak is None else min(peak, mark)
+            self._trail_peak[run_id] = new_peak
+            if run_id not in self._trail_armed and (entry - new_peak) / entry >= arm_mfe:
+                self._trail_armed.add(run_id)
+        return False
+
     def _hit_stop(self, side: str, mark: float, sl_price: float) -> bool:
         hit_sl = mark <= sl_price if side == "LONG" else mark >= sl_price
         return sl_price > 0 and hit_sl
@@ -1295,6 +1384,15 @@ class MainnetOneRunManager:
         await self._cancel_take_profit_orders(symbol, run_id)
         await self._cancel_stop_loss_order(symbol, run_id)
         qty_str = await self._client.format_quantity(symbol, qty)
+
+        # TRAIL profit-lock: the runner is in profit and not racing a stop, so
+        # try a reduce-only POST_ONLY (maker, 0 fee) exit first to save the
+        # taker fee.  If it does not fill within the TTL we fall through to the
+        # market close below.  SL/ADVERSE/MAX_HOLD always skip this and use the
+        # guaranteed market close.
+        if reason == "TRAIL" and self._settings.mainnet_trail_exit_use_maker:
+            if await self._try_trail_maker_exit(symbol, side, qty_str, run):
+                return
 
         # Always market-close; STOP_MARKET on the exchange is already cancelled above.
         try:
@@ -1320,6 +1418,81 @@ class MainnetOneRunManager:
         await self._repo.log_event(run_id, "close_submitted", {"reason": reason, "order": order})
         await self._repo.update_run(run_id, status="CLOSING", exit_reason=reason)
         await self._notify(f"🏁 Mainnet one-run 已送出平倉：<code>{escape(run_id)}</code> reason=<b>{escape(reason)}</b>")
+
+    async def _try_trail_maker_exit(self, symbol: str, side: str, qty_str: str, run: dict) -> bool:
+        """Lock a TRAIL exit at maker fee, falling back to market on timeout.
+
+        Places a reduce-only POST_ONLY limit at the passive top-of-book and
+        polls the position for up to mainnet_trail_exit_maker_ttl_seconds.
+        Returns True if the position went flat (maker filled — 0 fee).  On
+        timeout or placement rejection, cancels the maker order and returns
+        False so the caller market-closes whatever remains (reduce_only caps
+        the qty, so a partial maker fill is handled safely).
+        """
+        run_id = run["run_id"]
+        client_order_id = f"{run_id}_trail"
+        # Anchor the passive quote to the side we are resting on: a SELL exit
+        # rests at/above the best bid, a BUY exit at/below the best ask.
+        book = await self._client.get_book_ticker(symbol)
+        anchor = float(book["bidPrice"]) if side == "SELL" else float(book["askPrice"])
+        try:
+            order = await self._place_post_only_with_retry(
+                symbol=symbol,
+                side=side,
+                quantity=qty_str,
+                signal_price=anchor,
+                client_order_id=client_order_id,
+                slippage_bps=self._settings.mainnet_tp_slippage_bps,
+                fallback_to_gtc=False,
+                reduce_only=True,
+            )
+        except (GTXSlippageExceeded, BinanceAPIException) as exc:
+            logger.warning(
+                "trail_maker_place_failed_fallback_market",
+                run_id=run_id,
+                side=side,
+                error=str(exc)[:200],
+            )
+            await self._repo.log_event(run_id, "trail_maker_place_failed", {"error": str(exc)[:300]})
+            return False
+        logger.info(
+            "trail_maker_order_placed",
+            run_id=run_id,
+            side=side,
+            qty=qty_str,
+            price=anchor,
+            order_id=order.get("orderId"),
+        )
+        await self._repo.log_event(run_id, "trail_maker_placed", {"order": order, "anchor": anchor})
+        await self._notify(
+            f"🪝 TRAIL 鎖利改掛 maker（0 手續費）：<code>{escape(run_id)}</code> @ <b>${anchor:.4f}</b>"
+        )
+
+        ttl = max(0, int(self._settings.mainnet_trail_exit_maker_ttl_seconds))
+        deadline = time.monotonic() + ttl
+        while time.monotonic() < deadline:
+            await asyncio.sleep(1.0)
+            position = await self._client.get_position(symbol)
+            if position is None or abs(position.position_amt) < 1e-9:
+                logger.info("trail_maker_filled", run_id=run_id)
+                await self._repo.log_event(run_id, "trail_maker_filled", {})
+                await self._repo.update_run(run_id, status="CLOSING", exit_reason="TRAIL")
+                await self._notify(
+                    f"🎯 TRAIL maker 鎖利已成交（省 taker 費）：<code>{escape(run_id)}</code>"
+                )
+                return True
+        # TTL elapsed without a full fill — cancel the resting maker order and
+        # let the caller market-close the remainder (reduce_only caps the qty).
+        logger.info("trail_maker_timeout_fallback_market", run_id=run_id, ttl_seconds=ttl)
+        await self._repo.log_event(run_id, "trail_maker_timeout", {"ttl_seconds": ttl})
+        try:
+            open_orders = await self._client.get_open_orders(symbol)
+            for o in open_orders:
+                if str(o.get("clientOrderId") or "") == client_order_id:
+                    await self._client.cancel_order(symbol, int(o["orderId"]))
+        except BinanceAPIException as exc:
+            logger.warning("trail_maker_cancel_failed", run_id=run_id, error=str(exc)[:200])
+        return False
 
     async def _place_stop_loss_maker(
         self,
@@ -1452,6 +1625,12 @@ class MainnetOneRunManager:
         # Use the broad sweep (_cancel_all_run_orders) first so we never leave
         # dangling orders even if the exact clientOrderId suffix matching fails.
         await self._cancel_all_run_orders(run["symbol"], run["run_id"])
+        # Drop per-run trailing state so the dicts do not grow unbounded across
+        # loop chains.
+        self._trail_peak.pop(run["run_id"], None)
+        self._trail_armed.discard(run["run_id"])
+        self._dca_block_times.pop(run["run_id"], None)
+        self._partial_exits.discard(run["run_id"])
         summary = await self._build_run_summary(run)
         exit_reason = run.get("exit_reason") or summary["exit_reason"] or reason
         await self._repo.update_run(
