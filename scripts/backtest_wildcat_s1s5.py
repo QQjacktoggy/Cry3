@@ -107,6 +107,14 @@ class WildcatParams:
     adverse_exit_enabled: bool = False
     adverse_exit_bars: int = 10
     adverse_exit_loss_pct: float = 0.0009
+    # S2_SuperTrend strength gates (2026-06-08). Defaults 0/False = no extra
+    # gate (existing presets unchanged). SuperTrend whipsaws in chop that the
+    # loose ±0.06 slope classifier still labels up/down; these require a
+    # *sustained, separated* trend and (optionally) a fresh cross instead of
+    # the permissive every-pullback "continuation" entry.
+    s2_min_trend_share_60: float = 0.0   # last-60-bar trending fraction floor
+    s2_min_ema_spread_atr: float = 0.0   # |emaFast-emaSlow|/ATR floor
+    s2_require_cross: bool = False        # drop continuation entries
 
 
 @dataclass
@@ -177,7 +185,7 @@ def main() -> None:
         default=None,
         help="Search only local DD/weak-day refinements around a named preset.",
     )
-    parser.add_argument("--preset", choices=["wildcat_converged_v1", "wildcat_30d_balanced_v1", "wildcat_v2_regime_guard", "wildcat_v2_adverse_guard"], default=None, help="Run a fixed named wildcat preset instead of searching variants.")
+    parser.add_argument("--preset", choices=["wildcat_converged_v1", "wildcat_30d_balanced_v1", "wildcat_v2_regime_guard", "wildcat_v2_adverse_guard", "wildcat_v2ag_fees", "wildcat_v3_trend", "wildcat_v3_trend_rr", "wildcat_v3_trend_filt", "wildcat_v3_trend_filt2", "wildcat_v3_trend_cross", "wildcat_v3_trend_cont"], default=None, help="Run a fixed named wildcat preset instead of searching variants.")
     parser.add_argument("--json-output", default=None, help="Optional report path. Defaults to reports/wildcat_s1s5_<days>d.json")
     parser.add_argument("--dump-trades", action="store_true", help="Include all trades in the JSON artifact for deeper analysis.")
     args = parser.parse_args()
@@ -574,6 +582,76 @@ def preset_params(
             adverse_exit_loss_pct=0.0007,
         ),
     }
+    # --- B/C experiment presets (2026-06-08) -------------------------------
+    # Derived from the live wildcat_v2_adverse_guard so the live preset is left
+    # untouched. They model REALISTIC fees (maker entry/TP = 0, taker SL =
+    # 0.0004) because the live bleed was fee/slippage-driven, which the
+    # zero-fee baseline hides.
+    _v2ag = presets["wildcat_v2_adverse_guard"]
+    _realistic_fees = {"entry_fee_rate": 0.0, "tp_exit_fee_rate": 0.0, "sl_exit_fee_rate": 0.0004}
+    # Baseline with fees (apples-to-apples control for the variants below).
+    presets["wildcat_v2ag_fees"] = replace(
+        _v2ag, label="wildcat_v2ag_fees", **_realistic_fees
+    )
+    # C1: enable S2_SuperTrend so a sustained drop is traded WITH the trend
+    # (short) instead of only mean-reverted (the falling-knife longs of Run 4/5).
+    presets["wildcat_v3_trend"] = replace(
+        _v2ag,
+        label="wildcat_v3_trend",
+        enabled_strategies=("S1_BB_RSI", "S5_Stoch", "S2_SuperTrend"),
+        **_realistic_fees,
+    )
+    # B1: as v3_trend, plus rebalance S1 risk/reward to >= 1:1 (tp 0.0012 ->
+    # 0.0018 to match the 0.0018 sl) so a win covers a loss after taker SL fee.
+    presets["wildcat_v3_trend_rr"] = replace(
+        _v2ag,
+        label="wildcat_v3_trend_rr",
+        enabled_strategies=("S1_BB_RSI", "S5_Stoch", "S2_SuperTrend"),
+        s1_tp=0.0018,
+        **_realistic_fees,
+    )
+    # C1 salvage: S2 with strength gates so it only fires in sustained, separated
+    # trends (cuts the chop whipsaw that made naive S2 lose over 30d).
+    presets["wildcat_v3_trend_filt"] = replace(
+        _v2ag,
+        label="wildcat_v3_trend_filt",
+        enabled_strategies=("S1_BB_RSI", "S5_Stoch", "S2_SuperTrend"),
+        s2_min_trend_share_60=0.5,
+        s2_min_ema_spread_atr=0.5,
+        s2_require_cross=True,
+        **_realistic_fees,
+    )
+    # Cross-only (drop the permissive continuation entries) with light gates —
+    # isolates whether the whipsaw was mostly the continuation branch.
+    presets["wildcat_v3_trend_cross"] = replace(
+        _v2ag,
+        label="wildcat_v3_trend_cross",
+        enabled_strategies=("S1_BB_RSI", "S5_Stoch", "S2_SuperTrend"),
+        s2_min_trend_share_60=0.4,
+        s2_min_ema_spread_atr=0.3,
+        s2_require_cross=True,
+        **_realistic_fees,
+    )
+    # Continuation allowed but only in strong/separated trends (no cross req).
+    presets["wildcat_v3_trend_cont"] = replace(
+        _v2ag,
+        label="wildcat_v3_trend_cont",
+        enabled_strategies=("S1_BB_RSI", "S5_Stoch", "S2_SuperTrend"),
+        s2_min_trend_share_60=0.55,
+        s2_min_ema_spread_atr=0.7,
+        s2_require_cross=False,
+        **_realistic_fees,
+    )
+    # Stricter still — fresh cross + very strong/separated trend only.
+    presets["wildcat_v3_trend_filt2"] = replace(
+        _v2ag,
+        label="wildcat_v3_trend_filt2",
+        enabled_strategies=("S1_BB_RSI", "S5_Stoch", "S2_SuperTrend"),
+        s2_min_trend_share_60=0.65,
+        s2_min_ema_spread_atr=0.9,
+        s2_require_cross=True,
+        **_realistic_fees,
+    )
     if name not in presets:
         raise ValueError(f"Unknown wildcat preset: {name}")
     preset = presets[name]
@@ -1104,11 +1182,15 @@ def build_candidates(
             relax_penalty = max(0.0, 68 - f["rsi"][i]) * 0.35 + params.range_edge_atr_margin * 14
             add("S1_BB_RSI", "SHORT", 65 + min(18, stretch * 12) + (max(f["rsi"][i], 68) - 68) * 0.4 - relax_penalty, params.s1_tp, params.s1_sl, ["bb_upper", "rsi_overbought"])
 
-    if trend in {"up", "down"} and vol_state != "low" and vol_ratio >= params.min_vol_ratio:
+    s2_strong = (
+        f["trend_share_60"][i] >= params.s2_min_trend_share_60
+        and f["ema_spread_atr"][i] >= params.s2_min_ema_spread_atr
+    )
+    if trend in {"up", "down"} and vol_state != "low" and vol_ratio >= params.min_vol_ratio and s2_strong:
         cross_up = f["ema_fast"][i - 1] <= f["ema_slow"][i - 1] and f["ema_fast"][i] > f["ema_slow"][i]
         cross_dn = f["ema_fast"][i - 1] >= f["ema_slow"][i - 1] and f["ema_fast"][i] < f["ema_slow"][i]
-        continuation_up = f["ema_fast"][i] > f["ema_slow"][i] and c["low"] <= max(f["vwap"][i], f["ema_slow"][i])
-        continuation_dn = f["ema_fast"][i] < f["ema_slow"][i] and c["high"] >= min(f["vwap"][i], f["ema_slow"][i])
+        continuation_up = (not params.s2_require_cross) and f["ema_fast"][i] > f["ema_slow"][i] and c["low"] <= max(f["vwap"][i], f["ema_slow"][i])
+        continuation_dn = (not params.s2_require_cross) and f["ema_fast"][i] < f["ema_slow"][i] and c["high"] >= min(f["vwap"][i], f["ema_slow"][i])
         if f["supertrend"][i] == 1 and price > f["vwap"][i] and mtf_bull and (cross_up or continuation_up):
             add("S2_SuperTrend", "LONG", 78 + vol_ratio * 5 + (8 if cross_up else 0), params.s2_tp, params.s2_sl, ["supertrend_up", "vwap_above", "mtf_bull"])
         if f["supertrend"][i] == -1 and price < f["vwap"][i] and mtf_bear and (cross_dn or continuation_dn):

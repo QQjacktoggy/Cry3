@@ -51,6 +51,90 @@ def _to_wildcat_candle(candle: Candle) -> dict:
     }
 
 
+def evaluate_dca_guard(candles: list[Candle], position_side: str) -> tuple[bool, str]:
+    """Risk gate for DCA (averaging-down) on an open position.
+
+    DCA doubles the position while the price is moving against us, which also
+    doubles the loss if the SL is then hit.  This gate blocks DCA when the
+    adverse move looks like a *trend* rather than a *range pullback*, so we do
+    not "average into" a losing trend.
+
+    Returns ``(allow, reason)``.  ``position_side`` is ``"LONG"`` or ``"SHORT"``.
+
+    Two checks:
+    1. **Trend filter** — wildcat only enters in a ``range`` regime.  If the
+       regime has flipped to a trend, the adverse move is likely directional;
+       block DCA.
+    2. **Momentum reversal** — use the Stochastic cross.  For a SHORT, a bullish
+       (golden) cross means upward momentum is strengthening (the move against
+       us is accelerating, not reverting); block.  Mirror for LONG.
+    """
+    side = (position_side or "").upper()
+    if len(candles) < 2:
+        return False, "K 線不足，保守跳過 DCA"
+    raw = [_to_wildcat_candle(c) for c in candles]
+    features = build_features(raw)
+    i = len(raw) - 1
+
+    trend = features["trend"][i]
+    if trend != "range":
+        return False, f"trend={trend}（非 range，疑似趨勢逆行，不加碼）"
+
+    k = features["stoch_k"][i]
+    d = features["stoch_d"][i]
+    k_prev = features["stoch_k"][i - 1]
+    d_prev = features["stoch_d"][i - 1]
+    stoch_up = k_prev <= d_prev and k > d  # golden cross (bullish)
+    stoch_dn = k_prev >= d_prev and k < d  # death cross (bearish)
+
+    if side == "SHORT" and stoch_up:
+        return False, f"Stoch 金叉(K={k:.1f}/D={d:.1f})，上漲動能轉強，做空不加碼"
+    if side == "LONG" and stoch_dn:
+        return False, f"Stoch 死叉(K={k:.1f}/D={d:.1f})，下跌動能轉強，做多不加碼"
+
+    return True, f"range + 動能未反轉(Stoch K={k:.1f}/D={d:.1f})"
+
+
+def evaluate_entry_trend_guard(
+    candles: list[Candle], side: str, slope_block: float = 0.03
+) -> tuple[bool, str]:
+    """Block fresh entries that fight an established trend (falling-knife guard).
+
+    The live preset only enables the mean-reversion strategies (S1/S5), which
+    require ``trend == "range"`` on the *entry bar*.  But the per-bar regime
+    classifier (slope threshold ±0.06 vs EMA50) labels brief consolidations
+    *inside* a sustained move as ``range``, so the dip-buyer fires LONG in the
+    middle of a dump (and shorts a spike in a rally).  Run 4/5 of the
+    2026-06-08 loop were exactly this: LONG @1677/1672 while ETH fell to 1670.
+
+    This gate extends the regime test: it refuses a LONG when price is below
+    the EMA50 *and* the (ATR-normalised) EMA20 slope is meaningfully negative —
+    i.e. a soft downtrend that slipped through as ``range`` — and mirrors it for
+    SHORT.  ``slope_block`` is half the classifier's 0.06, catching the band the
+    classifier still calls ``range``.
+
+    Returns ``(allow, reason)``.  ``side`` is ``"LONG"`` or ``"SHORT"``.
+    """
+    s = (side or "").upper()
+    if len(candles) < 60:
+        return True, "K 線不足，略過進場趨勢守門"
+    raw = [_to_wildcat_candle(c) for c in candles]
+    features = build_features(raw)
+    i = len(raw) - 1
+    price = raw[i]["close"]
+    ema_trend = features["ema_trend"][i]
+    ema_slow = features["ema_slow"]
+    atr = features["atr"][i]
+    atr_val = atr if atr and atr > 0 else 1.0
+    slope = (ema_slow[i] - ema_slow[i - 20]) / atr_val
+
+    if s == "LONG" and price < ema_trend and slope < -slope_block:
+        return False, f"下跌段(價<EMA50, slope={slope:.3f})，不逆勢做多"
+    if s == "SHORT" and price > ema_trend and slope > slope_block:
+        return False, f"上漲段(價>EMA50, slope={slope:.3f})，不逆勢做空"
+    return True, f"趨勢一致(slope={slope:.3f})"
+
+
 def generate_wildcat_v2_adverse_guard_live_decision(
     candles: list[Candle],
     *,

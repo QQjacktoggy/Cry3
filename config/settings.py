@@ -203,6 +203,23 @@ class Settings(BaseSettings):
     mainnet_sl_use_maker: bool = True
     mainnet_sl_maker_ttl_seconds: int = 10
     mainnet_sl_fallback_to_market: bool = True
+    # SL slippage cap (A3, 2026-06-08).  A plain STOP_MARKET guarantees the
+    # exit but fills at market once triggered, so a fast spike can slip well
+    # past the trigger (Run 2: trigger 1688.49 -> filled 1690.98, ~0.15%).
+    # When this is > 0 the SL is armed as a STOP (stop-limit) whose limit price
+    # is the trigger worsened by this fraction, capping the worst fill.
+    # TRADE-OFF: in an extreme gap the limit may NOT fill, leaving the position
+    # open past the stop until the adverse-exit / max-hold market backstop
+    # fires.  Default 0.0 keeps the original guaranteed-exit STOP_MARKET;
+    # validate on testnet before enabling on mainnet.
+    mainnet_sl_limit_cap_pct: float = 0.0
+
+    # Residual "dust" cleanup threshold.  After partial TP fills, the remaining
+    # position may be tiny and its ideal-price TP can sit unfilled until a
+    # reverse move triggers the SL.  When the remaining notional is below this
+    # threshold, re-quote it as a reduce-only POST-ONLY (maker, 0 USDC fee)
+    # order at the top of book so it fills fast without paying taker fees.
+    mainnet_residual_cleanup_notional_usdc: float = 20.0
 
     # Loop cooldown: after an SL exit in a loop chain, the same
     # (side, strategy_label) combination is blocked for N minutes so
