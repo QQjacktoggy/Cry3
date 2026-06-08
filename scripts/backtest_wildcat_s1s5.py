@@ -136,6 +136,11 @@ class WildcatParams:
     s7_sl: float = 0.0013
     s7_breakout_atr: float = 0.10  # margin beyond the band, in ATR units
     s7_vol_ratio: float = 1.2      # volume confirmation
+    # Per-strategy DCA opt-out (2026-06-08). DCA (averaging-down) helps
+    # mean-reversion (price returns) but is poison for trend/breakout entries:
+    # if the move continues against us, DCA doubles the loss when the SL fires.
+    # Strategies listed here never DCA even when recovery_enabled is True.
+    no_dca_strategies: tuple[str, ...] = ()
 
 
 @dataclass
@@ -206,7 +211,7 @@ def main() -> None:
         default=None,
         help="Search only local DD/weak-day refinements around a named preset.",
     )
-    parser.add_argument("--preset", choices=["wildcat_converged_v1", "wildcat_30d_balanced_v1", "wildcat_v2_regime_guard", "wildcat_v2_adverse_guard", "wildcat_v2ag_fees", "wildcat_v3_trend", "wildcat_v3_trend_rr", "wildcat_v3_trend_filt", "wildcat_v3_trend_filt2", "wildcat_v3_trend_cross", "wildcat_v3_trend_cont", "wildcat_v3_s3", "wildcat_v3_s4", "wildcat_v3_s3s4", "wildcat_v2ag_guarded", "wildcat_v3_cross_guarded", "wildcat_v3_s1high", "wildcat_v3_s6", "wildcat_v3_s7", "wildcat_v3_full_cover", "wildcat_v3_best_cover"], default=None, help="Run a fixed named wildcat preset instead of searching variants.")
+    parser.add_argument("--preset", choices=["wildcat_converged_v1", "wildcat_30d_balanced_v1", "wildcat_v2_regime_guard", "wildcat_v2_adverse_guard", "wildcat_v2ag_fees", "wildcat_v3_trend", "wildcat_v3_trend_rr", "wildcat_v3_trend_filt", "wildcat_v3_trend_filt2", "wildcat_v3_trend_cross", "wildcat_v3_trend_cont", "wildcat_v3_s3", "wildcat_v3_s4", "wildcat_v3_s3s4", "wildcat_v2ag_guarded", "wildcat_v3_cross_guarded", "wildcat_v3_s1high", "wildcat_v3_s6", "wildcat_v3_s7", "wildcat_v3_full_cover", "wildcat_v3_best_cover", "wildcat_v3_s6_nodca", "wildcat_v3_s6_tight", "wildcat_v3_s6_strict", "wildcat_v3_s6_cons"], default=None, help="Run a fixed named wildcat preset instead of searching variants.")
     parser.add_argument("--json-output", default=None, help="Optional report path. Defaults to reports/wildcat_s1s5_<days>d.json")
     parser.add_argument("--dump-trades", action="store_true", help="Include all trades in the JSON artifact for deeper analysis.")
     args = parser.parse_args()
@@ -727,6 +732,27 @@ def preset_params(
         s1_allow_high_vol=True,
         enabled_strategies=("S1_BB_RSI", "S5_Stoch", "S2_SuperTrend"),
         s2_min_trend_share_60=0.4, s2_min_ema_spread_atr=0.3, s2_require_cross=True,
+    )
+    # --- Conservative trend-segment retry (2026-06-08) -----------------------
+    # S6 had WR 72.6% but lost -110 / DD135 — classic win-small/lose-big with
+    # DCA amplifying the losers. These variants probe whether a CONSERVATIVE S6
+    # (no DCA / tighter SL / stricter entry) can turn the high WR into profit.
+    _s6base = replace(
+        _guarded, enabled_strategies=("S1_BB_RSI", "S5_Stoch", "S6_TrendPull"),
+        no_dca_strategies=("S6_TrendPull",),
+    )
+    presets["wildcat_v3_s6_nodca"] = replace(_s6base, label="wildcat_v3_s6_nodca")
+    # no DCA + tighter SL (0.0016 -> 0.0010), so each loser is smaller.
+    presets["wildcat_v3_s6_tight"] = replace(
+        _s6base, label="wildcat_v3_s6_tight", s6_sl=0.0010,
+    )
+    # no DCA + stricter entry (only deep pullbacks: vwap_atr 0.8 -> 1.5).
+    presets["wildcat_v3_s6_strict"] = replace(
+        _s6base, label="wildcat_v3_s6_strict", s6_vwap_atr=1.5,
+    )
+    # no DCA + tighter SL + stricter entry (most conservative).
+    presets["wildcat_v3_s6_cons"] = replace(
+        _s6base, label="wildcat_v3_s6_cons", s6_sl=0.0010, s6_vwap_atr=1.5,
     )
     # --- S3/S4 evaluation presets (2026-06-08) --------------------------------
     # S3_EMA_MACD: EMA pullback + MACD flip in trending regime (trend pullback
@@ -1462,6 +1488,8 @@ def maybe_exit(candle: dict, c_time: datetime, i: int, pos: Position, params: Wi
 
 def maybe_recover_position(candle: dict, pos: Position, params: WildcatParams, f: dict, i: int) -> None:
     if not params.recovery_enabled or pos.dca_count >= params.recovery_steps:
+        return
+    if pos.strategy in params.no_dca_strategies:
         return
     # DCA regime guard: mirrors live evaluate_dca_guard.  Only average-down
     # when the regime is still "range" and stochastic momentum is not crossing
