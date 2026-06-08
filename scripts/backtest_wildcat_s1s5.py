@@ -34,7 +34,7 @@ from scripts.backtest_multi_strategies import (
 from scripts.backtest_smart_scalp import calculate_atr, calculate_vwap
 
 TAIPEI = ZoneInfo("Asia/Taipei")
-STRATEGIES = ("S1_BB_RSI", "S2_SuperTrend", "S3_EMA_MACD", "S4_Donchian", "S5_Stoch")
+STRATEGIES = ("S1_BB_RSI", "S2_SuperTrend", "S3_EMA_MACD", "S4_Donchian", "S5_Stoch", "S6_TrendPull", "S7_Squeeze")
 
 
 @dataclass(frozen=True)
@@ -119,6 +119,23 @@ class WildcatParams:
     # unchanged.  Set both to match the A-layer live bot behaviour.
     entry_trend_guard_slope: float = 0.0  # >0 blocks counter-trend entries (live uses 0.03)
     dca_regime_guard: bool = False        # True blocks DCA outside range or on opposing stoch cross
+    # Regime-coverage expansion (2026-06-08). Defaults off / 0 so existing
+    # presets are unchanged.  These extend coverage into regimes S1/S5 ignore.
+    # (1) S1 wide-band reversion in range+HIGH vol (S1 normally only low/normal).
+    s1_allow_high_vol: bool = False
+    # (2) S6_TrendPull: WITH-trend pullback entry — in an up-trend buy a dip
+    #     below VWAP, in a down-trend sell a bounce above VWAP; short TP rides
+    #     the trend continuation, not a counter-trend knife.
+    s6_tp: float = 0.0010
+    s6_sl: float = 0.0016
+    s6_vwap_atr: float = 0.8   # min |price-VWAP|/ATR to call it a pullback
+    s6_require_supertrend: bool = True  # only enter when SuperTrend agrees with trend
+    # (3) S7_Squeeze: Bollinger squeeze breakout in LOW vol — band width is
+    #     narrow (low atr_pct) then price breaks the band with volume.
+    s7_tp: float = 0.0024
+    s7_sl: float = 0.0013
+    s7_breakout_atr: float = 0.10  # margin beyond the band, in ATR units
+    s7_vol_ratio: float = 1.2      # volume confirmation
 
 
 @dataclass
@@ -189,7 +206,7 @@ def main() -> None:
         default=None,
         help="Search only local DD/weak-day refinements around a named preset.",
     )
-    parser.add_argument("--preset", choices=["wildcat_converged_v1", "wildcat_30d_balanced_v1", "wildcat_v2_regime_guard", "wildcat_v2_adverse_guard", "wildcat_v2ag_fees", "wildcat_v3_trend", "wildcat_v3_trend_rr", "wildcat_v3_trend_filt", "wildcat_v3_trend_filt2", "wildcat_v3_trend_cross", "wildcat_v3_trend_cont", "wildcat_v3_s3", "wildcat_v3_s4", "wildcat_v3_s3s4", "wildcat_v2ag_guarded", "wildcat_v3_cross_guarded"], default=None, help="Run a fixed named wildcat preset instead of searching variants.")
+    parser.add_argument("--preset", choices=["wildcat_converged_v1", "wildcat_30d_balanced_v1", "wildcat_v2_regime_guard", "wildcat_v2_adverse_guard", "wildcat_v2ag_fees", "wildcat_v3_trend", "wildcat_v3_trend_rr", "wildcat_v3_trend_filt", "wildcat_v3_trend_filt2", "wildcat_v3_trend_cross", "wildcat_v3_trend_cont", "wildcat_v3_s3", "wildcat_v3_s4", "wildcat_v3_s3s4", "wildcat_v2ag_guarded", "wildcat_v3_cross_guarded", "wildcat_v3_s1high", "wildcat_v3_s6", "wildcat_v3_s7", "wildcat_v3_full_cover", "wildcat_v3_best_cover"], default=None, help="Run a fixed named wildcat preset instead of searching variants.")
     parser.add_argument("--json-output", default=None, help="Optional report path. Defaults to reports/wildcat_s1s5_<days>d.json")
     parser.add_argument("--dump-trades", action="store_true", help="Include all trades in the JSON artifact for deeper analysis.")
     args = parser.parse_args()
@@ -677,6 +694,40 @@ def preset_params(
         label="wildcat_v3_cross_guarded",
         entry_trend_guard_slope=0.03,
     )
+    # --- Regime-coverage expansion presets (2026-06-08) ----------------------
+    # All built on wildcat_v2ag_guarded (entry guard + realistic fees) so they
+    # are directly comparable to that +241.7 / DD49 baseline.
+    _guarded = presets["wildcat_v2ag_guarded"]
+    # range+HIGH vol wide-band S1 reversion (adds the 1197 range+high bars).
+    presets["wildcat_v3_s1high"] = replace(
+        _guarded, label="wildcat_v3_s1high", s1_allow_high_vol=True,
+    )
+    # S6 with-trend pullback (covers up/down trend continuation).
+    presets["wildcat_v3_s6"] = replace(
+        _guarded, label="wildcat_v3_s6",
+        enabled_strategies=("S1_BB_RSI", "S5_Stoch", "S6_TrendPull"),
+    )
+    # S7 low-vol squeeze breakout (covers the low-vol regime).
+    presets["wildcat_v3_s7"] = replace(
+        _guarded, label="wildcat_v3_s7",
+        enabled_strategies=("S1_BB_RSI", "S5_Stoch", "S7_Squeeze"),
+    )
+    # All three coverage expansions together (+ S2 cross-only rescue).
+    presets["wildcat_v3_full_cover"] = replace(
+        _guarded, label="wildcat_v3_full_cover",
+        s1_allow_high_vol=True,
+        enabled_strategies=("S1_BB_RSI", "S5_Stoch", "S2_SuperTrend", "S6_TrendPull", "S7_Squeeze"),
+        s2_min_trend_share_60=0.4, s2_min_ema_spread_atr=0.3, s2_require_cross=True,
+    )
+    # Best surviving combo: S1(+high vol) + S5 + S2 cross-only.  Drops the two
+    # losing trend/breakout strategies (S6 pullback, S7 squeeze) that the
+    # 2026-06-08 backtest showed lose money (S6 -110/DD135, S7 -29/PF0.24).
+    presets["wildcat_v3_best_cover"] = replace(
+        _guarded, label="wildcat_v3_best_cover",
+        s1_allow_high_vol=True,
+        enabled_strategies=("S1_BB_RSI", "S5_Stoch", "S2_SuperTrend"),
+        s2_min_trend_share_60=0.4, s2_min_ema_spread_atr=0.3, s2_require_cross=True,
+    )
     # --- S3/S4 evaluation presets (2026-06-08) --------------------------------
     # S3_EMA_MACD: EMA pullback + MACD flip in trending regime (trend pullback
     #   entry, fires when trend != range and price touches EMA slow + MACD
@@ -1028,6 +1079,8 @@ def run_backtest(
         "S3_EMA_MACD": RollingWinRate(16, 0.38),
         "S4_Donchian": RollingWinRate(24, 0.30),
         "S5_Stoch": RollingWinRate(20, 0.34),
+        "S6_TrendPull": RollingWinRate(16, 0.36),
+        "S7_Squeeze": RollingWinRate(20, 0.32),
     }
     cooldown_until = {key: 0 for key in STRATEGIES}
     side_cooldown_until = {(strategy, side): 0 for strategy in STRATEGIES for side in ("LONG", "SHORT")}
@@ -1221,7 +1274,8 @@ def build_candidates(
 
     s1_allowed = s1_regime_allowed(f, i, params)
 
-    if s1_allowed and trend == "range" and vol_state in {"low", "normal"} and vol_ratio >= params.min_vol_ratio and body_ratio >= params.strict_body_ratio:
+    s1_vol_ok = vol_state in {"low", "normal"} or (params.s1_allow_high_vol and vol_state == "high")
+    if s1_allowed and trend == "range" and s1_vol_ok and vol_ratio >= params.min_vol_ratio and body_ratio >= params.strict_body_ratio:
         if price <= f["bb_lower"][i] + params.range_edge_atr_margin * atr_val and f["rsi"][i] <= params.s1_rsi_long_max:
             stretch = max(0.0, (f["bb_lower"][i] - price) / atr_val)
             relax_penalty = max(0.0, f["rsi"][i] - 32) * 0.35 + params.range_edge_atr_margin * 14
@@ -1270,6 +1324,27 @@ def build_candidates(
         if stoch_dn and f["stoch_d"][i] > params.s5_short_d_min and price > f["vwap"][i] - (0.25 + params.range_edge_atr_margin) * atr_val:
             relax_penalty = max(0.0, 76 - f["stoch_d"][i]) * 0.3 + params.range_edge_atr_margin * 10
             add("S5_Stoch", "SHORT", 66 + (max(f["stoch_d"][i], 76) - 76) * 0.5 - relax_penalty, params.s5_tp, params.s5_sl, ["stoch_cross_down", "range_reversion"])
+
+    # S6_TrendPull: WITH-trend pullback entry (not a counter-trend knife).
+    # up-trend  -> price dips below VWAP by >= s6_vwap_atr ATR -> buy the dip;
+    # down-trend-> price bounces above VWAP by >= s6_vwap_atr ATR -> sell it.
+    # SuperTrend (optional) must agree, so we only ride confirmed trends.
+    if "S6_TrendPull" in params.enabled_strategies and trend in {"up", "down"} and vol_state != "low" and vol_ratio >= params.min_vol_ratio:
+        dev = (f["vwap"][i] - price) / atr_val  # >0 = price below VWAP (a dip)
+        st_long = (not params.s6_require_supertrend) or f["supertrend"][i] == 1
+        st_short = (not params.s6_require_supertrend) or f["supertrend"][i] == -1
+        if trend == "up" and mtf_bull and st_long and dev >= params.s6_vwap_atr:
+            add("S6_TrendPull", "LONG", 70 + min(12, dev * 4), params.s6_tp, params.s6_sl, ["uptrend_pullback", "vwap_dip"])
+        if trend == "down" and mtf_bear and st_short and (-dev) >= params.s6_vwap_atr:
+            add("S6_TrendPull", "SHORT", 70 + min(12, (-dev) * 4), params.s6_tp, params.s6_sl, ["downtrend_bounce", "vwap_above"])
+
+    # S7_Squeeze: low-vol Bollinger squeeze breakout — narrow band (low atr_pct)
+    # then price expands through the band with volume confirmation.
+    if "S7_Squeeze" in params.enabled_strategies and vol_state == "low" and vol_ratio >= params.s7_vol_ratio:
+        if price > f["bb_upper"][i] + params.s7_breakout_atr * atr_val:
+            add("S7_Squeeze", "LONG", 68 + min(15, vol_ratio * 4), params.s7_tp, params.s7_sl, ["squeeze_break_up", "low_vol_expansion"])
+        if price < f["bb_lower"][i] - params.s7_breakout_atr * atr_val:
+            add("S7_Squeeze", "SHORT", 68 + min(15, vol_ratio * 4), params.s7_tp, params.s7_sl, ["squeeze_break_down", "low_vol_expansion"])
 
     if catchup and s1_allowed and vol_ratio >= params.min_vol_ratio * 0.45 and body_ratio >= max(0.04, params.strict_body_ratio * 0.45):
         vwap_atr = params.rescue_vwap_atr if rescue else params.catchup_vwap_atr
