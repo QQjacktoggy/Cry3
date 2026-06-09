@@ -3,12 +3,12 @@
   "symbol": "ETHUSDC",
   "runs": [
     {
-      "days": 7,
-      "generated_at": "2026-06-08T06:42:23.912451+00:00",
+      "days": 14,
+      "generated_at": "2026-06-08T06:42:28.911754+00:00",
       "variant_count": 1,
       "best": {
         "symbol": "ETHUSDC",
-        "days": 7,
+        "days": 14,
         "params": {
           "label": "wildcat_v3_best_cover",
           "s1_tp": 0.0012,
@@ -101,15 +101,15 @@
           "s7_vol_ratio": 1.2,
           "no_dca_strategies": []
         },
-        "trades": 567,
-        "wins": 507,
-        "losses": 59,
-        "win_rate_pct": 89.42,
-        "net_pnl_usdc": 166.433,
-        "gross_profit_usdc": 427.6844,
-        "gross_loss_usdc": 261.2515,
-        "profit_factor": 1.6371,
-        "max_drawdown_usdc": 42.882,
+        "trades": 1041,
+        "wins": 886,
+        "losses": 154,
+        "win_rate_pct": 85.11,
+        "net_pnl_usdc": 211.5086,
+        "gross_profit_usdc": 723.8334,
+        "gross_loss_usdc": 512.3249,
+        "profit_factor": 1.4128,
+        "max_drawdown_usdc": 38.1605,
         "strict_objective": {
           "daily_min_target_usdc": 20.0,
           "avg_daily_target_usdc": 30.0,
@@ -123,32 +123,67 @@
           "met": false
         },
         "target_daily_usdc": 20.0,
-        "active_days": 8,
-        "avg_daily_pnl_usdc": 23.7761,
-        "avg_active_day_pnl_usdc": 20.8041,
-        "daily_target_hits": 5,
-        "daily_target_day_count": 8,
-        "daily_target_hit_rate_pct": 62.5,
+        "active_days": 15,
+        "avg_daily_pnl_usdc": 15.1078,
+        "avg_active_day_pnl_usdc": 14.1006,
+        "daily_target_hits": 6,
+        "daily_target_day_count": 15,
+        "daily_target_hit_rate_pct": 40.0,
         "all_days_met_target": false,
         "best_day_usdc": 40.7019,
         "worst_day_usdc": -22.8468,
-        "required_notional_for_target_usdc": 841.18,
+        "required_notional_for_target_usdc": 1323.82,
         "leverage_report": [
           {
             "leverage": 75,
             "margin_per_trade_usdc": 13.3333,
-            "avg_daily_return_on_margin_pct": 178.32
+            "avg_daily_return_on_margin_pct": 113.31
           },
           {
             "leverage": 100,
             "margin_per_trade_usdc": 10.0,
-            "avg_daily_return_on_margin_pct": 237.76
+            "avg_daily_return_on_margin_pct": 151.08
           }
         ],
         "daily_pnl": [
           {
+            "date": "2026-05-25",
+            "pnl_usdc": 3.7187,
+            "met_target": false
+          },
+          {
+            "date": "2026-05-26",
+            "pnl_usdc": -3.434,
+            "met_target": false
+          },
+          {
+            "date": "2026-05-27",
+            "pnl_usdc": 3.6699,
+            "met_target": false
+          },
+          {
+            "date": "2026-05-28",
+            "pnl_usdc": 26.2166,
+            "met_target": true
+          },
+          {
+            "date": "2026-05-29",
+            "pnl_usdc": -9.1581,
+            "met_target": false
+          },
+          {
+            "date": "2026-05-30",
+            "pnl_usdc": 0.1004,
+            "met_target": false
+          },
+          {
+            "date": "2026-05-31",
+            "pnl_usdc": 3.7758,
+            "met_target": false
+          },
+          {
             "date": "2026-06-01",
-            "pnl_usdc": -11.0434,
+            "pnl_usdc": 9.1429,
             "met_target": false
           },
           {
@@ -189,18 +224,18 @@
         ],
         "by_strategy": {
           "S1_BB_RSI": {
-            "trades": 508,
-            "win_rate_pct": 90.75,
-            "net_pnl_usdc": 147.7468,
-            "profit_factor": 1.6983,
-            "max_drawdown_usdc": 41.2561
+            "trades": 922,
+            "win_rate_pct": 86.88,
+            "net_pnl_usdc": 201.2592,
+            "profit_factor": 1.4914,
+            "max_drawdown_usdc": 36.5318
           },
           "S2_SuperTrend": {
-            "trades": 4,
-            "win_rate_pct": 50.0,
-            "net_pnl_usdc": -0.2337,
-            "profit_factor": 0.9586,
-            "max_drawdown_usdc": 3.6275
+            "trades": 8,
+            "win_rate_pct": 37.5,
+            "net_pnl_usdc": -1.1154,
+            "profit_factor": 0.8747,
+            "max_drawdown_usdc": 5.0564
           },
           "S3_EMA_MACD": {
             "trades": 0,
@@ -217,11 +252,11 @@
             "max_drawdown_usdc": 0.0
           },
           "S5_Stoch": {
-            "trades": 55,
-            "win_rate_pct": 80.0,
-            "net_pnl_usdc": 18.9199,
-            "profit_factor": 1.4297,
-            "max_drawdown_usdc": 10.3779
+            "trades": 111,
+            "win_rate_pct": 73.87,
+            "net_pnl_usdc": 11.3647,
+            "profit_factor": 1.1211,
+            "max_drawdown_usdc": 14.7622
           },
           "S6_TrendPull": {
             "trades": 0,
@@ -238,10 +273,10 @@
             "max_drawdown_usdc": 0.0
           }
         },
-        "rank_score": -2293.3967,
+        "rank_score": -3539.0457600000004,
         "rejected": {
-          "cooldown": 71,
-          "duplicate_open": 389,
+          "duplicate_open": 1454,
+          "cooldown": 175,
           "daily_target_stop": 1340
         },
         "sample_trades": [
@@ -250,8 +285,8 @@
             "side": "LONG",
             "entry_time": "2026-06-08T00:30:00+08:00",
             "exit_time": "2026-06-08T00:32:00+08:00",
-            "entry_index": 9227,
-            "exit_index": 9229,
+            "entry_index": 19307,
+            "exit_index": 19309,
             "entry_price": 1627.29,
             "exit_price": 1630.2191,
             "exit_reason": "TP",
@@ -268,8 +303,8 @@
             "side": "LONG",
             "entry_time": "2026-06-08T00:56:00+08:00",
             "exit_time": "2026-06-08T00:59:00+08:00",
-            "entry_index": 9253,
-            "exit_index": 9256,
+            "entry_index": 19333,
+            "exit_index": 19336,
             "entry_price": 1625.99,
             "exit_price": 1627.59,
             "exit_reason": "TP",
@@ -286,8 +321,8 @@
             "side": "LONG",
             "entry_time": "2026-06-08T01:45:00+08:00",
             "exit_time": "2026-06-08T01:48:00+08:00",
-            "entry_index": 9302,
-            "exit_index": 9305,
+            "entry_index": 19382,
+            "exit_index": 19385,
             "entry_price": 1630.2122,
             "exit_price": 1630.934,
             "exit_reason": "TP",
@@ -304,8 +339,8 @@
             "side": "LONG",
             "entry_time": "2026-06-08T02:49:00+08:00",
             "exit_time": "2026-06-08T02:50:00+08:00",
-            "entry_index": 9366,
-            "exit_index": 9367,
+            "entry_index": 19446,
+            "exit_index": 19447,
             "entry_price": 1629.3161,
             "exit_price": 1630.0376,
             "exit_reason": "TP",
@@ -322,8 +357,8 @@
             "side": "LONG",
             "entry_time": "2026-06-08T02:50:00+08:00",
             "exit_time": "2026-06-08T02:52:00+08:00",
-            "entry_index": 9367,
-            "exit_index": 9369,
+            "entry_index": 19447,
+            "exit_index": 19449,
             "entry_price": 1628.31,
             "exit_price": 1629.9123,
             "exit_reason": "TP",
@@ -340,8 +375,8 @@
             "side": "SHORT",
             "entry_time": "2026-06-08T05:56:00+08:00",
             "exit_time": "2026-06-08T05:57:00+08:00",
-            "entry_index": 9553,
-            "exit_index": 9554,
+            "entry_index": 19633,
+            "exit_index": 19634,
             "entry_price": 1630.7332,
             "exit_price": 1630.0111,
             "exit_reason": "TP",
@@ -358,8 +393,8 @@
             "side": "SHORT",
             "entry_time": "2026-06-08T07:15:00+08:00",
             "exit_time": "2026-06-08T07:16:00+08:00",
-            "entry_index": 9632,
-            "exit_index": 9633,
+            "entry_index": 19712,
+            "exit_index": 19713,
             "entry_price": 1677.37,
             "exit_price": 1674.3507,
             "exit_reason": "TP",
@@ -376,8 +411,8 @@
             "side": "SHORT",
             "entry_time": "2026-06-08T10:26:00+08:00",
             "exit_time": "2026-06-08T10:28:00+08:00",
-            "entry_index": 9823,
-            "exit_index": 9825,
+            "entry_index": 19903,
+            "exit_index": 19905,
             "entry_price": 1686.88,
             "exit_price": 1685.2201,
             "exit_reason": "TP",
@@ -394,8 +429,8 @@
             "side": "SHORT",
             "entry_time": "2026-06-08T12:00:00+08:00",
             "exit_time": "2026-06-08T12:02:00+08:00",
-            "entry_index": 9917,
-            "exit_index": 9919,
+            "entry_index": 19997,
+            "exit_index": 19999,
             "entry_price": 1679.14,
             "exit_price": 1677.8552,
             "exit_reason": "TP",
@@ -412,8 +447,8 @@
             "side": "LONG",
             "entry_time": "2026-06-08T14:15:00+08:00",
             "exit_time": "2026-06-08T14:17:00+08:00",
-            "entry_index": 10052,
-            "exit_index": 10054,
+            "entry_index": 20132,
+            "exit_index": 20134,
             "entry_price": 1660.56,
             "exit_price": 1661.8943,
             "exit_reason": "TP",
@@ -430,8 +465,8 @@
             "side": "LONG",
             "entry_time": "2026-06-08T14:37:00+08:00",
             "exit_time": "2026-06-08T14:39:00+08:00",
-            "entry_index": 10074,
-            "exit_index": 10076,
+            "entry_index": 20154,
+            "exit_index": 20156,
             "entry_price": 1661.61,
             "exit_price": 1662.9451,
             "exit_reason": "TP",
@@ -448,10 +483,10 @@
             "side": "LONG",
             "entry_time": "2026-06-08T14:42:00+08:00",
             "exit_time": "2026-06-08T14:42:00+08:00",
-            "entry_index": 10079,
-            "exit_index": 10079,
-            "entry_price": 1662.5,
-            "exit_price": 1662.5,
+            "entry_index": 20159,
+            "exit_index": 20159,
+            "entry_price": 1662.33,
+            "exit_price": 1662.33,
             "exit_reason": "EOD",
             "gross_pnl": 0.0,
             "fees": 0.0,

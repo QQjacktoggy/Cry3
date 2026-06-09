@@ -13,7 +13,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from html import escape
 from zoneinfo import ZoneInfo
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from config.settings import Settings
@@ -636,6 +636,76 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("▶️ 已恢復訊號推送。系統會繼續掃描 ETHUSDC，有可開單訊號會主動通知。")
     else:
         await update.message.reply_text("排程器未初始化")
+
+
+def _rescue_menu(current: bool) -> tuple[str, InlineKeyboardMarkup]:
+    """Build the /rescue status text + inline keyboard for the given state."""
+    state = "✅ 開啟" if current else "⛔ 關閉"
+    text = (
+        "🚑 <b>Rescue / Catch-up 追進度模式</b>\n"
+        f"目前狀態：<b>{state}</b>\n\n"
+        "<b>開啟</b>：<u>立即</u>進入搶單模式（不必等中午，只要當日未達標就放寬"
+        "進場條件搶單，回測顯示是主要獲利來源）。\n"
+        "<b>關閉</b>：停止，只用嚴格 S1/S2/S5 訊號，交易量大減但每筆品質較高。\n\n"
+        "💡 半夜低流動性時段建議關閉，避免品質差的單。\n"
+        "點下方按鈕切換（即時生效，無需重啟）："
+    )
+    buttons = [[
+        InlineKeyboardButton("🟢 開啟 ✓" if current else "開啟", callback_data="rescue:on"),
+        InlineKeyboardButton("關閉" if current else "🔴 關閉 ✓", callback_data="rescue:off"),
+    ]]
+    return text, InlineKeyboardMarkup(buttons)
+
+
+async def cmd_rescue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/rescue — Show the catch-up/rescue toggle menu (inline buttons).
+
+    The setting is persisted in app_config and read live by the mainnet one-run
+    manager, so toggling takes effect without a restart.
+    """
+    if not await _authorized(update, context):
+        return
+    from src.gridbot.mainnet.one_run import RESCUE_CONFIG_KEY
+
+    config_repo = context.application.bot_data.get("config_repo")
+    if config_repo is None:
+        await update.message.reply_text("❌ 設定儲存未初始化（mainnet 未啟用）。")
+        return
+
+    raw = await config_repo.get(RESCUE_CONFIG_KEY)
+    current = raw != "0"  # default enabled
+    text, markup = _rescue_menu(current)
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=markup)
+
+
+async def handle_rescue_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle the rescue:on / rescue:off inline buttons from /rescue."""
+    if not await _authorized(update, context):
+        return
+    query = update.callback_query
+    if query is None:
+        return
+    from src.gridbot.mainnet.one_run import RESCUE_CONFIG_KEY
+
+    config_repo = context.application.bot_data.get("config_repo")
+    if config_repo is None:
+        await query.answer("設定儲存未初始化（mainnet 未啟用）。", show_alert=True)
+        return
+    manager = context.application.bot_data.get("mainnet_one_run_manager")
+    target = (query.data or "") == "rescue:on"
+
+    # Prefer the manager setter so its in-memory cache stays in sync.
+    if manager is not None:
+        await manager.set_rescue_enabled(target)
+    else:
+        await config_repo.set(RESCUE_CONFIG_KEY, "1" if target else "0")
+
+    await query.answer("已開啟 Rescue" if target else "已關閉 Rescue")
+    text, markup = _rescue_menu(target)
+    try:
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+    except Exception as exc:  # noqa: BLE001 — e.g. "message is not modified"
+        logger.info("rescue_menu_edit_skipped", error=str(exc))
 
 
 async def cmd_signal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

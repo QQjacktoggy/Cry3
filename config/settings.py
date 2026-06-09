@@ -158,6 +158,8 @@ class Settings(BaseSettings):
     mainnet_entry_requote_min_age_seconds: int = 22
     mainnet_partial_exit_pct: float = 0.40
     mainnet_partial_tp_pct: float = 0.0005
+    mainnet_mid_tp_pct: float = 0.0012     # mid exit at +0.12% (0 = disabled)
+    mainnet_mid_exit_pct: float = 0.50     # fraction of remaining qty (after TP1) to exit at mid TP
     mainnet_recovery_enabled: bool = True
     # Recovery (DCA) settings — reduced from 3 steps to 1, with
     # tighter trigger (0.09% -> 0.05%) so the first averaging happens
@@ -169,6 +171,28 @@ class Settings(BaseSettings):
     mainnet_adverse_exit_bars: int = 10
     mainnet_adverse_exit_loss_pct: float = 0.0007
     mainnet_max_holding_bars: int = 20
+    # Trailing take-profit / profit-lock (2026-06-08). Mirrors the backtest
+    # wildcat_v3_trail_c preset (arm 0.7 / giveback 0.25), which lifted 30d
+    # PnL +320->+762 and cut MaxDD 45.8->15.8 by locking runner gains that
+    # spike toward TP2 then reverse instead of riding them back to SL.
+    # Backtest assumes a 1m-low fill; live samples mark every ~10s so realised
+    # gain will be somewhat lower — validate on testnet before trusting fully.
+    mainnet_trail_enabled: bool = True
+    mainnet_trail_arm_frac: float = 0.7      # arm once peak MFE >= this fraction of tp_pct
+    mainnet_trail_giveback_frac: float = 0.25  # lock-exit after retracing this fraction of the run
+    # TRAIL profit-lock exit fee optimisation (2026-06-08). The runner is in
+    # profit and not racing a stop, so the lock-exit can be a reduce-only
+    # POST_ONLY (maker, 0 USDC fee on ETHUSDC) instead of a market taker close.
+    # We place the maker exit at the passive top-of-book and poll for up to
+    # mainnet_trail_exit_maker_ttl_seconds; if it has not filled by then (price
+    # ran past), we cancel it and market-close the remainder. SL/ADVERSE/MAX_HOLD
+    # keep their guaranteed market close — only TRAIL uses this maker-first path.
+    # Within the TTL the maker quote is re-priced every
+    # mainnet_trail_exit_reprice_seconds to chase the book, so a moving market
+    # does not strand it at a stale price (Run 61139 paid a taker fee that way).
+    mainnet_trail_exit_use_maker: bool = True
+    mainnet_trail_exit_maker_ttl_seconds: int = 12
+    mainnet_trail_exit_reprice_seconds: int = 2
     mainnet_client_order_prefix: str = "cry3mn"
 
     # GTX post-only rejection handling.
@@ -203,11 +227,32 @@ class Settings(BaseSettings):
     mainnet_sl_use_maker: bool = True
     mainnet_sl_maker_ttl_seconds: int = 10
     mainnet_sl_fallback_to_market: bool = True
+    # SL slippage cap (A3, 2026-06-08).  A plain STOP_MARKET guarantees the
+    # exit but fills at market once triggered, so a fast spike can slip well
+    # past the trigger (Run 2: trigger 1688.49 -> filled 1690.98, ~0.15%).
+    # When this is > 0 the SL is armed as a STOP (stop-limit) whose limit price
+    # is the trigger worsened by this fraction, capping the worst fill.
+    # TRADE-OFF: in an extreme gap the limit may NOT fill, leaving the position
+    # open past the stop until the adverse-exit / max-hold market backstop
+    # fires.  Default 0.0 keeps the original guaranteed-exit STOP_MARKET;
+    # validate on testnet before enabling on mainnet.
+    mainnet_sl_limit_cap_pct: float = 0.0
+
+    # Residual "dust" cleanup threshold.  After partial TP fills, the remaining
+    # position may be tiny and its ideal-price TP can sit unfilled until a
+    # reverse move triggers the SL.  When the remaining notional is below this
+    # threshold, re-quote it as a reduce-only POST-ONLY (maker, 0 USDC fee)
+    # order at the top of book so it fills fast without paying taker fees.
+    mainnet_residual_cleanup_notional_usdc: float = 20.0
 
     # Loop cooldown: after an SL exit in a loop chain, the same
     # (side, strategy_label) combination is blocked for N minutes so
     # we do not chain into an identical losing setup.
     mainnet_loop_cooldown_minutes: int = 5
+    # DCA guard cooldown: after the DCA risk guard blocks a recovery order,
+    # hold that block for this many seconds regardless of regime re-classification
+    # (prevents a brief range flicker from bypassing the guard within the window).
+    mainnet_dca_guard_cooldown_seconds: int = 300
 
     @property
     def mainnet_effective_entry_notional_usdc(self) -> float:

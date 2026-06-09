@@ -21,7 +21,7 @@ if [[ "${BINANCE_TESTNET:-}" != "true" ]]; then
 fi
 
 case "${DB_PATH:-}" in
-  testnet/*) ;;
+  testnet/* | */testnet/*) ;;
   *)
     echo "Refusing to start: DB_PATH must stay under testnet/." >&2
     exit 1

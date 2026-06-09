@@ -274,6 +274,69 @@ class BinanceFuturesClient:
         return await self.client.futures_create_order(**params)
 
     @async_retry(max_attempts=3, base_delay=2.0, exceptions=(BinanceAPIException, Exception))
+    async def create_stop_market_sl_order(
+        self,
+        symbol: str,
+        side: str,
+        stop_price: float,
+        quantity: str,
+        client_order_id: str | None = None,
+        working_type: str = "MARK_PRICE",
+    ) -> dict:
+        """POST /fapi/v1/order — reduce-only STOP_MARKET for stop-loss.
+        Sits passively on the exchange; triggers a market close when mark
+        price touches stop_price.  Never rejected with -5022.
+        """
+        tick_size = await self._price_tick_size(symbol)
+        params = {
+            "symbol": symbol,
+            "side": side,
+            "type": "STOP_MARKET",
+            "stopPrice": _format_tick_price(stop_price, tick_size),
+            "quantity": quantity,
+            "reduceOnly": "true",
+            "workingType": working_type,
+            "priceProtect": "TRUE",
+        }
+        if client_order_id:
+            params["newClientOrderId"] = client_order_id
+        return await self.client.futures_create_order(**params)
+
+    async def create_stop_limit_sl_order(
+        self,
+        symbol: str,
+        side: str,
+        stop_price: float,
+        limit_price: float,
+        quantity: str,
+        client_order_id: str | None = None,
+        working_type: str = "MARK_PRICE",
+    ) -> dict:
+        """POST /fapi/v1/order — reduce-only STOP (stop-limit) for stop-loss.
+
+        Sits passively until mark price touches ``stop_price``, then places a
+        reduce-only LIMIT at ``limit_price`` (the trigger worsened by the
+        configured slippage cap).  Caps the worst fill versus a STOP_MARKET, but
+        may NOT fill in an extreme gap — callers must keep a market backstop.
+        """
+        tick_size = await self._price_tick_size(symbol)
+        params = {
+            "symbol": symbol,
+            "side": side,
+            "type": "STOP",
+            "stopPrice": _format_tick_price(stop_price, tick_size),
+            "price": _format_tick_price(limit_price, tick_size),
+            "quantity": quantity,
+            "reduceOnly": "true",
+            "timeInForce": "GTC",
+            "workingType": working_type,
+            "priceProtect": "TRUE",
+        }
+        if client_order_id:
+            params["newClientOrderId"] = client_order_id
+        return await self.client.futures_create_order(**params)
+
+    @async_retry(max_attempts=3, base_delay=2.0, exceptions=(BinanceAPIException, Exception))
     async def create_reduce_only_limit_order(
         self,
         symbol: str,

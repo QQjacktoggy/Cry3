@@ -267,7 +267,20 @@ class PositionInfo:
     @classmethod
     def from_api(cls, data: dict) -> "PositionInfo":
         leverage_raw = data.get("leverage")
-        leverage = int(float(leverage_raw)) if leverage_raw not in (None, "") else 1
+        if leverage_raw not in (None, ""):
+            leverage = int(float(leverage_raw))
+        else:
+            # Newer /fapi/v3/positionRisk responses drop the "leverage" field,
+            # so infer it from notional / initialMargin (e.g. 86.21 / 0.862 ≈ 100).
+            notional = abs(float(data.get("notional", 0) or 0))
+            if notional == 0:
+                notional = abs(float(data.get("positionAmt", 0) or 0)) * float(
+                    data.get("markPrice", 0) or 0
+                )
+            init_margin = float(
+                data.get("initialMargin", data.get("positionInitialMargin", 0)) or 0
+            )
+            leverage = max(1, round(notional / init_margin)) if notional > 0 and init_margin > 0 else 1
         return cls(
             symbol=data["symbol"],
             position_amt=float(data.get("positionAmt", 0)),

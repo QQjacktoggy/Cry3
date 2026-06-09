@@ -567,6 +567,15 @@ class MainnetRunRepository:
             return None
         return int(row["event_time_ms"])
 
+    async def get_runs_by_ids(self, run_ids: list[str]) -> list[dict]:
+        if not run_ids:
+            return []
+        placeholders = ",".join("?" for _ in run_ids)
+        return await self._db.fetchall(
+            f"SELECT * FROM mainnet_runs WHERE run_id IN ({placeholders})",
+            tuple(run_ids),
+        )
+
 
 class ConfigRepository:
     def __init__(self, db: Database) -> None:

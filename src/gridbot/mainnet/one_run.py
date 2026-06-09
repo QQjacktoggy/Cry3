@@ -19,12 +19,21 @@ from src.gridbot.binance.client import BinanceFuturesClient
 from src.gridbot.binance.models import PositionInfo
 from src.gridbot.storage.repositories import FuturesTradeRepository, MainnetRunRepository
 from src.gridbot.strategy.long_pullback import Candle
-from src.gridbot.strategy.wildcat_live import WildcatLiveDecision, generate_wildcat_v2_adverse_guard_live_decision
+from src.gridbot.strategy.wildcat_live import (
+    WildcatLiveDecision,
+    evaluate_dca_guard,
+    evaluate_entry_trend_guard,
+    generate_wildcat_v2_adverse_guard_live_decision,
+)
 from src.gridbot.utils.logging import get_logger
 
 logger = get_logger(__name__)
 PARTIAL_TP_SUFFIX = "_tp1"
-FINAL_TP_SUFFIX = "_tp2"
+MID_TP_SUFFIX = "_tp2"
+FINAL_TP_SUFFIX = "_tp3"
+
+# app_config key for the catch-up/rescue runtime kill-switch (Telegram /rescue).
+RESCUE_CONFIG_KEY = "mainnet_rescue_enabled"
 
 
 TERMINAL_STATUSES = {"COMPLETED", "ENTRY_EXPIRED", "FAILED", "CANCELLED", "EMERGENCY_CLOSED"}
@@ -50,16 +59,36 @@ class MainnetOneRunManager:
         repo: MainnetRunRepository,
         telegram_app=None,
         trade_repo: FuturesTradeRepository | None = None,
+        config_repo=None,
     ) -> None:
         self._settings = settings
         self._client = client
         self._repo = repo
         self._trade_repo = trade_repo
         self._telegram_app = telegram_app
+        # Runtime kill-switch for the catch-up/rescue branch, persisted in
+        # app_config (key RESCUE_CONFIG_KEY) so it survives restarts and is
+        # shared with the Telegram /rescue command. None = not yet loaded.
+        self._config_repo = config_repo
+        self._rescue_enabled: bool | None = None
         self._protection_sent: set[str] = set()
         self._partial_taken: set[str] = set()
         self._partial_order_armed: set[str] = set()
         self._recovery_counts: dict[str, int] = {}
+        # Trailing take-profit state, keyed by run_id.  _trail_peak holds the
+        # best favorable mark price seen since entry (highest for LONG, lowest
+        # for SHORT); _trail_armed marks runs whose peak has crossed the arm
+        # threshold so the lock-exit is live.  See _run_running.
+        self._trail_peak: dict[str, float] = {}
+        self._trail_armed: set[str] = set()
+        # DCA guard cooldown: maps run_id -> ms timestamp of last guard block.
+        # Prevents regime-flicker from bypassing the guard within the cooldown
+        # window (mainnet_dca_guard_cooldown_seconds).
+        self._dca_block_times: dict[str, int] = {}
+        # Partial-exit flag: once TP1 fires (qty shrinks), DCA is forbidden so
+        # we never average into a runner that already booked partial profit.
+        self._partial_exits: set[str] = set()
+        self._mid_order_armed: set[str] = set()
         # Conservative entry requote state — counts and last-requote
         # timestamps keyed by run_id, so we can throttle requotes
         # without bumping run.updated_at_ms (which would also push out
@@ -71,12 +100,22 @@ class MainnetOneRunManager:
         # currently active run counts as the first).
         self._loop_total: int = 0
         self._loop_completed: int = 0
+        self._loop_run_ids: list[str] = []
         # Cooldown tracker for loop chains: key = (side, strategy_label),
         # value = cooldown_until_ms.  After an SL exit, the same side +
         # strategy combination is blocked for the configured duration so
         # we do not chain into an identical losing setup.
         self._loop_cooldowns: dict[tuple[str, str], int] = {}
         self._loop_cooldown_minutes: int = self._settings.mainnet_loop_cooldown_minutes
+        # When a loop chain-arm is skipped because of an active cooldown, the
+        # pending arm is recorded here so run_cycle can resume it once the
+        # cooldown expires.  Without this, the loop would stall forever after a
+        # cooldown skip (the COMPLETED run is gone and nothing re-arms it).
+        self._loop_resume: dict | None = None
+        # Run ids that have already emitted an entry-trend-guard skip notice, so
+        # an armed run skipping a counter-trend signal every cycle does not spam
+        # Telegram/DB until either the trend flips or signal_timeout fires.
+        self._entry_guard_notified: set[str] = set()
 
     async def status(self) -> RunStatus:
             latest = await self._repo.get_latest_run()
@@ -176,6 +215,9 @@ class MainnetOneRunManager:
         if not is_chain:
             self._loop_total = int(loop_count)
             self._loop_completed = 0
+            self._loop_run_ids = [run_id]
+        else:
+            self._loop_run_ids.append(run_id)
         params = {
             "actor": actor,
             "symbol": self._settings.mainnet_symbol,
@@ -231,6 +273,7 @@ class MainnetOneRunManager:
         # Clear loop state on cancel
         self._loop_total = 0
         self._loop_completed = 0
+        self._loop_run_ids = []
         if was_in_loop:
             return (
                 f"🛑 已取消 run：<code>{escape(active['run_id'])}</code>。\n"
@@ -256,6 +299,7 @@ class MainnetOneRunManager:
         )
         self._loop_total = 0
         self._loop_completed = 0
+        self._loop_run_ids = []
         self._loop_cooldowns.clear()
         logger.info(
             "mainnet_one_run_loop_stopped",
@@ -275,6 +319,9 @@ class MainnetOneRunManager:
             return
         active = await self._repo.get_active_run()
         if not active:
+            # No active run: if a loop arm was deferred by a cooldown, resume
+            # it once the cooldown expires.
+            await self._maybe_resume_pending_loop()
             return
         try:
             status = active["status"]
@@ -293,10 +340,36 @@ class MainnetOneRunManager:
                 f"錯誤：<code>{escape(str(exc)[:500])}</code>"
             )
 
+    async def _is_rescue_enabled(self) -> bool:
+        """Return the catch-up/rescue toggle, defaulting to enabled.
+
+        Cached in memory after the first DB read; the Telegram /rescue command
+        updates both the DB and this cache via set_rescue_enabled().
+        """
+        if self._rescue_enabled is not None:
+            return self._rescue_enabled
+        enabled = True
+        if self._config_repo is not None:
+            try:
+                raw = await self._config_repo.get(RESCUE_CONFIG_KEY)
+                if raw is not None:
+                    enabled = raw == "1"
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("mainnet_rescue_toggle_read_failed", error=str(exc))
+        self._rescue_enabled = enabled
+        return enabled
+
+    async def set_rescue_enabled(self, enabled: bool) -> None:
+        """Persist the catch-up/rescue toggle and refresh the in-memory cache."""
+        self._rescue_enabled = enabled
+        if self._config_repo is not None:
+            await self._config_repo.set(RESCUE_CONFIG_KEY, "1" if enabled else "0")
+
     async def _run_armed(self, run: dict) -> None:
         if int(time.time() * 1000) - int(run["armed_at_ms"]) > self._settings.mainnet_one_run_signal_timeout_minutes * 60_000:
             await self._repo.complete_run(run["run_id"], "ENTRY_EXPIRED", "signal_timeout")
             await self._notify(f"⌛ Mainnet one-run 等待訊號逾時，已停止：<code>{escape(run['run_id'])}</code>")
+            await self._advance_loop_after_entry_failure(run, "signal_timeout")
             return
         candles = await self._load_candles(run["symbol"])
         decision = generate_wildcat_v2_adverse_guard_live_decision(
@@ -304,8 +377,37 @@ class MainnetOneRunManager:
             target_daily_usdc=self._settings.mainnet_equity_cap_usdc * 0.03,
             notional_usdc=self._settings.mainnet_effective_entry_notional_usdc,
             leverage=self._settings.mainnet_leverage,
+            rescue_enabled=await self._is_rescue_enabled(),
         )
         if decision is None:
+            return
+        allow_entry, entry_reason = evaluate_entry_trend_guard(candles, decision.side)
+        if not allow_entry:
+            # Counter-trend signal (falling-knife / spike-short). Skip this bar
+            # but stay ARMED — keep waiting for an aligned signal until
+            # signal_timeout, which then advances the loop (Bug 9 path). Notify
+            # only once per run to avoid per-cycle spam.
+            if run["run_id"] not in self._entry_guard_notified:
+                self._entry_guard_notified.add(run["run_id"])
+                await self._repo.log_event(
+                    run["run_id"],
+                    "entry_trend_skipped",
+                    {"side": decision.side, "strategy": decision.strategy, "reason": entry_reason},
+                )
+                await self._notify(
+                    "🛡️ <b>進場守門：跳過逆勢訊號</b>\n"
+                    f"Run：<code>{escape(run['run_id'])}</code>\n"
+                    f"方向：{escape(decision.side)}｜策略：{escape(decision.strategy)}\n"
+                    f"原因：{escape(entry_reason)}\n"
+                    "（續等順勢訊號，逾時則前進下一個 loop run）"
+                )
+            else:
+                logger.info(
+                    "entry_trend_guard_skip run=%s side=%s reason=%s",
+                    run["run_id"],
+                    decision.side,
+                    entry_reason,
+                )
             return
         await self._place_entry(run, decision)
 
@@ -353,6 +455,7 @@ class MainnetOneRunManager:
         if not still_open:
             await self._repo.complete_run(run["run_id"], "ENTRY_EXPIRED", "entry_not_open_no_position")
             await self._notify(f"⌛ Entry 掛單已不在 open orders 且沒有持倉，run 已停止：<code>{escape(run['run_id'])}</code>")
+            await self._advance_loop_after_entry_failure(run, "entry_not_open_no_position")
             return
         # Conservative entry requote: if the maker has been on the book
         # long enough, the mark has drifted beyond the configured
@@ -369,6 +472,7 @@ class MainnetOneRunManager:
                 await self._client.cancel_order(symbol, order_id)
             await self._repo.complete_run(run["run_id"], "ENTRY_EXPIRED", "entry_ttl_expired")
             await self._notify(f"⌛ Entry maker 掛單逾時未成交，已取消：<code>{escape(run['run_id'])}</code>")
+            await self._advance_loop_after_entry_failure(run, "entry_ttl_expired")
 
     async def _run_running(self, run: dict) -> None:
         symbol = run["symbol"]
@@ -377,8 +481,21 @@ class MainnetOneRunManager:
             await self._finish_flat_run(run, "flat_detected")
             return
         current_qty = abs(position.position_amt)
-        if abs(current_qty - float(run.get("qty") or 0.0)) > 1e-9:
-            # DCA filled - update SL maker to new average entry price
+        prev_qty = float(run.get("qty") or 0.0)
+        if current_qty > prev_qty + 1e-9:
+            # DCA filled (qty grew) — record the fill, then cancel old SL and
+            # re-arm at the new average entry price.
+            await self._repo.log_event(
+                run["run_id"],
+                "recovery_entry_filled",
+                {
+                    "qty": current_qty,
+                    "added_qty": current_qty - prev_qty,
+                    "prev_qty": prev_qty,
+                    "avg_price": position.entry_price,
+                    "notional_usdc": current_qty * position.entry_price,
+                },
+            )
             await self._cancel_stop_loss_order(symbol, run["run_id"])
             if self._settings.mainnet_sl_use_maker:
                 signal = json.loads(run.get("signal_json") or "{}")
@@ -401,6 +518,11 @@ class MainnetOneRunManager:
                         )
             await self._repo.update_run(run["run_id"], qty=current_qty)
             run["qty"] = current_qty
+        elif abs(current_qty - prev_qty) > 1e-9:
+            # Qty shrank (TP partial fills) — sync tracking only, do NOT touch SL
+            self._partial_exits.add(run["run_id"])
+            await self._repo.update_run(run["run_id"], qty=current_qty)
+            run["qty"] = current_qty
         if run["status"] == "CLOSING":
             logger.info(
                 "mainnet_one_run_waiting_close_fill",
@@ -420,9 +542,63 @@ class MainnetOneRunManager:
         hold_start_ms = await self._get_hold_start_ms(run)
         run_age_bars = max(0, int((int(time.time() * 1000) - hold_start_ms) / 60_000))
 
-        await self._refresh_partial_fill_state(run, position)
+        # Residual "dust" cleanup: after partial TP fills the remaining position
+        # may be tiny.  The ideal-price TP can then sit unfilled (price moved
+        # away) until a reverse move triggers the SL.  Instead, place a
+        # reduce-only POST-ONLY (maker, 0 USDC fee) order at the top of book so
+        # the dust fills quickly WITHOUT paying taker fees.  reduce-only orders
+        # are exempt from the min-notional rule, so even sub-20-USDC dust works.
+        # The exchange-side STOP_MARKET SL stays armed as a backstop.
+        residual_notional = qty * mark
+        if 0 < residual_notional < self._settings.mainnet_residual_cleanup_notional_usdc:
+            # Cancel any stale TP / dust orders so we can re-quote at the book.
+            open_orders = await self._client.get_open_orders(symbol)
+            for o in open_orders:
+                cid = str(o.get("clientOrderId") or "")
+                if cid.startswith(run["run_id"]):
+                    try:
+                        await self._client.cancel_order(symbol, int(o["orderId"]))
+                    except BinanceAPIException as exc:
+                        if exc.code not in {-2011, -2022}:
+                            raise
+            book = await self._client.get_book_ticker(symbol)
+            # POST-ONLY maker: SELL sits at best ask, BUY at best bid (queue
+            # head, never crosses the spread → always maker, never taker).
+            dust_price = (
+                float(book["askPrice"]) if close_side == "SELL" else float(book["bidPrice"])
+            )
+            qty_str = await self._client.format_quantity(symbol, qty)
+            try:
+                await self._client.create_reduce_only_limit_order(
+                    symbol,
+                    close_side,
+                    qty_str,
+                    dust_price,
+                    client_order_id=f"{run['run_id']}_dust",
+                    post_only=True,
+                )
+                logger.info(
+                    "mainnet_residual_dust_maker_placed",
+                    run_id=run["run_id"],
+                    qty=qty,
+                    price=dust_price,
+                    notional=residual_notional,
+                )
+            except BinanceAPIException as exc:
+                if exc.code == -2022:
+                    logger.info("mainnet_residual_dust_position_gone", run_id=run["run_id"])
+                elif exc.code == -5022:
+                    # Book moved; will re-quote next cycle.
+                    logger.info("mainnet_residual_dust_postonly_rejected_retry_next", run_id=run["run_id"])
+                else:
+                    raise
+            return
+
+        await self._refresh_partial_fill_state(run, position, prev_qty=prev_qty)
         await self._sync_take_profit_orders(run, position, signal)
         if await self._maybe_recovery(run, signal, position):
+            return
+        if await self._maybe_trailing_exit(run, signal, position, side, mark, entry, qty, close_side):
             return
         if self._hit_stop(side, mark, sl_price):
             await self._close_position(symbol, close_side, qty, "SL", run)
@@ -481,6 +657,7 @@ class MainnetOneRunManager:
                 f"原因：滑價超出容忍範圍\n"
                 f"詳情：<code>{escape(str(exc)[:400])}</code>"
             )
+            await self._advance_loop_after_entry_failure(run, "slippage_exceeded")
             return
         final_price = float(order.get("price", 0) or decision.signal.price)
         payload = {
@@ -674,8 +851,12 @@ class MainnetOneRunManager:
                 f"exceeds tolerance {slippage_bps} bps"
             )
 
-        # No GTC fallback — re-raise last BinanceAPIException
-        raise last_exc  # type: ignore[misc]
+        # No GTC fallback — all GTX retries exhausted; surface as a typed
+        # exception so _place_entry handles it as ENTRY_REJECTED instead of
+        # letting the raw BinanceAPIException propagate to run_cycle as FAILED.
+        raise GTXSlippageExceeded(
+            f"GTX entry retries exhausted ({max_attempts} attempts, fallback disabled)"
+        ) from last_exc
 
     async def _maybe_requote_entry(
         self,
@@ -882,27 +1063,48 @@ class MainnetOneRunManager:
         )
         return True
 
-    async def _refresh_partial_fill_state(self, run: dict, position: PositionInfo) -> None:
+    async def _refresh_partial_fill_state(
+        self, run: dict, position: PositionInfo, prev_qty: float = 0.0
+    ) -> None:
         run_id = run["run_id"]
-        if run_id in self._partial_taken or run_id not in self._partial_order_armed:
+        check_tp1 = run_id not in self._partial_taken and run_id in self._partial_order_armed
+        check_mid = run_id in self._mid_order_armed
+        if not check_tp1 and not check_mid:
             return
         current_qty = abs(position.position_amt)
-        initial_qty = float(run.get("qty") or 0.0)
-        open_orders = await self._client.get_open_orders(position.symbol)
-        partial_open = any(
-            str(order.get("clientOrderId") or "") == f"{run_id}{PARTIAL_TP_SUFFIX}"
-            for order in open_orders
-        )
-        if partial_open or abs(current_qty - initial_qty) < 1e-9:
+        # Use the pre-update qty so detection works in the same cycle the fill lands.
+        # run["qty"] is already updated to current_qty by the time we get here.
+        ref_qty = prev_qty if prev_qty > 0 else float(run.get("qty") or 0.0)
+        if abs(current_qty - ref_qty) < 1e-9:
             return
-        qty_closed = max(0.0, initial_qty - current_qty)
-        qty_text = await self._client.format_quantity(position.symbol, qty_closed) if qty_closed > 0 else "unknown"
-        self._partial_taken.add(run_id)
-        self._partial_order_armed.discard(run_id)
-        await self._repo.log_event(run_id, "partial_exit", {"qty": qty_text, "position_qty": current_qty})
-        await self._notify(
-            f"✅ Mainnet one-run 已部分獲利了結：<code>{escape(run_id)}</code> qty=<code>{escape(str(qty_text))}</code>"
-        )
+        open_orders = await self._client.get_open_orders(position.symbol)
+        if check_tp1:
+            partial_open = any(
+                str(order.get("clientOrderId") or "") == f"{run_id}{PARTIAL_TP_SUFFIX}"
+                for order in open_orders
+            )
+            if not partial_open:
+                qty_closed = max(0.0, ref_qty - current_qty)
+                qty_text = await self._client.format_quantity(position.symbol, qty_closed) if qty_closed > 0 else "unknown"
+                self._partial_taken.add(run_id)
+                self._partial_order_armed.discard(run_id)
+                await self._repo.log_event(run_id, "partial_exit", {"qty": qty_text, "position_qty": current_qty})
+                await self._notify(
+                    f"✅ Mainnet one-run 已部分獲利了結：<code>{escape(run_id)}</code> qty=<code>{escape(str(qty_text))}</code>"
+                )
+        if check_mid:
+            mid_open = any(
+                str(order.get("clientOrderId") or "") == f"{run_id}{MID_TP_SUFFIX}"
+                for order in open_orders
+            )
+            if not mid_open:
+                qty_closed = max(0.0, ref_qty - current_qty)
+                qty_text = await self._client.format_quantity(position.symbol, qty_closed) if qty_closed > 0 else "unknown"
+                self._mid_order_armed.discard(run_id)
+                await self._repo.log_event(run_id, "mid_exit", {"qty": qty_text, "position_qty": current_qty})
+                await self._notify(
+                    f"✅ Mainnet one-run TP2 +{self._settings.mainnet_mid_tp_pct*100:.2f}% 已出場：<code>{escape(run_id)}</code> qty=<code>{escape(str(qty_text))}</code>"
+                )
 
     async def _sync_take_profit_orders(self, run: dict, position: PositionInfo, signal: dict) -> None:
         run_id = run["run_id"]
@@ -947,6 +1149,16 @@ class MainnetOneRunManager:
                     post_only=True,
                 )
             except BinanceAPIException as exc:
+                if exc.code == -2022:
+                    # Position is gone (race with exchange-side SL/TP fill).
+                    # Stop placing TP orders; next cycle will detect flat.
+                    logger.info(
+                        "tp_order_reduce_only_rejected_position_gone",
+                        run_id=run_id,
+                        client_order_id=client_order_id,
+                        code=exc.code,
+                    )
+                    return
                 if exc.code == -5022 and self._settings.mainnet_tp_fallback_to_gtc:
                     # Market past TP — fill immediately as taker to ensure exit
                     logger.warning(
@@ -956,18 +1168,31 @@ class MainnetOneRunManager:
                         price=price,
                         side=close_side,
                     )
-                    await self._client.create_reduce_only_limit_order(
-                        position.symbol,
-                        close_side,
-                        qty,
-                        price,
-                        client_order_id=client_order_id,
-                        post_only=False,
-                    )
+                    try:
+                        await self._client.create_reduce_only_limit_order(
+                            position.symbol,
+                            close_side,
+                            qty,
+                            price,
+                            client_order_id=client_order_id,
+                            post_only=False,
+                        )
+                    except BinanceAPIException as gtc_exc:
+                        if gtc_exc.code == -2022:
+                            logger.info(
+                                "tp_order_gtc_fallback_reduce_only_rejected",
+                                run_id=run_id,
+                                client_order_id=client_order_id,
+                                code=gtc_exc.code,
+                            )
+                            return
+                        raise
                 else:
                     raise
         if any(client_order_id.endswith(PARTIAL_TP_SUFFIX) for client_order_id, _, _ in desired):
             self._partial_order_armed.add(run_id)
+        if any(client_order_id.endswith(MID_TP_SUFFIX) for client_order_id, _, _ in desired):
+            self._mid_order_armed.add(run_id)
         await self._repo.log_event(
             run_id,
             "take_profit_synced",
@@ -991,7 +1216,26 @@ class MainnetOneRunManager:
         if current_qty <= 0:
             return []
         full_tp_price = float(signal.get("take_profit") or 0.0)
+        # After DCA the avg entry shifts; recalculate final TP from new avg entry
+        # using the same tp_pct as the original signal, so TP3 stays proportional
+        # to cost basis (not locked to an absolute price from the pre-DCA entry).
+        # Same pattern as SL recalculation after DCA (uses signal.wildcat.sl_pct).
+        original_entry = float(run.get("entry_price") or 0.0)
+        current_avg = position.entry_price
+        tp_pct = float(signal.get("wildcat", {}).get("tp_pct") or 0.0)
+        if (
+            tp_pct > 0
+            and original_entry > 0
+            and current_avg > 0
+            and full_tp_price > 0
+            and abs(current_avg - original_entry) > 0.01
+        ):
+            if position.position_direction == "LONG":
+                full_tp_price = current_avg * (1 + tp_pct)
+            elif position.position_direction == "SHORT":
+                full_tp_price = current_avg * (1 - tp_pct)
         partial_price = self._partial_take_profit_price(position)
+        mid_price = self._mid_take_profit_price(position)
         orders: list[tuple[str, str, float]] = []
         remaining_qty = current_qty
         if (
@@ -1004,6 +1248,12 @@ class MainnetOneRunManager:
             if float(partial_qty) > 0:
                 orders.append((f"{run_id}{PARTIAL_TP_SUFFIX}", partial_qty, partial_price))
                 remaining_qty = max(0.0, current_qty - float(partial_qty))
+        if mid_price > 0 and self._settings.mainnet_mid_exit_pct > 0 and remaining_qty > 0:
+            mid_qty_raw = remaining_qty * self._settings.mainnet_mid_exit_pct
+            mid_qty = await self._client.format_quantity(position.symbol, mid_qty_raw)
+            if float(mid_qty) > 0:
+                orders.append((f"{run_id}{MID_TP_SUFFIX}", mid_qty, mid_price))
+                remaining_qty = max(0.0, remaining_qty - float(mid_qty))
         if full_tp_price > 0 and remaining_qty > 0:
             final_qty = await self._client.format_quantity(position.symbol, remaining_qty)
             if float(final_qty) > 0:
@@ -1017,52 +1267,55 @@ class MainnetOneRunManager:
             return position.entry_price * (1 - self._settings.mainnet_partial_tp_pct)
         return 0.0
 
+    def _mid_take_profit_price(self, position: PositionInfo) -> float:
+        mid_pct = self._settings.mainnet_mid_tp_pct
+        if mid_pct <= 0:
+            return 0.0
+        if position.position_direction == "LONG":
+            return position.entry_price * (1 + mid_pct)
+        if position.position_direction == "SHORT":
+            return position.entry_price * (1 - mid_pct)
+        return 0.0
+
     def _take_profit_orders_match(
         self,
         existing_orders: list[dict],
         desired_orders: list[tuple[str, str, float]],
         current_qty: float,
     ) -> bool:
-        """Check if existing TP orders sufficiently cover the current position.
+        """Check if existing TP orders match the desired set (price+qty per level).
 
-        Returns True if:
-          - Total existing TP qty >= current_qty (full coverage)
-          - All existing order prices are present in desired_orders
-          - All desired prices that have qty > 0 are represented in existing_orders
-            or have qty == 0 in desired (soft match for post-partial scenarios)
+        Compares each desired order against existing orders by price within a
+        tolerance.  If every desired level either (a) has a matching existing
+        order with the same qty, or (b) has qty==0 (already filled), the set
+        matches and no cancel/rebuild is needed.
         """
-        if not existing_orders:
-            return False
+        if not desired_orders:
+            return len(existing_orders) == 0
 
-        # Total existing qty must cover current position
-        existing_total_qty = sum(float(o.get("origQty", 0) or 0) for o in existing_orders)
-        if existing_total_qty + 1e-9 < current_qty:
-            return False
+        existing_by_price: dict[float, float] = {}
+        for o in existing_orders:
+            p = float(o.get("price", 0) or 0)
+            q = float(o.get("origQty", 0) or 0)
+            existing_by_price[p] = existing_by_price.get(p, 0.0) + q
 
-        # Build set of desired prices (with qty > 0) for validation
-        desired_prices = {price for _, qty, price in desired_orders if float(qty) > 1e-9}
-
-        # All existing orders must have valid prices (subset of desired)
-        existing_prices = {float(o.get("price", 0) or 0) for o in existing_orders}
-        if not existing_prices.issubset(desired_prices):
-            return False
-
-        # All desired prices (with qty > 0) must be represented in existing orders
-        # UNLESS the existing total qty already covers them — this handles
-        # the post-partial case where an existing final TP covers the
-        # partial qty that was already filled.
-        for _, _, price in desired_orders:
-            if price in existing_prices:
+        for _, desired_qty_str, desired_price in desired_orders:
+            desired_qty = float(desired_qty_str)
+            if desired_qty < 1e-9:
                 continue
-            # This desired price is not on book. If existing orders already
-            # provide enough total qty to cover the position, we can skip
-            # placing it (the position is already protected). Otherwise,
-            # we need to place it.
-            # In practice, if we reach here, it means we are missing a TP
-            # level that should exist — but since total coverage is met,
-            # we consider it a match to avoid unnecessary cancel/replace.
-            # The only time this returns False is when total existing qty
-            # < current_qty (handled above).
+            matched = False
+            for ep, eq in existing_by_price.items():
+                if abs(ep - desired_price) < 0.005 and abs(eq - desired_qty) < 1e-9:
+                    matched = True
+                    break
+            if not matched:
+                return False
+
+        for o in existing_orders:
+            p = float(o.get("price", 0) or 0)
+            desired_prices = {dp for _, _, dp in desired_orders if abs(dp - p) < 0.005}
+            if not desired_prices:
+                return False
 
         return True
 
@@ -1072,6 +1325,24 @@ class MainnetOneRunManager:
         count = self._recovery_counts.get(run["run_id"], 0)
         if count >= self._settings.mainnet_recovery_steps:
             return False
+        # Block DCA after TP1 partial fill: never average into a runner that
+        # already booked partial profit.
+        if run["run_id"] in self._partial_exits:
+            logger.info("dca_blocked_partial_exit", run_id=run["run_id"])
+            return False
+        # Block DCA within cooldown after a guard block to prevent regime-flicker
+        # from briefly re-classifying the market as range and bypassing the guard.
+        cooldown_ms = self._settings.mainnet_dca_guard_cooldown_seconds * 1000
+        last_block_ms = self._dca_block_times.get(run["run_id"], 0)
+        if cooldown_ms > 0 and last_block_ms > 0:
+            now_ms = int(time.time() * 1000)
+            if now_ms - last_block_ms < cooldown_ms:
+                logger.info(
+                    "dca_blocked_guard_cooldown",
+                    run_id=run["run_id"],
+                    remaining_ms=cooldown_ms - (now_ms - last_block_ms),
+                )
+                return False
         entry_notional = self._settings.mainnet_effective_entry_notional_usdc
         cumulative = float(run.get("cumulative_notional_usdc") or entry_notional)
         if cumulative + entry_notional > self._settings.mainnet_effective_max_cumulative_notional_usdc:
@@ -1084,6 +1355,24 @@ class MainnetOneRunManager:
             hit = position.mark_price >= position.entry_price * (1 + trigger_pct)
             side = "SELL"
         if not hit:
+            return False
+        # DCA risk gate: averaging down doubles the position (and the loss if SL
+        # then triggers).  Block DCA when the adverse move looks like a trend or
+        # the momentum has reversed against us, instead of a range pullback.
+        candles = await self._load_candles(position.symbol)
+        allow_dca, guard_reason = evaluate_dca_guard(candles, position.position_direction)
+        if not allow_dca:
+            self._dca_block_times[run["run_id"]] = int(time.time() * 1000)
+            logger.info(
+                "dca_blocked_by_guard",
+                run_id=run["run_id"],
+                dca_number=count + 1,
+                side=position.position_direction,
+                reason=guard_reason,
+            )
+            await self._notify(
+                f"🛡️ DCA #{count + 1} 已跳過（風險守門）：<code>{escape(guard_reason)}</code>"
+            )
             return False
         open_orders = await self._client.get_open_orders(position.symbol)
         if any(str(row.get("clientOrderId") or "").startswith(f"{run['run_id']}_dca") for row in open_orders):
@@ -1121,48 +1410,236 @@ class MainnetOneRunManager:
         await self._notify(f"🧩 Mainnet one-run 已掛 DCA maker 單 #{count + 1}：<code>{escape(run['run_id'])}</code>")
         return True
 
+    async def _maybe_trailing_exit(
+        self,
+        run: dict,
+        signal: dict,
+        position: PositionInfo,
+        side: str,
+        mark: float,
+        entry: float,
+        qty: float,
+        close_side: str,
+    ) -> bool:
+        """Lock a runner's gain when it spikes toward TP2 then reverses.
+
+        Mirrors the backtest wildcat_v3_trail_c logic: track the peak favorable
+        mark since entry; once the peak reaches arm_frac * tp_pct of the move,
+        arm a trailing stop that market-closes the remaining position if mark
+        retraces giveback_frac of the peak run.  The exchange-side TP2 fills on
+        its own if price reaches it first, so this only fires on the sub-TP
+        retracement path.  Returns True if a lock-exit was submitted.
+        """
+        if not self._settings.mainnet_trail_enabled:
+            return False
+        tp_pct = float(signal.get("wildcat", {}).get("tp_pct") or 0.0)
+        if tp_pct <= 0 or entry <= 0 or mark <= 0 or side not in {"LONG", "SHORT"}:
+            return False
+        run_id = run["run_id"]
+        peak = self._trail_peak.get(run_id)
+        arm_mfe = tp_pct * self._settings.mainnet_trail_arm_frac
+        keep = 1.0 - self._settings.mainnet_trail_giveback_frac
+
+        if side == "LONG":
+            # Check the lock against the peak from prior cycles BEFORE updating
+            # it with the current mark (no same-tick lookahead).
+            if run_id in self._trail_armed and peak is not None:
+                trail_stop = entry + (peak - entry) * keep
+                if mark <= trail_stop:
+                    await self._close_position(position.symbol, close_side, qty, "TRAIL", run)
+                    return True
+            new_peak = mark if peak is None else max(peak, mark)
+            self._trail_peak[run_id] = new_peak
+            if run_id not in self._trail_armed and (new_peak - entry) / entry >= arm_mfe:
+                self._trail_armed.add(run_id)
+        else:
+            if run_id in self._trail_armed and peak is not None:
+                trail_stop = entry - (entry - peak) * keep
+                if mark >= trail_stop:
+                    await self._close_position(position.symbol, close_side, qty, "TRAIL", run)
+                    return True
+            new_peak = mark if peak is None else min(peak, mark)
+            self._trail_peak[run_id] = new_peak
+            if run_id not in self._trail_armed and (entry - new_peak) / entry >= arm_mfe:
+                self._trail_armed.add(run_id)
+        return False
+
     def _hit_stop(self, side: str, mark: float, sl_price: float) -> bool:
         hit_sl = mark <= sl_price if side == "LONG" else mark >= sl_price
         return sl_price > 0 and hit_sl
 
     async def _close_position(self, symbol: str, side: str, qty: float, reason: str, run: dict) -> None:
-        """Close position.  For SL reason, try reduce-only GTX maker at
-        stop_loss first (if enabled), with TTL fallback to market.
-        Other reasons (ADVERSE_EXIT, MAX_HOLD_*) go straight to market.
+        """Cancel all open SL/TP orders then market-close the position.
+        The STOP_MARKET order armed at entry handles normal SL execution on
+        the exchange side; this path is the software backup (ADVERSE_EXIT,
+        MAX_HOLD, or _hit_stop fallback).
         """
         run_id = run["run_id"]
-        # Cancel all open orders (TP + SL) for this run
         await self._cancel_take_profit_orders(symbol, run_id)
         await self._cancel_stop_loss_order(symbol, run_id)
         qty_str = await self._client.format_quantity(symbol, qty)
 
-        if reason == "SL" and self._settings.mainnet_sl_use_maker:
-            # Try maker SL at stop_loss price.
-            signal = json.loads(run.get("signal_json") or "{}")
-            sl_price = float(signal.get("stop_loss") or 0.0)
-            if sl_price > 0:
-                await self._place_stop_loss_maker(
-                    symbol=symbol,
-                    side=side,
-                    qty_str=qty_str,
-                    sl_price=sl_price,
-                    run_id=run_id,
-                    reason=reason,
-                    run=run,
-                )
+        # TRAIL profit-lock: the runner is in profit and not racing a stop, so
+        # try a reduce-only POST_ONLY (maker, 0 fee) exit first to save the
+        # taker fee.  If it does not fill within the TTL we fall through to the
+        # market close below.  SL/ADVERSE/MAX_HOLD always skip this and use the
+        # guaranteed market close.
+        if reason == "TRAIL" and self._settings.mainnet_trail_exit_use_maker:
+            if await self._try_trail_maker_exit(symbol, side, qty_str, run):
                 return
 
-        # Non-SL or maker disabled / sl_price unavailable → market order
-        order = await self._client.create_market_order(
-            symbol,
-            side,
-            qty_str,
-            reduce_only=True,
-            client_order_id=f"{run_id}_close",
-        )
+        # Always market-close; STOP_MARKET on the exchange is already cancelled above.
+        try:
+            order = await self._client.create_market_order(
+                symbol,
+                side,
+                qty_str,
+                reduce_only=True,
+                client_order_id=f"{run_id}_close",
+            )
+        except BinanceAPIException as exc:
+            if exc.code == -2022:
+                # Position already closed by exchange-side SL before software
+                # could act. Let the next cycle's 'not position' path handle it.
+                logger.info(
+                    "market_close_reduce_only_rejected_position_gone",
+                    run_id=run_id,
+                    reason=reason,
+                    code=exc.code,
+                )
+                return
+            raise
         await self._repo.log_event(run_id, "close_submitted", {"reason": reason, "order": order})
         await self._repo.update_run(run_id, status="CLOSING", exit_reason=reason)
         await self._notify(f"🏁 Mainnet one-run 已送出平倉：<code>{escape(run_id)}</code> reason=<b>{escape(reason)}</b>")
+
+    async def _try_trail_maker_exit(self, symbol: str, side: str, qty_str: str, run: dict) -> bool:
+        """Lock a TRAIL exit at maker fee, falling back to market on timeout.
+
+        Places a reduce-only POST_ONLY limit at the passive top-of-book and,
+        for up to mainnet_trail_exit_maker_ttl_seconds, re-prices it every
+        mainnet_trail_exit_reprice_seconds to chase the book so a moving market
+        does not strand the order at a stale price (Run 61139 ate a taker fee
+        because the single static quote never re-anchored after the bid moved).
+        Returns True if the position went flat (maker filled — 0 fee).  On
+        timeout or placement rejection, cancels the resting order and returns
+        False so the caller market-closes whatever remains (reduce_only caps
+        the qty, so a partial maker fill is handled safely).
+        """
+        run_id = run["run_id"]
+        client_order_id = f"{run_id}_trail"
+
+        async def _anchor() -> float:
+            # A SELL exit rests at/above the best bid, a BUY exit at/below the
+            # best ask — always on the passive side of the book.
+            book = await self._client.get_book_ticker(symbol)
+            return float(book["bidPrice"]) if side == "SELL" else float(book["askPrice"])
+
+        async def _place(price: float) -> dict | None:
+            try:
+                return await self._place_post_only_with_retry(
+                    symbol=symbol,
+                    side=side,
+                    quantity=qty_str,
+                    signal_price=price,
+                    client_order_id=client_order_id,
+                    slippage_bps=self._settings.mainnet_tp_slippage_bps,
+                    fallback_to_gtc=False,
+                    reduce_only=True,
+                )
+            except (GTXSlippageExceeded, BinanceAPIException) as exc:
+                logger.warning(
+                    "trail_maker_place_failed_fallback_market",
+                    run_id=run_id,
+                    side=side,
+                    error=str(exc)[:200],
+                )
+                await self._repo.log_event(
+                    run_id, "trail_maker_place_failed", {"error": str(exc)[:300]}
+                )
+                return None
+
+        async def _cancel_resting() -> None:
+            try:
+                open_orders = await self._client.get_open_orders(symbol)
+                for o in open_orders:
+                    if str(o.get("clientOrderId") or "") == client_order_id:
+                        await self._client.cancel_order(symbol, int(o["orderId"]))
+            except BinanceAPIException as exc:
+                logger.warning("trail_maker_cancel_failed", run_id=run_id, error=str(exc)[:200])
+
+        async def _flat() -> bool:
+            position = await self._client.get_position(symbol)
+            return position is None or abs(position.position_amt) < 1e-9
+
+        anchor = await _anchor()
+        order = await _place(anchor)
+        if order is None:
+            return False
+        logger.info(
+            "trail_maker_order_placed",
+            run_id=run_id,
+            side=side,
+            qty=qty_str,
+            price=anchor,
+            order_id=order.get("orderId"),
+        )
+        await self._repo.log_event(run_id, "trail_maker_placed", {"order": order, "anchor": anchor})
+        await self._notify(
+            f"🪝 TRAIL 鎖利改掛 maker（0 手續費）：<code>{escape(run_id)}</code> @ <b>${anchor:.4f}</b>"
+        )
+
+        ttl = max(0, int(self._settings.mainnet_trail_exit_maker_ttl_seconds))
+        reprice_every = max(1, int(self._settings.mainnet_trail_exit_reprice_seconds))
+        # One tick of tolerance so we only re-place when the book has genuinely
+        # walked away from our resting quote, not on every micro-jitter.
+        try:
+            tick = float(await self._client.price_tick_size(symbol))
+        except (BinanceAPIException, ValueError, TypeError):
+            tick = 0.0
+        reprice_threshold = tick if tick > 0 else 0.0
+        deadline = time.monotonic() + ttl
+        last_reprice = time.monotonic()
+        while time.monotonic() < deadline:
+            await asyncio.sleep(1.0)
+            if await _flat():
+                logger.info("trail_maker_filled", run_id=run_id)
+                await self._repo.log_event(run_id, "trail_maker_filled", {})
+                await self._repo.update_run(run_id, status="CLOSING", exit_reason="TRAIL")
+                await self._notify(
+                    f"🎯 TRAIL maker 鎖利已成交（省 taker 費）：<code>{escape(run_id)}</code>"
+                )
+                return True
+            # Chase the book: if it has moved past our resting quote by more than
+            # a tick, cancel and re-place at the fresh passive anchor.
+            if time.monotonic() - last_reprice >= reprice_every:
+                last_reprice = time.monotonic()
+                new_anchor = await _anchor()
+                if abs(new_anchor - anchor) > reprice_threshold:
+                    await _cancel_resting()
+                    if await _flat():
+                        # Filled in the gap between cancel and re-check.
+                        logger.info("trail_maker_filled", run_id=run_id)
+                        await self._repo.log_event(run_id, "trail_maker_filled", {})
+                        await self._repo.update_run(run_id, status="CLOSING", exit_reason="TRAIL")
+                        await self._notify(
+                            f"🎯 TRAIL maker 鎖利已成交（省 taker 費）：<code>{escape(run_id)}</code>"
+                        )
+                        return True
+                    reorder = await _place(new_anchor)
+                    if reorder is None:
+                        # Re-placement rejected — bail to the market fallback.
+                        return False
+                    anchor = new_anchor
+                    await self._repo.log_event(
+                        run_id, "trail_maker_repriced", {"anchor": new_anchor}
+                    )
+        # TTL elapsed without a full fill — cancel the resting maker order and
+        # let the caller market-close the remainder (reduce_only caps the qty).
+        logger.info("trail_maker_timeout_fallback_market", run_id=run_id, ttl_seconds=ttl)
+        await self._repo.log_event(run_id, "trail_maker_timeout", {"ttl_seconds": ttl})
+        await _cancel_resting()
+        return False
 
     async def _place_stop_loss_maker(
         self,
@@ -1174,82 +1651,56 @@ class MainnetOneRunManager:
         reason: str,
         run: dict,
     ) -> None:
-        """Place a reduce-only GTX limit order at stop_loss price.
-        Wait up to mainnet_sl_maker_ttl_seconds for fill.
-        If not filled, cancel and fall back to market order.
+        """Arm a STOP_MARKET order at sl_price on the exchange.
+        The order sits passively until mark price touches sl_price, then the
+        exchange auto-executes a market close — no GTX / -5022 rejection risk.
+        Falls back to immediate market order only if placement itself fails.
         """
-        ttl_seconds = self._settings.mainnet_sl_maker_ttl_seconds
         client_order_id = f"{run_id}_sl"
-        s = self._settings
-
+        cap_pct = float(getattr(self._settings, "mainnet_sl_limit_cap_pct", 0.0) or 0.0)
         try:
-            order = await self._client.create_reduce_only_limit_order(
-                symbol=symbol,
-                side=side,
-                quantity=qty_str,
-                price=sl_price,
-                client_order_id=client_order_id,
-                post_only=True,  # GTX
-            )
-        except BinanceAPIException as exc:
-            if exc.code == -5022 and s.mainnet_tp_fallback_to_gtc:
-                # SL rejected as post-only — fallback to market immediately.
-                logger.warning("sl_maker_rejected_fallback_market", run_id=run_id, error=str(exc)[:200])
+            if cap_pct > 0:
+                # Stop-limit: trigger at sl_price, cap the fill cap_pct worse.
+                # SELL (close LONG) fills lower, so the limit floor is below the
+                # trigger; BUY (close SHORT) fills higher, so the ceiling is
+                # above. The adverse-exit / max-hold market close is the backstop
+                # if an extreme gap leaves the limit unfilled.
+                if side.upper() == "SELL":
+                    limit_price = sl_price * (1 - cap_pct)
+                else:
+                    limit_price = sl_price * (1 + cap_pct)
+                order = await self._client.create_stop_limit_sl_order(
+                    symbol=symbol,
+                    side=side,
+                    stop_price=sl_price,
+                    limit_price=limit_price,
+                    quantity=qty_str,
+                    client_order_id=client_order_id,
+                )
             else:
-                raise
-
-            # Fall through to market order
-            order = await self._client.create_market_order(
+                order = await self._client.create_stop_market_sl_order(
+                    symbol=symbol,
+                    side=side,
+                    stop_price=sl_price,
+                    quantity=qty_str,
+                    client_order_id=client_order_id,
+                )
+        except BinanceAPIException as exc:
+            logger.warning("sl_stop_market_place_failed_fallback_market", run_id=run_id, error=str(exc)[:200])
+            fallback = await self._client.create_market_order(
                 symbol, side, qty_str, reduce_only=True, client_order_id=f"{run_id}_close"
             )
-            await self._repo.log_event(run_id, "close_submitted", {"reason": reason, "order": order})
+            await self._repo.log_event(run_id, "close_submitted", {"reason": reason, "order": fallback})
             await self._repo.update_run(run_id, status="CLOSING", exit_reason=reason)
-            await self._notify(f"🏁 Mainnet one-run 已送出平倉（SL maker 被拒，市價）：<code>{escape(run_id)}</code> reason=<b>{escape(reason)}</b>")
+            await self._notify(f"🏁 Mainnet one-run 已送出平倉（SL 掛單失敗，市價）：<code>{escape(run_id)}</code> reason=<b>{escape(reason)}</b>")
             return
 
-        # Log the maker SL order
-        await self._repo.log_event(
-            run_id, "sl_maker_placed", {"order": order, "sl_price": sl_price, "ttl_seconds": ttl_seconds}
-        )
+        await self._repo.log_event(run_id, "sl_stop_market_placed", {"order": order, "sl_price": sl_price})
         await self._notify(
-            f"🛑 <b>Stop-Loss Maker 已掛單</b>\n"
+            f"🛑 <b>Stop-Loss STOP_MARKET 已掛</b>\n"
             f"Run：<code>{escape(run_id)}</code>\n"
-            f"價格：<b>${sl_price:.4f}</b> | Qty：<code>{qty_str}</code>\n"
-            f"等待 <b>{ttl_seconds}s</b> 若未成交將送市價單"
-        )
-
-        # Wait for TTL, polling open orders
-        deadline = time.time() + ttl_seconds
-        while time.time() < deadline:
-            await asyncio.sleep(1)
-            open_orders = await self._client.get_open_orders(symbol)
-            still_open = any(int(row.get("orderId", 0)) == int(order.get("orderId", 0) or 0) for row in open_orders)
-            position = await self._client.get_position(symbol)
-            if not still_open or (position and abs(position.position_amt) < abs(float(run.get("qty") or 0)) * 0.1):
-                # Filled or position mostly closed
-                await self._repo.log_event(run_id, "sl_maker_filled", {"order": order})
-                await self._notify(f"✅ <b>Stop-Loss Maker 成交</b>\nRun：<code>{escape(run_id)}</code>")
-                await self._repo.update_run(run_id, status="CLOSING", exit_reason=reason)
-                return
-
-        # TTL expired — cancel and fallback to market
-        try:
-            order_id = int(order.get("orderId", 0) or 0)
-            if order_id:
-                await self._client.cancel_order(symbol, order_id)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("sl_maker_cancel_failed", run_id=run_id, error=str(exc)[:200])
-
-        # Fallback to market
-        market_order = await self._client.create_market_order(
-            symbol, side, qty_str, reduce_only=True, client_order_id=f"{run_id}_close"
-        )
-        await self._repo.log_event(run_id, "close_submitted", {"reason": reason, "order": market_order})
-        await self._repo.log_event(run_id, "sl_maker_fallback_market", {"maker_order_id": order.get("orderId")})
-        await self._repo.update_run(run_id, status="CLOSING", exit_reason=reason)
-        await self._notify(
-            f"⚡ <b>Stop-Loss TTL 過期，已送市價單</b>\n"
-            f"Run：<code>{escape(run_id)}</code> reason=<b>{escape(reason)}</b>"
+            f"觸發價：<b>${sl_price:.4f}</b> | Qty：<code>{qty_str}</code>\n"
+            f"當 mark 觸 <b>${sl_price:.4f}</b> 交易所自動平倉"
         )
 
     async def _cancel_take_profit_orders(self, symbol: str, run_id: str) -> None:
@@ -1260,14 +1711,93 @@ class MainnetOneRunManager:
                 await self._client.cancel_order(symbol, int(order["orderId"]))
 
     async def _cancel_stop_loss_order(self, symbol: str, run_id: str) -> None:
-        open_orders = await self._client.get_open_orders(symbol)
+        """Cancel the STOP_MARKET stop-loss order.
+
+        IMPORTANT: the python-binance SDK routes STOP_MARKET (and other
+        conditional types) to the *algoOrder* endpoint.  Such orders:
+          - live in openAlgoOrders, NOT openOrders
+          - get a random clientAlgoId (our newClientOrderId is discarded)
+          - must be cancelled via cancel_algo_order, NOT cancel_order
+        one-run holds a single position, so we cancel every reduce-only
+        conditional order on the symbol (our SL).
+        """
+        try:
+            algo_orders = await self._client.get_open_algo_orders(symbol)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("cancel_sl_algo_get_failed", run_id=run_id, error=str(exc)[:200])
+            return
+        if not algo_orders:
+            logger.info("cancel_sl_algo_none_open", run_id=run_id)
+            return
+        for o in algo_orders:
+            if not o.get("reduceOnly", True):
+                continue
+            algo_id = o.get("algoId")
+            client_algo_id = o.get("clientAlgoId")
+            try:
+                await self._client.cancel_algo_order(symbol, algo_id=algo_id, client_algo_id=client_algo_id)
+                logger.info("cancel_sl_algo_ok", run_id=run_id, algo_id=algo_id, client_algo_id=client_algo_id)
+            except BinanceAPIException as exc:
+                logger.warning("cancel_sl_algo_failed", run_id=run_id, algo_id=algo_id, code=exc.code, error=str(exc)[:200])
+
+    async def _cancel_all_run_orders(self, symbol: str, run_id: str) -> None:
+        """Cancel every residual order for this run.
+
+        Two distinct surfaces must be swept:
+          1. Regular open orders (TP limit orders) — get_open_orders +
+             cancel_order, matched by clientOrderId prefix.
+          2. Conditional/algo orders (STOP_MARKET SL) — these live in the
+             separate openAlgoOrders endpoint and are handled by
+             _cancel_stop_loss_order (cancel_algo_order).
+        """
+        try:
+            open_orders = await self._client.get_open_orders(symbol)
+        except Exception as exc:
+            logger.warning("cancel_all_run_orders_get_failed", run_id=run_id, error=str(exc)[:200])
+            open_orders = []
         for order in open_orders:
-            if str(order.get("clientOrderId") or "") == f"{run_id}_sl":
-                await self._client.cancel_order(symbol, int(order["orderId"]))
+            cid = str(order.get("clientOrderId") or "")
+            if cid.startswith(run_id):
+                oid = int(order["orderId"])
+                try:
+                    await self._client.cancel_order(symbol, oid)
+                    logger.info("cancel_all_run_orders_ok", run_id=run_id, client_order_id=cid, order_id=oid)
+                except BinanceAPIException as exc:
+                    logger.warning("cancel_all_run_orders_failed", run_id=run_id, client_order_id=cid, order_id=oid, code=exc.code)
+        # Also sweep the STOP_MARKET SL, which is an algo order on a separate endpoint.
+        await self._cancel_stop_loss_order(symbol, run_id)
 
     async def _finish_flat_run(self, run: dict, reason: str) -> None:
+        # Cancel all residual orders (SL STOP_MARKET, TP, etc.) for this run.
+        # Use the broad sweep (_cancel_all_run_orders) first so we never leave
+        # dangling orders even if the exact clientOrderId suffix matching fails.
+        await self._cancel_all_run_orders(run["symbol"], run["run_id"])
+        # Drop per-run trailing state so the dicts do not grow unbounded across
+        # loop chains.
+        self._trail_peak.pop(run["run_id"], None)
+        self._trail_armed.discard(run["run_id"])
+        self._dca_block_times.pop(run["run_id"], None)
+        self._partial_exits.discard(run["run_id"])
         summary = await self._build_run_summary(run)
-        exit_reason = run.get("exit_reason") or summary["exit_reason"] or reason
+        # Determine exit_reason.  Priority:
+        #   1. Explicit reason already written by _close_position (SL/TRAIL/ADVERSE_EXIT/MAX_HOLD_*)
+        #   2. If flat_detected (exchange-side close we didn't initiate), check algo
+        #      orders to see if STOP_MARKET SL fired; otherwise infer from TP fills.
+        #   3. The caller's reason as last resort.
+        explicit = run.get("exit_reason")
+        if explicit and explicit != "flat_detected":
+            exit_reason = explicit
+        elif reason != "flat_detected":
+            exit_reason = reason
+        else:
+            inferred = summary["exit_reason"]
+            if summary["realized_pnl_usdc"] < -1e-6:
+                # flat_detected with a loss is almost always a STOP_MARKET fill
+                # (algo order, clientOrderId mismatch) that _infer_flat_exit_reason
+                # can't see. Override to SL regardless of inferred value.
+                exit_reason = "SL"
+            else:
+                exit_reason = inferred or reason
         await self._repo.update_run(
             run["run_id"],
             qty=summary["qty"],
@@ -1275,7 +1805,7 @@ class MainnetOneRunManager:
             commission_usdc=summary["commission_usdc"],
         )
         await self._repo.complete_run(run["run_id"], "COMPLETED", exit_reason)
-        await self._repo.log_event(run["run_id"], "completed", {"reason": reason})
+        await self._repo.log_event(run["run_id"], "completed", {"reason": exit_reason})
         # Loop progress: increment completed and compute position label.
         in_loop = self._loop_total > 0
         if in_loop:
@@ -1283,11 +1813,16 @@ class MainnetOneRunManager:
         position_label = (
             f" ({self._loop_completed}/{self._loop_total})" if in_loop else ""
         )
-        # If SL exit and we are in a loop, set cooldown for this
-        # (side, strategy_label) so the chain-arm skips the next same
-        # signal.
+        # If SL exit (or flat_detected with a loss) and we are in a loop,
+        # set cooldown for this (side, strategy_label) so the chain-arm
+        # skips the next same signal.  flat_detected is almost always a
+        # STOP_MARKET fill that wasn't captured in time; treating it as SL
+        # for cooldown purposes prevents consecutive loss runs.
         from_loop_chain = run.get("params", {}).get("actor") == "telegram_loop" or in_loop
-        if from_loop_chain and exit_reason == "SL":
+        _is_loss_exit = exit_reason == "SL" or (
+            exit_reason == "flat_detected" and summary["realized_pnl_usdc"] < 0
+        )
+        if from_loop_chain and _is_loss_exit:
             side = str((run.get("params") or {}).get("side") or run.get("side") or "").upper()
             strategy = run.get("strategy_label") or ""
             if side and strategy:
@@ -1300,10 +1835,19 @@ class MainnetOneRunManager:
                 f"\n🔁 還剩 <b>{remaining}</b> 個 run，即將自動 arm 下一個。"
             )
         elif in_loop and self._loop_completed >= self._loop_total:
-            loop_footer = "\n🎯 全部 run 已完成，loop 結束。"
-            # Reset loop state at the end
+            finished_run_ids = list(self._loop_run_ids)
             self._loop_total = 0
             self._loop_completed = 0
+            self._loop_run_ids = []
+            try:
+                loop_runs = await self._repo.get_runs_by_ids(finished_run_ids)
+                stats_text = self._build_loop_stats(loop_runs)
+                loop_footer = (
+                    f"\n🎯 全部 run 已完成，loop 結束。"
+                    f"\n\n📊 <b>Loop 統計 ({len(finished_run_ids)} runs)</b>\n{stats_text}"
+                )
+            except Exception:  # noqa: BLE001
+                loop_footer = "\n🎯 全部 run 已完成，loop 結束。"
         await self._notify(
             f"🏁 <b>Mainnet one-run 已完成{position_label}</b>\n"
             f"Run：<code>{escape(run['run_id'])}</code>\n"
@@ -1317,96 +1861,262 @@ class MainnetOneRunManager:
         # If loop continues, auto-arm the next run.  This must happen AFTER
         # the COMPLETED notification so the user sees the prior run's
         # summary first.  The new run will be ARMED; it will wait for the
-        # next wildcat signal.
+        # next wildcat signal.  If the (side, strategy) is still in cooldown,
+        # the arm is deferred and resumed by run_cycle once it expires.
         if in_loop and self._loop_completed < self._loop_total:
+            side = str((run.get("params") or {}).get("side") or run.get("side") or "").upper()
+            strategy = run.get("strategy_label") or ""
+            await self._try_arm_next_loop_run(side, strategy, run["run_id"])
+
+    @staticmethod
+    def _build_loop_stats(runs: list[dict]) -> str:
+        import json as _json  # local import to avoid top-level churn
+        from collections import defaultdict
+
+        completed = [r for r in runs if r.get("status") == "COMPLETED"]
+        entry_failed = [r for r in runs if r.get("status") in {"ENTRY_EXPIRED", "ENTRY_REJECTED"}]
+
+        n = len(completed)
+        if n == 0:
+            return f"（無已完成的 run，進場失敗 {len(entry_failed)} 次）"
+
+        wins = [r for r in completed if (r.get("realized_pnl_usdc") or 0) >= 0]
+        n_wins = len(wins)
+        wr_pct = n_wins / n * 100
+
+        total_pnl = sum((r.get("realized_pnl_usdc") or 0) for r in completed)
+        total_comm = sum((r.get("commission_usdc") or 0) for r in completed)
+        net_pnl = total_pnl - total_comm
+
+        pnl_sign = "+" if net_pnl >= 0 else ""
+        gross_sign = "+" if total_pnl >= 0 else ""
+
+        lines = [
+            f"{'▲' if net_pnl >= 0 else '▼'} 淨 PnL：<b>{pnl_sign}{net_pnl:.4f}</b>  │  勝率：<b>{n_wins}/{n} ({wr_pct:.0f}%)</b>",
+            f"毛利：{gross_sign}{total_pnl:.4f}  │  手續費：{total_comm:.4f}",
+        ]
+        if entry_failed:
+            lines.append(f"進場失敗（未成交）：{len(entry_failed)} 次")
+
+        # Exit-type distribution: e.g. TRAIL 5(+0.180) ｜ TP 3(+0.095) ｜ SL 2(-0.140)
+        exit_pnl: dict[str, list[float]] = defaultdict(list)
+        for r in completed:
+            reason = r.get("exit_reason") or "?"
+            exit_pnl[reason].append(r.get("realized_pnl_usdc") or 0)
+        if exit_pnl:
+            parts = []
+            for reason, pnls in sorted(exit_pnl.items(), key=lambda x: -len(x[1])):
+                s = sum(pnls)
+                sign = "+" if s >= 0 else ""
+                parts.append(f"{reason} {len(pnls)}次({sign}{s:.3f})")
+            lines.append("出場：" + " ｜ ".join(parts))
+
+        # Strategy distribution: from signal_json.reasons
+        strat_counts: dict[str, int] = defaultdict(int)
+        for r in completed:
             try:
-                # Check cooldown: if the previous run exited via SL, the
-                # same (side, strategy) may still be in cooldown.  In that
-                # case we skip one arm cycle — the loop still has remaining
-                # runs in counter but we wait for the cooldown to expire
-                # before chaining the next run.
-                now_ms = int(time.time() * 1000)
-                side = str((run.get("params") or {}).get("side") or run.get("side") or "").upper()
-                strategy = run.get("strategy_label") or ""
-                cooldown_key = (side, strategy)
-                cooldown_remaining = 0
-                if side and strategy:
-                    cooldown_until = self._loop_cooldowns.get(cooldown_key, 0)
-                    if cooldown_until > now_ms:
-                        cooldown_remaining = (cooldown_until - now_ms) // 1000
-                        logger.info(
-                            "mainnet_one_run_loop_cooldown_skip",
-                            side=side,
-                            strategy=strategy,
-                            cooldown_remaining_seconds=cooldown_remaining,
-                            completed=self._loop_completed,
-                            total=self._loop_total,
-                        )
-                        await self._notify(
-                            f"⏳ <b>Cooldown 中，跳過 arm</b>\\n"
-                            f"方向：<b>{escape(side)}</b> / 策略：<b>{escape(strategy)}</b>\\n"
-                            f"冷卻剩 <b>{cooldown_remaining}s</b>，完成後才 arm 下一 run。\\n"
-                            f"目前進度：<b>{self._loop_completed}/{self._loop_total}</b>\\n"
-                            "Loop 保留中，cooldown 到期後自動繼續。"
-                        )
-                if cooldown_remaining == 0:
-                    # Proceed with chain-arm: build a new run directly.
-                    # Bypasses the "already have active run" guard.
-                    preflight_error = await self._preflight()
-                    if preflight_error:
-                        await self._notify(
-                            f"❌ <b>Loop 自動 arm 失敗</b>\n"
-                            f"前一個 run：<code>{escape(run['run_id'])}</code>\n"
-                            f"原因：<code>{escape(preflight_error[:300])}</code>\n"
-                            "Loop 已中止，請手動確認。"
-                        )
-                        self._loop_total = 0
-                        self._loop_completed = 0
-                    else:
-                        next_run_id = f"{self._settings.mainnet_client_order_prefix}_{int(time.time() * 1000)}"
-                        next_index = self._loop_completed + 1
-                        next_params = {
-                            "actor": "telegram_loop",
-                            "symbol": self._settings.mainnet_symbol,
-                            "strategy": self._settings.mainnet_strategy_label,
-                            "equity_cap_usdc": self._settings.mainnet_equity_cap_usdc,
-                            "initial_notional_usdc": self._settings.mainnet_effective_entry_notional_usdc,
-                            "max_cumulative_notional_usdc": self._settings.mainnet_effective_max_cumulative_notional_usdc,
-                            "leverage": self._settings.mainnet_leverage,
-                            "maker_first": True,
-                            "loop_count": self._loop_total,
-                            "loop_index": next_index,
-                        }
-                        await self._repo.create_run(
-                            {
-                                "run_id": next_run_id,
-                                "symbol": self._settings.mainnet_symbol,
-                                "strategy_label": self._settings.mainnet_strategy_label,
-                                "status": "ARMED",
-                                "params": next_params,
-                            }
-                        )
-                        await self._repo.log_event(next_run_id, "armed", next_params)
-                        await self._notify(
-                            f"🔄 <b>Loop 自動 arm 下一個 run</b>\n"
-                            f"✅ Mainnet one-run 已啟動 ({next_index}/{self._loop_total})\n"
-                            f"Run：<code>{escape(next_run_id)}</code>\n"
-                            f"接下來只會等待下一個 wildcat 訊號；沒訊號時不會下單。"
-                        )
-            except Exception as exc:  # noqa: BLE001
-                logger.error(
-                    "mainnet_one_run_loop_chain_failed",
-                    run_id=run["run_id"],
-                    error=str(exc),
+                sig = _json.loads(r.get("signal_json") or "{}")
+                reasons = sig.get("reasons", [])
+                if any("rescue" in x for x in reasons):
+                    strat_counts["rescue"] += 1
+                elif any("catchup" in x for x in reasons):
+                    strat_counts["catchup"] += 1
+                else:
+                    strat = next(
+                        (x.split(":")[1] for x in reasons if x.startswith("wildcat:")),
+                        "?",
+                    )
+                    strat = (
+                        strat.replace("S1_BB_RSI", "S1")
+                        .replace("S5_Stoch", "S5")
+                        .replace("S2_SuperTrend", "S2")
+                    )
+                    strat_counts[strat] += 1
+            except Exception:  # noqa: BLE001
+                strat_counts["?"] += 1
+        if strat_counts:
+            strat_parts = [f"{k} {v}" for k, v in sorted(strat_counts.items(), key=lambda x: -x[1])]
+            lines.append("策略：" + " ｜ ".join(strat_parts))
+
+        return "\n".join(lines)
+
+    async def _advance_loop_after_entry_failure(self, run: dict, reason: str) -> None:
+        """Advance the loop when a run ends during the *entry stage* (no fill).
+
+        Reached from signal_timeout / entry_ttl_expired / entry_not_open /
+        slippage_exceeded — paths that go through complete_run and never reach
+        _finish_flat_run.  Without this the loop would stall (Bug 9).
+
+        Per product decision: an entry-stage failure *consumes* one loop slot
+        and advances to the next run.  There is no position and no PnL, so no
+        cooldown is applied (cooldown is only for SL losses).  For a non-loop
+        (single) run this is a no-op.
+        """
+        self._entry_guard_notified.discard(run["run_id"])
+        if self._loop_total <= 0:
+            return  # single run, nothing to chain
+        self._loop_completed += 1
+        side = str((run.get("params") or {}).get("side") or run.get("side") or "").upper()
+        strategy = run.get("strategy_label") or ""
+        if self._loop_completed < self._loop_total:
+            remaining = self._loop_total - self._loop_completed
+            await self._notify(
+                f"🔁 <b>Loop run entry 階段結束</b>（{escape(reason)}），未成交，消耗 1 次。\n"
+                f"進度：<b>{self._loop_completed}/{self._loop_total}</b>，還剩 {remaining} 個，arm 下一個。"
+            )
+            await self._try_arm_next_loop_run(side, strategy, run["run_id"])
+        else:
+            finished_run_ids = list(self._loop_run_ids)
+            n_total = self._loop_total
+            n_done = self._loop_completed
+            self._loop_total = 0
+            self._loop_completed = 0
+            self._loop_run_ids = []
+            try:
+                loop_runs = await self._repo.get_runs_by_ids(finished_run_ids)
+                stats_text = self._build_loop_stats(loop_runs)
+                stats_block = f"\n\n📊 <b>Loop 統計 ({len(finished_run_ids)} runs)</b>\n{stats_text}"
+            except Exception:  # noqa: BLE001
+                stats_block = ""
+            await self._notify(
+                f"🏁 <b>Loop 全部結束</b>（最後一個 run entry 階段結束：{escape(reason)}）。\n"
+                f"進度：<b>{n_done}/{n_total}</b>。自動交易回到待命。"
+                f"{stats_block}"
+            )
+
+    async def _try_arm_next_loop_run(self, side: str, strategy: str, prev_run_id: str) -> None:
+        """Arm the next loop run, honoring the (side, strategy) cooldown.
+
+        If the cooldown is still active, the pending arm is recorded in
+        self._loop_resume so run_cycle can resume it once the cooldown expires.
+        This is the fix for the loop stalling forever after a cooldown skip.
+        """
+        if not (self._loop_total > 0 and self._loop_completed < self._loop_total):
+            return
+        try:
+            now_ms = int(time.time() * 1000)
+            cooldown_remaining = 0
+            cooldown_until = 0
+            if side and strategy:
+                cooldown_until = self._loop_cooldowns.get((side, strategy), 0)
+                if cooldown_until > now_ms:
+                    cooldown_remaining = (cooldown_until - now_ms) // 1000
+            if cooldown_remaining > 0:
+                # Defer: record the pending arm so run_cycle resumes it later.
+                self._loop_resume = {
+                    "side": side,
+                    "strategy": strategy,
+                    "prev_run_id": prev_run_id,
+                    "resume_at_ms": cooldown_until,
+                }
+                logger.info(
+                    "mainnet_one_run_loop_cooldown_skip",
+                    side=side,
+                    strategy=strategy,
+                    cooldown_remaining_seconds=cooldown_remaining,
+                    completed=self._loop_completed,
+                    total=self._loop_total,
                 )
                 await self._notify(
+                    f"⏳ <b>Cooldown 中，跳過 arm</b>\n"
+                    f"方向：<b>{escape(side)}</b> / 策略：<b>{escape(strategy)}</b>\n"
+                    f"冷卻剩 <b>{cooldown_remaining}s</b>，到期後自動 arm 下一 run。\n"
+                    f"目前進度：<b>{self._loop_completed}/{self._loop_total}</b>\n"
+                    "Loop 保留中，cooldown 到期後會自動繼續。"
+                )
+                return
+            # Cooldown clear — arm the next run now.  Build a new run directly,
+            # bypassing the "already have active run" guard.
+            preflight_error = await self._preflight()
+            if preflight_error:
+                await self._notify(
                     f"❌ <b>Loop 自動 arm 失敗</b>\n"
-                    f"前一個 run：<code>{escape(run['run_id'])}</code>\n"
-                    f"錯誤：<code>{escape(str(exc)[:300])}</code>\n"
+                    f"前一個 run：<code>{escape(prev_run_id)}</code>\n"
+                    f"原因：<code>{escape(preflight_error[:300])}</code>\n"
                     "Loop 已中止，請手動確認。"
                 )
                 self._loop_total = 0
                 self._loop_completed = 0
+                self._loop_run_ids = []
+                self._loop_resume = None
+                return
+            next_run_id = f"{self._settings.mainnet_client_order_prefix}_{int(time.time() * 1000)}"
+            self._loop_run_ids.append(next_run_id)
+            next_index = self._loop_completed + 1
+            next_params = {
+                "actor": "telegram_loop",
+                "symbol": self._settings.mainnet_symbol,
+                "strategy": self._settings.mainnet_strategy_label,
+                "equity_cap_usdc": self._settings.mainnet_equity_cap_usdc,
+                "initial_notional_usdc": self._settings.mainnet_effective_entry_notional_usdc,
+                "max_cumulative_notional_usdc": self._settings.mainnet_effective_max_cumulative_notional_usdc,
+                "leverage": self._settings.mainnet_leverage,
+                "maker_first": True,
+                "loop_count": self._loop_total,
+                "loop_index": next_index,
+            }
+            await self._repo.create_run(
+                {
+                    "run_id": next_run_id,
+                    "symbol": self._settings.mainnet_symbol,
+                    "strategy_label": self._settings.mainnet_strategy_label,
+                    "status": "ARMED",
+                    "params": next_params,
+                }
+            )
+            await self._repo.log_event(next_run_id, "armed", next_params)
+            self._loop_resume = None
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "mainnet_one_run_loop_chain_failed",
+                run_id=prev_run_id,
+                error=str(exc),
+            )
+            await self._notify(
+                f"❌ <b>Loop 自動 arm 失敗</b>\n"
+                f"前一個 run：<code>{escape(prev_run_id)}</code>\n"
+                f"錯誤：<code>{escape(str(exc)[:300])}</code>\n"
+                "Loop 已中止，請手動確認。"
+            )
+            self._loop_total = 0
+            self._loop_completed = 0
+            self._loop_run_ids = []
+            self._loop_resume = None
+        else:
+            # Notify after critical work succeeds; Telegram timeout must NOT abort the loop.
+            try:
+                await self._notify(
+                    f"🔄 <b>Loop 自動 arm 下一個 run</b>\n"
+                    f"✅ Mainnet one-run 已啟動 ({next_index}/{self._loop_total})\n"
+                    f"Run：<code>{escape(next_run_id)}</code>\n"
+                    f"接下來只會等待下一個 wildcat 訊號；沒訊號時不會下單。"
+                )
+            except Exception as notify_exc:  # noqa: BLE001
+                logger.warning(
+                    "mainnet_one_run_loop_arm_notify_failed",
+                    run_id=next_run_id,
+                    error=str(notify_exc),
+                )
+
+    async def _maybe_resume_pending_loop(self) -> None:
+        """Resume a loop chain-arm previously deferred by a cooldown.
+
+        Called from run_cycle when there is no active run.  Once the recorded
+        cooldown expires, arms the next loop run.  This closes the gap where a
+        cooldown skip would otherwise leave the loop stalled forever.
+        """
+        pending = self._loop_resume
+        if not pending:
+            return
+        if not (self._loop_total > 0 and self._loop_completed < self._loop_total):
+            self._loop_resume = None
+            return
+        if int(time.time() * 1000) < int(pending.get("resume_at_ms", 0)):
+            return  # cooldown not expired yet
+        self._loop_resume = None
+        await self._try_arm_next_loop_run(
+            pending["side"], pending["strategy"], pending["prev_run_id"]
+        )
 
     async def _build_run_summary(self, run: dict) -> dict[str, float | str | None]:
         orders, trades = await self._load_run_orders_and_trades(run)
@@ -1417,6 +2127,20 @@ class MainnetOneRunManager:
             qty = max(qty, abs(float(order.get("origQty") or 0.0)))
         realized_pnl = sum(float(trade["realized_pnl"]) for trade in trades)
         commission = sum(float(trade["commission"]) for trade in trades)
+        # The SL exit is a STOP_MARKET *algo* order whose fill carries an
+        # "x-..." clientOrderId (not the "<run_id>_sl" suffix), so the
+        # clientOrderId-prefix matching above silently drops the SL close - that
+        # is exactly why SL-exit runs reported realized_pnl=0 (A2 fix,
+        # 2026-06-08). Add any in-window trades NOT already order-matched;
+        # one-run holds a single position per symbol at a time, so an unmatched
+        # in-window fill can only be this run's SL close.
+        matched_order_ids = {int(order.get("orderId", 0) or 0) for order in orders}
+        extra_pnl, extra_comm, extra_qty = await self._window_extra_realized(
+            run, matched_order_ids
+        )
+        realized_pnl += extra_pnl
+        commission += extra_comm
+        qty = max(qty, extra_qty)
         exit_reason = self._infer_flat_exit_reason(run, orders)
         return {
             "qty": qty,
@@ -1424,6 +2148,42 @@ class MainnetOneRunManager:
             "commission_usdc": commission,
             "exit_reason": exit_reason,
         }
+
+    async def _window_extra_realized(
+        self, run: dict, matched_order_ids: set[int]
+    ) -> tuple[float, float, float]:
+        """Sum realized PnL/commission/qty for in-window trades NOT order-matched.
+
+        Captures the algo STOP_MARKET SL fill that clientOrderId matching misses.
+        Returns ``(realized_pnl_usdc, commission_usdc, max_qty)``.
+
+        The window starts at ``armed_at_ms`` with NO look-back buffer: in a loop
+        the next run can arm ~1s after the previous one completes, so a negative
+        buffer would double-count the prior run's SL. Every trade of this run
+        (entry, TP, SL) happens strictly after it was armed, so this is exact.
+        """
+        start_time = int(run.get("armed_at_ms") or 0)
+        try:
+            trades = await self._client.get_user_trades(
+                run["symbol"], start_time=start_time, limit=1000
+            )
+        except Exception as exc:  # noqa: BLE001 - reporting must not break completion
+            logger.warning(
+                "window_extra_realized_fetch_failed run=%s error=%s",
+                run["run_id"],
+                str(exc)[:200],
+            )
+            return 0.0, 0.0, 0.0
+        realized = 0.0
+        commission = 0.0
+        max_qty = 0.0
+        for t in trades:
+            if int(t.order_id) in matched_order_ids:
+                continue
+            realized += float(t.realized_pnl)
+            commission += float(t.commission)
+            max_qty = max(max_qty, float(t.qty))
+        return realized, commission, max_qty
 
     async def _load_run_orders_and_trades(self, run: dict) -> tuple[list[dict], list[dict[str, float | int | str]]]:
         start_time = max(0, int(run.get("armed_at_ms") or 0) - 60_000)
@@ -1503,7 +2263,7 @@ class MainnetOneRunManager:
                 latest_filled = str(order.get("clientOrderId") or "")
         if not latest_filled:
             return run.get("exit_reason")
-        if latest_filled.endswith(FINAL_TP_SUFFIX) or latest_filled.endswith(PARTIAL_TP_SUFFIX):
+        if latest_filled.endswith(FINAL_TP_SUFFIX) or latest_filled.endswith(PARTIAL_TP_SUFFIX) or latest_filled.endswith(MID_TP_SUFFIX):
             return "TP"
         if latest_filled.endswith("_close"):
             return run.get("exit_reason")
