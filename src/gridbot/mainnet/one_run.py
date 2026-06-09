@@ -1265,13 +1265,19 @@ class MainnetOneRunManager:
             run_id not in self._partial_taken
             and self._settings.mainnet_partial_exit_pct > 0
             and partial_price > 0
+            and abs(partial_price - full_tp_price) > 0.01
         ):
             partial_qty_raw = current_qty * self._settings.mainnet_partial_exit_pct
             partial_qty = await self._client.format_quantity(position.symbol, partial_qty_raw)
             if float(partial_qty) > 0:
                 orders.append((f"{run_id}{PARTIAL_TP_SUFFIX}", partial_qty, partial_price))
                 remaining_qty = max(0.0, current_qty - float(partial_qty))
-        if mid_price > 0 and self._settings.mainnet_mid_exit_pct > 0 and remaining_qty > 0:
+        if (
+            mid_price > 0
+            and self._settings.mainnet_mid_exit_pct > 0
+            and remaining_qty > 0
+            and abs(mid_price - full_tp_price) > 0.01
+        ):
             mid_qty_raw = remaining_qty * self._settings.mainnet_mid_exit_pct
             mid_qty = await self._client.format_quantity(position.symbol, mid_qty_raw)
             if float(mid_qty) > 0:

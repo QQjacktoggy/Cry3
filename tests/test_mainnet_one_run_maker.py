@@ -1164,18 +1164,15 @@ async def test_run_running_dca_shrinks_and_caps_take_profits():
     signal = json.loads(run["signal_json"])
     orders = await manager._desired_take_profit_orders(run, client.position, signal=signal, close_side="BUY")
     
-    assert len(orders) == 3
+    assert len(orders) == 2
     order_dict = {o[0]: (o[1], o[2]) for o in orders}
     
     # Check quantities:
     assert order_dict["cry3mn_test_tp1"][0] == "0.095"
-    assert order_dict["cry3mn_test_tp2"][0] == "0.071"
-    assert order_dict["cry3mn_test_tp3"][0] == "0.072"
+    assert order_dict["cry3mn_test_tp3"][0] == "0.143"
     
     # Check prices (SHORT direction):
     # tp1 = 1686.71 * (1 - 0.000225) = 1686.33
     # tp3 = 1686.71 * (1 - 0.00036) = 1686.10
-    # tp2 = 1686.71 * (1 - 0.00054) = 1685.80 -> capped to tp3 (1686.10)
     assert float(order_dict["cry3mn_test_tp1"][1]) == pytest.approx(1686.3305, abs=0.01)
-    assert float(order_dict["cry3mn_test_tp2"][1]) == pytest.approx(1686.1027, abs=0.01)
     assert float(order_dict["cry3mn_test_tp3"][1]) == pytest.approx(1686.1027, abs=0.01)
