@@ -677,6 +677,7 @@ class MainnetOneRunManager:
                 "partial_tp_pct": decision.partial_tp_pct,
                 "recovery_steps": decision.recovery_steps,
                 "recovery_trigger_pct": decision.recovery_trigger_pct,
+                "recovery_tp_shrink": decision.recovery_tp_shrink,
                 "adverse_exit_bars": decision.adverse_exit_bars,
                 "adverse_exit_loss_pct": decision.adverse_exit_loss_pct,
                 "max_holding_bars": decision.max_holding_bars,
@@ -1223,19 +1224,41 @@ class MainnetOneRunManager:
         original_entry = float(run.get("entry_price") or 0.0)
         current_avg = position.entry_price
         tp_pct = float(signal.get("wildcat", {}).get("tp_pct") or 0.0)
+        
+        # Determine the shrink factor
+        shrink = 1.0
+        dca_count = self._recovery_counts.get(run_id, 0)
+        if dca_count > 0:
+            shrink = float(signal.get("wildcat", {}).get("recovery_tp_shrink") or self._settings.mainnet_recovery_tp_shrink)
+            tp_pct *= shrink
+
         if (
             tp_pct > 0
             and original_entry > 0
             and current_avg > 0
             and full_tp_price > 0
-            and abs(current_avg - original_entry) > 0.01
+            and (dca_count > 0 or abs(current_avg - original_entry) > 0.01)
         ):
             if position.position_direction == "LONG":
                 full_tp_price = current_avg * (1 + tp_pct)
             elif position.position_direction == "SHORT":
                 full_tp_price = current_avg * (1 - tp_pct)
-        partial_price = self._partial_take_profit_price(position)
-        mid_price = self._mid_take_profit_price(position)
+        partial_price = self._partial_take_profit_price(position, shrink)
+        mid_price = self._mid_take_profit_price(position, shrink)
+
+        # Cap partial_price and mid_price at full_tp_price to prevent inverted orders leaving a tail
+        if full_tp_price > 0:
+            if position.position_direction == "LONG":
+                if partial_price > 0:
+                    partial_price = min(partial_price, full_tp_price)
+                if mid_price > 0:
+                    mid_price = min(mid_price, full_tp_price)
+            elif position.position_direction == "SHORT":
+                if partial_price > 0:
+                    partial_price = max(partial_price, full_tp_price)
+                if mid_price > 0:
+                    mid_price = max(mid_price, full_tp_price)
+
         orders: list[tuple[str, str, float]] = []
         remaining_qty = current_qty
         if (
@@ -1260,15 +1283,16 @@ class MainnetOneRunManager:
                 orders.append((f"{run_id}{FINAL_TP_SUFFIX}", final_qty, full_tp_price))
         return orders
 
-    def _partial_take_profit_price(self, position: PositionInfo) -> float:
+    def _partial_take_profit_price(self, position: PositionInfo, shrink: float = 1.0) -> float:
+        pct = self._settings.mainnet_partial_tp_pct * shrink
         if position.position_direction == "LONG":
-            return position.entry_price * (1 + self._settings.mainnet_partial_tp_pct)
+            return position.entry_price * (1 + pct)
         if position.position_direction == "SHORT":
-            return position.entry_price * (1 - self._settings.mainnet_partial_tp_pct)
+            return position.entry_price * (1 - pct)
         return 0.0
 
-    def _mid_take_profit_price(self, position: PositionInfo) -> float:
-        mid_pct = self._settings.mainnet_mid_tp_pct
+    def _mid_take_profit_price(self, position: PositionInfo, shrink: float = 1.0) -> float:
+        mid_pct = self._settings.mainnet_mid_tp_pct * shrink
         if mid_pct <= 0:
             return 0.0
         if position.position_direction == "LONG":

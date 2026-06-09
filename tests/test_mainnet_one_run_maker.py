@@ -1120,3 +1120,62 @@ async def test_loop_arms_immediately_when_no_cooldown():
     assert len(repo.created) == 1
     assert repo.created[0]["status"] == "ARMED"
     assert manager._loop_resume is None
+
+
+@pytest.mark.asyncio
+async def test_run_running_dca_shrinks_and_caps_take_profits():
+    """Verify that when dca_count > 0, all TP orders are shrunk and capped at full_tp_price."""
+    client = FakeClient()
+    client.position = PositionInfo(
+        symbol="ETHUSDC",
+        position_amt=-0.238,  # SHORT position
+        entry_price=1686.71,
+        mark_price=1686.50,
+        unrealized_pnl=0.05,
+        liquidation_price=2000.0,
+        leverage=75,
+        margin_type="cross",
+    )
+    repo = FakeRepo()
+    manager = MainnetOneRunManager(
+        _settings(
+            mainnet_partial_tp_pct=0.0005,  # 0.05%
+            mainnet_mid_tp_pct=0.0012,     # 0.12%
+            mainnet_recovery_tp_shrink=0.45,
+            mainnet_partial_exit_pct=0.40,
+            mainnet_mid_exit_pct=0.50,
+        ),
+        client,
+        repo,
+        FakeTelegramApp(),
+    )
+    # Mark the run as having 1 DCA step completed
+    manager._recovery_counts["cry3mn_test"] = 1
+    
+    run = _run(
+        run_id="cry3mn_test",
+        side="SHORT",
+        signal_json='{"side":"SHORT","take_profit":1685.43,"stop_loss":1689.59,"wildcat":{"tp_pct":0.0008,"recovery_tp_shrink":0.45}}',
+        entry_price=1686.15,
+        avg_entry_price=1686.71,
+    )
+    
+    import json
+    signal = json.loads(run["signal_json"])
+    orders = await manager._desired_take_profit_orders(run, client.position, signal=signal, close_side="BUY")
+    
+    assert len(orders) == 3
+    order_dict = {o[0]: (o[1], o[2]) for o in orders}
+    
+    # Check quantities:
+    assert order_dict["cry3mn_test_tp1"][0] == "0.095"
+    assert order_dict["cry3mn_test_tp2"][0] == "0.071"
+    assert order_dict["cry3mn_test_tp3"][0] == "0.072"
+    
+    # Check prices (SHORT direction):
+    # tp1 = 1686.71 * (1 - 0.000225) = 1686.33
+    # tp3 = 1686.71 * (1 - 0.00036) = 1686.10
+    # tp2 = 1686.71 * (1 - 0.00054) = 1685.80 -> capped to tp3 (1686.10)
+    assert float(order_dict["cry3mn_test_tp1"][1]) == pytest.approx(1686.3305, abs=0.01)
+    assert float(order_dict["cry3mn_test_tp2"][1]) == pytest.approx(1686.1027, abs=0.01)
+    assert float(order_dict["cry3mn_test_tp3"][1]) == pytest.approx(1686.1027, abs=0.01)
