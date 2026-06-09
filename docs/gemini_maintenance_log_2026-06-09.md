@@ -30,11 +30,16 @@
    - 在調用 `_partial_take_profit_price` 與 `_mid_take_profit_price` 時傳入 `shrink` 因子，使其計算出來的部分止盈比率（tp1）與中等止盈比率（tp2）同步縮小。
    - **價格封頂邏輯**: 針對部分與中等止盈價格，強制進行方向性的封頂限制（LONG 用 `min`，SHORT 用 `max`），使其不得超過最終止盈 `tp3` 價格。這保證了當最終止盈價格觸發時，剩餘的所有分批訂單都已經在該價格或更近的價格全部被成交，不再有殘留部位。
 
-### 3. 單元測試驗證
+### 3. 止盈單同價合併優化
+* **檔案**: [one_run.py](file:///home/jack_shih/cry3/src/gridbot/mainnet/one_run.py) 中的 `_desired_take_profit_orders`。
+* **修改**: 當 `tp1` (partial) 或 `tp2` (mid) 價格因為封頂而與最終止盈 `tp3` 完全相同時（使用 `abs(price - full_tp_price) <= 0.01` 判斷），將不再掛出重複價格的獨立單據，而是將其數量直接合併進最終的 `tp3` 訂單中。這大幅精簡了極窄 TP（如 0.08% / 0.06%）在實盤上掛出多筆同價微型訂單的問題。
+
+### 4. 單元測試驗證
 * **檔案**: [test_mainnet_one_run_maker.py](file:///home/jack_shih/cry3/tests/test_mainnet_one_run_maker.py)
-* **修改**: 新增 `test_run_running_dca_shrinks_and_caps_take_profits` 測試，模擬 SHORT 方向在 `dca_count=1` 時的止盈計算，確認 `tp1` 與 `tp2` 分別正確被縮放與封頂。
+* **修改**: 更新 `test_run_running_dca_shrinks_and_caps_take_profits` 測試，除了驗證封頂價格外，也驗證了合併行為。在該測試中原本會掛出三筆單，現在因為 `tp2` 價格被封頂至與 `tp3` 相同，所以 `tp2` 順利被合併，最終只掛出兩筆單（`tp1` 與合併了數量後的 `tp3`），訂單長度斷言改為 `2`。
 
 ---
 
 ## 🧪 驗證結果
 - 本地 `pytest` 測試（共 269 個測試）全數通過，無任何 Regression。
+- 程式已成功同步部署並重啟 VM 服務。
