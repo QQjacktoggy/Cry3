@@ -71,6 +71,9 @@ class FakeClient:
         self.cancelled = []
         self.cancelled_algo = []
         self._next_order_id = 1000
+        # Configurable top-of-book so tests can keep the book consistent with
+        # the position's mark (the E3 anchor gate compares book vs cost basis).
+        self.book = {"bidPrice": "100.00", "askPrice": "100.10"}
 
     async def get_position(self, symbol):
         return self.position
@@ -213,10 +216,10 @@ class FakeClient:
         return f"{qty:.3f}".rstrip("0").rstrip(".")
 
     async def get_order_book_ticker(self, symbol):
-        return {"bidPrice": "100.00", "askPrice": "100.10"}
+        return dict(self.book)
 
     async def get_book_ticker(self, symbol):
-        return {"bidPrice": "100.00", "askPrice": "100.10"}
+        return dict(self.book)
 
     async def get_commission_rate(self, symbol):
         return {"makerCommissionRate": "0", "takerCommissionRate": "0.0004"}
@@ -288,23 +291,22 @@ async def test_entry_fill_syncs_maker_take_profit_orders():
     )
     repo = FakeRepo()
     telegram = FakeTelegramApp()
-    manager = MainnetOneRunManager(_settings(mainnet_sl_use_maker=True), client, repo, telegram)
+    manager = MainnetOneRunManager(_settings(), client, repo, telegram)
 
     run = _run(status="ENTRY_PENDING", entry_order_id=321, signal_json='{"side":"LONG","take_profit":101.0,"stop_loss":99.0}')
 
     await manager._run_entry_pending(run)
 
-    assert len(client.reduce_only_limit_orders) == 2
-    assert all(order["side"] == "SELL" for order in client.reduce_only_limit_orders)
-    assert {order["clientOrderId"] for order in client.reduce_only_limit_orders} == {"cry3mn_test_tp1", "cry3mn_test_tp2"}
-    # A STOP_MARKET SL order should also be armed on entry — it is an
-    # algo/conditional order (lives in algo_orders, has triggerPrice + reduceOnly).
+    tp_orders = [o for o in client.reduce_only_limit_orders if "tp" in (o.get("clientOrderId") or "")]
+    # TP2 (mid fixed) disabled: only TP1 (40%) + TP3 (signal, 30%) placed; remaining 30% left for TRAIL
+    assert len(tp_orders) == 2
+    assert all(order["side"] == "SELL" for order in tp_orders)
+    assert {o["clientOrderId"] for o in tp_orders} == {"cry3mn_test_tp1", "cry3mn_test_tp3"}
+    # SL is a STOP_MARKET algo order, lives in algo_orders (not reduce_only_limit_orders)
     assert len(client.stop_market_sl_orders) == 1
     sl = client.stop_market_sl_orders[0]
-    assert sl in client.algo_orders
-    assert sl["triggerPrice"] == "99.0"
+    assert float(sl["triggerPrice"]) == pytest.approx(99.0)
     assert sl["side"] == "SELL"
-    assert sl["reduceOnly"] is True
     assert telegram.bot.messages
     assert "Mainnet one-run 已成交" in telegram.bot.messages[-1]["text"]
 
@@ -335,6 +337,7 @@ async def test_run_running_take_profit_does_not_market_close():
     await manager._run_running(run)
 
     assert client.market_orders == []
+    # TP2 (mid fixed) disabled: TP1 + TP3 only (2 orders)
     assert len(client.reduce_only_limit_orders) == 2
 
 
@@ -344,11 +347,13 @@ async def test_run_running_stop_loss_closes_with_market_and_cancels_tp_orders():
     client = FakeClient()
     client.open_orders = [
         {"orderId": 111, "symbol": "ETHUSDC", "clientOrderId": "cry3mn_test_tp1", "origQty": "0.048", "price": "100.05"},
-        {"orderId": 112, "symbol": "ETHUSDC", "clientOrderId": "cry3mn_test_tp2", "origQty": "0.072", "price": "101.00"},
+        {"orderId": 112, "symbol": "ETHUSDC", "clientOrderId": "cry3mn_test_tp2", "origQty": "0.036", "price": "100.30"},
+        {"orderId": 114, "symbol": "ETHUSDC", "clientOrderId": "cry3mn_test_tp3", "origQty": "0.036", "price": "101.00"},
     ]
-    # SL is a conditional/algo order — lives in algo_orders, NOT open_orders.
+    # SL is a STOP_MARKET algo order on the separate openAlgoOrders endpoint
     client.algo_orders = [
-        {"algoId": 113, "clientAlgoId": "x-FAKE113", "orderType": "STOP_MARKET", "triggerPrice": "99.0", "reduceOnly": True},
+        {"algoId": 113, "clientAlgoId": "x-FAKE113", "algoType": "CONDITIONAL", "orderType": "STOP_MARKET",
+         "symbol": "ETHUSDC", "side": "SELL", "triggerPrice": "99.0", "quantity": "0.12", "reduceOnly": True},
     ]
     client.position = PositionInfo(
         symbol="ETHUSDC",
@@ -364,7 +369,7 @@ async def test_run_running_stop_loss_closes_with_market_and_cancels_tp_orders():
     telegram = FakeTelegramApp()
     # Disable recovery so _hit_stop path is reached without DCA interference
     manager = MainnetOneRunManager(
-        _settings(mainnet_recovery_enabled=False), client, repo, telegram
+        _settings(mainnet_recovery_enabled=False, mainnet_mid_tp_pct=0.0030), client, repo, telegram
     )
     run = _run(
         signal_json='{"side":"LONG","take_profit":101.0,"stop_loss":99.0}',
@@ -375,22 +380,23 @@ async def test_run_running_stop_loss_closes_with_market_and_cancels_tp_orders():
     await manager._run_running(run)
 
     # TP limit orders cancelled via cancel_order
-    assert set(client.cancelled) == {("ETHUSDC", 111), ("ETHUSDC", 112)}
-    # SL algo order cancelled via cancel_algo_order
-    assert any(a[1] == 113 for a in client.cancelled_algo)
-    assert client.algo_orders == []
-    # Then a single market close (no new STOP_MARKET placed)
+    assert set(client.cancelled) == {("ETHUSDC", 111), ("ETHUSDC", 112), ("ETHUSDC", 114)}
+    # STOP_MARKET SL algo order cancelled via cancel_algo_order
+    assert len(client.cancelled_algo) == 1
+    assert client.cancelled_algo[0][1] == 113  # algoId
+    # Then a single market close
     assert len(client.market_orders) == 1
     assert client.market_orders[0]["side"] == "SELL"
-    assert client.stop_market_sl_orders == []
 
 
 @pytest.mark.asyncio
-async def test_finish_flat_run_cancels_residual_sl_stop_market():
-    """STOP_MARKET SL (algo order) must be cancelled when position closes via TP."""
+async def test_finish_flat_run_cancels_residual_sl_algo():
+    """STOP_MARKET SL algo order must be cancelled when position closes via TP fill."""
     client = FakeClient()
+    # SL lives in algo_orders (openAlgoOrders), not open_orders
     client.algo_orders = [
-        {"algoId": 201, "clientAlgoId": "x-FAKE201", "orderType": "STOP_MARKET", "triggerPrice": "99.0", "reduceOnly": True},
+        {"algoId": 201, "clientAlgoId": "x-FAKE201", "algoType": "CONDITIONAL", "orderType": "STOP_MARKET",
+         "symbol": "ETHUSDC", "side": "SELL", "triggerPrice": "99.0", "quantity": "0.120", "reduceOnly": True},
     ]
     client.all_orders = [
         {"orderId": 1001, "clientOrderId": "cry3mn_test_entry", "origQty": "0.120", "status": "FILLED", "updateTime": 10},
@@ -407,14 +413,16 @@ async def test_finish_flat_run_cancels_residual_sl_stop_market():
 
     await manager._finish_flat_run(run, "flat_detected")
 
-    # The residual STOP_MARKET SL (algo order) must be cancelled via cancel_algo_order
-    assert any(a[1] == 201 for a in client.cancelled_algo)
-    assert client.algo_orders == []
+    # STOP_MARKET SL algo order cancelled via cancel_algo_order (not cancel_order)
+    assert len(client.cancelled_algo) == 1
+    assert client.cancelled_algo[0][1] == 201  # algoId
+    assert ("ETHUSDC", 201) not in client.cancelled
 
 
 @pytest.mark.asyncio
-async def test_sl_uses_stop_market_when_cap_disabled():
-    """A3 default: cap_pct=0.0 keeps the guaranteed-exit STOP_MARKET path."""
+async def test_sl_places_stop_market():
+    """_place_stop_loss_maker places a STOP_MARKET algo order at sl_price.
+    The order lives in openAlgoOrders (not openOrders)."""
     client = FakeClient()
     repo = FakeRepo()
     manager = MainnetOneRunManager(_settings(), client, repo, FakeTelegramApp())
@@ -426,31 +434,12 @@ async def test_sl_uses_stop_market_when_cap_disabled():
     )
 
     assert len(client.stop_market_sl_orders) == 1
-    assert client.stop_limit_sl_orders == []
-
-
-@pytest.mark.asyncio
-async def test_sl_uses_stop_limit_with_cap_when_enabled():
-    """A3 opt-in: cap_pct>0 arms a STOP (stop-limit); SELL floor is below the
-    trigger by cap_pct so the worst fill is bounded."""
-    client = FakeClient()
-    repo = FakeRepo()
-    manager = MainnetOneRunManager(
-        _settings(mainnet_sl_limit_cap_pct=0.001), client, repo, FakeTelegramApp()
-    )
-    run = _run()
-
-    await manager._place_stop_loss_maker(
-        symbol="ETHUSDC", side="SELL", qty_str="0.119", sl_price=1688.49,
-        run_id="cry3mn_test", reason="SL", run=run,
-    )
-
-    assert client.stop_market_sl_orders == []
-    assert len(client.stop_limit_sl_orders) == 1
-    order = client.stop_limit_sl_orders[0]
-    assert float(order["stopPrice"]) == pytest.approx(1688.49)
-    # SELL (close LONG) limit floor = trigger * (1 - 0.001)
-    assert float(order["price"]) == pytest.approx(1688.49 * 0.999)
+    order = client.stop_market_sl_orders[0]
+    assert float(order["triggerPrice"]) == pytest.approx(1688.49)
+    assert order["side"] == "SELL"
+    assert order["reduceOnly"] is True
+    assert len(client.algo_orders) == 1
+    assert client.reduce_only_limit_orders == []
 
 
 @pytest.mark.asyncio
@@ -596,8 +585,8 @@ async def test_finish_flat_run_merges_db_trade_commission_fallback():
 
 @pytest.mark.asyncio
 async def test_finish_flat_run_cancels_all_run_orders():
-    """_finish_flat_run must cancel EVERY open order whose clientOrderId starts
-    with run_id — including tp1, tp2, AND the STOP_MARKET SL."""
+    """_finish_flat_run must cancel all TP limit orders AND sweep the STOP_MARKET
+    SL algo order when position closes."""
     client = FakeClient()
     client.open_orders = [
         {"orderId": 301, "symbol": "ETHUSDC", "clientOrderId": "cry3mn_test_tp1", "origQty": "0.048", "price": "101.0"},
@@ -605,9 +594,10 @@ async def test_finish_flat_run_cancels_all_run_orders():
         # unrelated limit order from another run — prefix mismatch, must NOT be cancelled
         {"orderId": 999, "symbol": "ETHUSDC", "clientOrderId": "cry3mn_OTHER_tp1"},
     ]
-    # SL is a conditional/algo order, on a separate endpoint.
+    # SL lives in algo_orders (openAlgoOrders), not open_orders
     client.algo_orders = [
-        {"algoId": 303, "clientAlgoId": "x-FAKE303", "orderType": "STOP_MARKET", "triggerPrice": "99.0", "reduceOnly": True},
+        {"algoId": 303, "clientAlgoId": "x-FAKE303", "algoType": "CONDITIONAL", "orderType": "STOP_MARKET",
+         "symbol": "ETHUSDC", "side": "SELL", "triggerPrice": "99.0", "quantity": "0.120", "reduceOnly": True},
     ]
     client.all_orders = [
         {"orderId": 1001, "clientOrderId": "cry3mn_test_entry", "origQty": "0.120", "status": "FILLED", "updateTime": 10},
@@ -627,8 +617,9 @@ async def test_finish_flat_run_cancels_all_run_orders():
     # TP limit orders cancelled by prefix match
     assert ("ETHUSDC", 301) in client.cancelled
     assert ("ETHUSDC", 302) in client.cancelled
-    # SL algo order cancelled via cancel_algo_order
-    assert any(a[1] == 303 for a in client.cancelled_algo)
+    # STOP_MARKET SL algo order cancelled via cancel_algo_order
+    assert len(client.cancelled_algo) == 1
+    assert client.cancelled_algo[0][1] == 303  # algoId
     # Unrelated limit order (prefix mismatch) must NOT be cancelled
     assert ("ETHUSDC", 999) not in client.cancelled
 
@@ -639,10 +630,10 @@ async def test_run_running_tp_partial_fill_does_not_rearm_sl():
     cancelled-and-rearmed — only the qty tracking should be updated."""
     import time as _time
     client = FakeClient()
-    # SL STOP_MARKET (algo order) is already live on the exchange
+    # STOP_MARKET SL (algoId 301) is already live on the exchange as an algo order
     client.algo_orders = [
-        {"algoId": 301, "clientAlgoId": "x-FAKE301", "orderType": "STOP_MARKET",
-         "triggerPrice": "99.0", "reduceOnly": True},
+        {"algoId": 301, "clientAlgoId": "x-FAKE301", "algoType": "CONDITIONAL", "orderType": "STOP_MARKET",
+         "symbol": "ETHUSDC", "side": "SELL", "triggerPrice": "99.0", "quantity": "0.120", "reduceOnly": True},
     ]
     # Position qty shrank from 0.12 → 0.072 (partial TP filled 0.048)
     client.position = PositionInfo(
@@ -669,10 +660,9 @@ async def test_run_running_tp_partial_fill_does_not_rearm_sl():
 
     await manager._run_running(run)
 
-    # SL must NOT have been cancelled (algo 301 stays)
+    # STOP_MARKET SL must NOT have been cancelled (algo order stays)
     assert client.cancelled_algo == []
-    assert client.algo_orders and client.algo_orders[0]["algoId"] == 301
-    # No new STOP_MARKET SL placed
+    # No new STOP_MARKET SL placed (only new TP orders are acceptable)
     assert client.stop_market_sl_orders == []
     # qty tracking updated in the repo
     qty_updates = [f for _, f in repo.updated if "qty" in f]
@@ -797,8 +787,11 @@ async def test_trailing_exit_locks_runner_gain_after_arm_then_retrace():
     assert run["run_id"] in manager._trail_armed
 
     # Cycle 2: retrace to 100.5. trail_stop = 100 + (100.8-100)*0.75 = 100.6,
-    # mark 100.5 <= 100.6 → lock-exit via market close.
+    # mark 100.5 <= 100.6 → lock-exit via market close.  Keep the fake book
+    # consistent with the mark so the E3 anchor gate (bid vs cost basis +
+    # profit-floor epsilon) lets the fire proceed.
     client.position = _pos(100.5)
+    client.book = {"bidPrice": "100.50", "askPrice": "100.60"}
     await manager._run_running(run)
     assert len(client.market_orders) == 1
     assert client.market_orders[0]["side"] == "SELL"
@@ -880,9 +873,11 @@ async def test_trail_maker_exit_times_out_falls_back_to_market():
     """If the maker exit does not fill within the TTL, it is cancelled and the
     remainder is market-closed (guaranteed exit)."""
     client = FakeClient()
+    # SHORT in profit: entry 100.3, ask 100.10 — the buy-back anchor clears the
+    # cost basis (E3 gates require a TRAIL exit to still be in the money).
     client.position = PositionInfo(
-        symbol="ETHUSDC", position_amt=-0.071, entry_price=100.0, mark_price=100.2,
-        unrealized_pnl=-0.014, liquidation_price=120.0, leverage=75, margin_type="cross",
+        symbol="ETHUSDC", position_amt=-0.071, entry_price=100.3, mark_price=100.05,
+        unrealized_pnl=0.0178, liquidation_price=120.0, leverage=75, margin_type="cross",
     )
     repo = FakeRepo()
     manager = MainnetOneRunManager(
@@ -956,7 +951,7 @@ async def test_dca_blocked_by_guard_places_no_order(monkeypatch):
     )
     repo = FakeRepo()
     manager = MainnetOneRunManager(
-        _settings(mainnet_recovery_enabled=True), client, repo, FakeTelegramApp()
+        _settings(mainnet_recovery_enabled=True, mainnet_recovery_steps=1), client, repo, FakeTelegramApp()
     )
     run = _run(side="SHORT", qty=0.119)
     monkeypatch.setattr(orm, "evaluate_dca_guard", lambda c, s: (False, "trend=up（趨勢逆行）"))
@@ -984,7 +979,7 @@ async def test_dca_allowed_by_guard_places_order(monkeypatch):
     )
     repo = FakeRepo()
     manager = MainnetOneRunManager(
-        _settings(mainnet_recovery_enabled=True), client, repo, FakeTelegramApp()
+        _settings(mainnet_recovery_enabled=True, mainnet_recovery_steps=1), client, repo, FakeTelegramApp()
     )
     run = _run(side="SHORT", qty=0.119)
     monkeypatch.setattr(orm, "evaluate_dca_guard", lambda c, s: (True, "range ok"))
@@ -1011,7 +1006,7 @@ async def test_dca_guard_block_starts_cooldown_blocking_regime_flicker(monkeypat
     client.position = _dca_short_position()
     repo = FakeRepo()
     manager = MainnetOneRunManager(
-        _settings(mainnet_recovery_enabled=True, mainnet_dca_guard_cooldown_seconds=300),
+        _settings(mainnet_recovery_enabled=True, mainnet_recovery_steps=1, mainnet_dca_guard_cooldown_seconds=300),
         client, repo, FakeTelegramApp(),
     )
     run = _run(side="SHORT", qty=0.119)
@@ -1039,7 +1034,7 @@ async def test_dca_blocked_after_partial_exit(monkeypatch):
     client.position = _dca_short_position()
     repo = FakeRepo()
     manager = MainnetOneRunManager(
-        _settings(mainnet_recovery_enabled=True), client, repo, FakeTelegramApp()
+        _settings(mainnet_recovery_enabled=True, mainnet_recovery_steps=1), client, repo, FakeTelegramApp()
     )
     run = _run(side="SHORT", qty=0.119)
     # Guard would allow, but the run already booked a partial exit.
@@ -1119,3 +1114,225 @@ async def test_loop_arms_immediately_when_no_cooldown():
     assert len(repo.created) == 1
     assert repo.created[0]["status"] == "ARMED"
     assert manager._loop_resume is None
+
+
+@pytest.mark.asyncio
+async def test_run_running_dca_shrinks_and_caps_take_profits():
+    """Verify that when dca_count > 0, all TP orders are shrunk and capped at full_tp_price."""
+    client = FakeClient()
+    client.position = PositionInfo(
+        symbol="ETHUSDC",
+        position_amt=-0.238,  # SHORT position
+        entry_price=1686.71,
+        mark_price=1686.50,
+        unrealized_pnl=0.05,
+        liquidation_price=2000.0,
+        leverage=75,
+        margin_type="cross",
+    )
+    repo = FakeRepo()
+    manager = MainnetOneRunManager(
+        _settings(
+            mainnet_partial_tp_pct=0.0005,  # 0.05%
+            mainnet_mid_tp_pct=0.0012,     # 0.12%
+            mainnet_recovery_tp_shrink=0.45,
+            mainnet_partial_exit_pct=0.40,
+            mainnet_mid_exit_pct=0.50,
+        ),
+        client,
+        repo,
+        FakeTelegramApp(),
+    )
+    # Mark the run as having 1 DCA step completed
+    manager._recovery_counts["cry3mn_test"] = 1
+    
+    run = _run(
+        run_id="cry3mn_test",
+        side="SHORT",
+        signal_json='{"side":"SHORT","take_profit":1685.43,"stop_loss":1689.59,"wildcat":{"tp_pct":0.0008,"recovery_tp_shrink":0.45}}',
+        entry_price=1686.15,
+        avg_entry_price=1686.71,
+    )
+    
+    import json
+    signal = json.loads(run["signal_json"])
+    orders = await manager._desired_take_profit_orders(run, client.position, signal=signal, close_side="BUY")
+    
+    assert len(orders) == 2
+    order_dict = {o[0]: (o[1], o[2]) for o in orders}
+    
+    # Check quantities:
+    assert order_dict["cry3mn_test_tp1"][0] == "0.095"
+    assert order_dict["cry3mn_test_tp3"][0] == "0.143"
+    
+    # Check prices (SHORT direction):
+    # tp1 = 1686.71 * (1 - 0.000225) = 1686.33
+    # tp3 = 1686.71 * (1 - 0.00036) = 1686.10
+    assert float(order_dict["cry3mn_test_tp1"][1]) == pytest.approx(1686.3305, abs=0.01)
+    assert float(order_dict["cry3mn_test_tp3"][1]) == pytest.approx(1686.1027, abs=0.01)
+
+
+@pytest.mark.asyncio
+async def test_dca_fill_resets_trail_peak_and_disarms():
+    """E1: a DCA fill moves the cost basis TOWARD the market, so a pre-DCA peak
+    measured against the new basis would instantly re-satisfy arm_mfe and fire
+    on the first noise tick (06-10 08:32 loss run: stale peak 1632.58 vs new
+    avg 1633.72 armed AT the fill).  The manage cycle must restart peak
+    tracking from the current mark and disarm."""
+    import time as _time
+    client = FakeClient()
+    repo = FakeRepo()
+    manager = MainnetOneRunManager(
+        _settings(
+            mainnet_recovery_enabled=False,  # fill already happened; skip preplace
+            mainnet_trail_enabled=True,
+        ),
+        client, repo, FakeTelegramApp(),
+    )
+    run = _run(
+        signal_json='{"side":"LONG","take_profit":101.0,"stop_loss":99.0,"wildcat":{"tp_pct":0.01,"sl_pct":0.01}}',
+        qty=0.12,  # DB still holds the pre-DCA qty
+        avg_entry_price=100.0,
+        armed_at_ms=int(_time.time() * 1000),
+    )
+    # Stale pre-DCA trail state: peaked at 100.9 and armed.
+    manager._trail_peak["cry3mn_test"] = 100.9
+    manager._trail_armed.add("cry3mn_test")
+    # Exchange filled the DCA: qty doubled, avg moved up toward the market.
+    client.position = PositionInfo(
+        symbol="ETHUSDC", position_amt=0.24, entry_price=100.5, mark_price=100.55,
+        unrealized_pnl=0.012, liquidation_price=80.0, leverage=75, margin_type="cross",
+    )
+
+    await manager._run_running(run)
+
+    assert any(et == "recovery_entry_filled" for _, et, _ in repo.events)
+    # Trail baseline restarted from the current mark, no longer armed.
+    assert manager._trail_peak["cry3mn_test"] == pytest.approx(100.55)
+    assert "cry3mn_test" not in manager._trail_armed
+    # And nothing fired: mark is barely above the new avg (MFE << arm threshold).
+    assert client.market_orders == []
+
+
+@pytest.mark.asyncio
+async def test_trail_fire_aborted_when_book_anchor_below_floor():
+    """E3: the trigger passes on MARK, but the exit executes against the BOOK
+    (a LONG exit SELL rests at the bid).  If the bid has already dumped through
+    cost basis + floor, the fire must abort BEFORE tearing anything down — no
+    market order, no cancellations, run handed back to the SL/DCA path."""
+    import time as _time
+    client = FakeClient()
+    repo = FakeRepo()
+    manager = MainnetOneRunManager(
+        _settings(
+            mainnet_recovery_enabled=False,
+            mainnet_trail_enabled=True,
+            mainnet_trail_arm_frac=0.7,
+            mainnet_trail_giveback_frac=0.25,
+            mainnet_trail_exit_use_maker=False,  # without the gate → market close
+        ),
+        client, repo, FakeTelegramApp(),
+    )
+    run = _run(
+        signal_json='{"side":"LONG","take_profit":101.0,"stop_loss":99.0,"wildcat":{"tp_pct":0.01,"sl_pct":0.01}}',
+        avg_entry_price=100.0,
+        armed_at_ms=int(_time.time() * 1000),
+    )
+
+    def _pos(mark):
+        return PositionInfo(
+            symbol="ETHUSDC", position_amt=0.12, entry_price=100.0, mark_price=mark,
+            unrealized_pnl=(mark - 100.0) * 0.12, liquidation_price=80.0,
+            leverage=75, margin_type="cross",
+        )
+
+    # Cycle 1: peak 100.8 (MFE 0.8% >= 0.7%) arms the trail.
+    client.position = _pos(100.8)
+    await manager._run_running(run)
+    assert run["run_id"] in manager._trail_armed
+
+    # Cycle 2: mark 100.5 passes the trigger (<= trail_stop 100.6, above the
+    # mark floor) — but the book already dumped through the cost basis:
+    # bid 99.95 < floor 100.0×(1+1.5bp) = 100.015.  The fire must abort.
+    client.position = _pos(100.5)
+    client.book = {"bidPrice": "99.95", "askPrice": "99.99"}
+    await manager._run_running(run)
+
+    assert client.market_orders == []          # nothing closed
+    assert client.cancelled_algo == []         # SL untouched
+    assert any(et == "trail_fire_aborted_anchor_floor" for _, et, _ in repo.events)
+    assert run["run_id"] not in manager._trail_exiting  # back to managed state
+    assert repo.completed == []                # run still alive
+    assert not any(f.get("exit_reason") == "TRAIL" for _, f in repo.updated)
+    # Still armed: when the book recovers above the floor it may fire again.
+    assert run["run_id"] in manager._trail_armed
+
+
+@pytest.mark.asyncio
+async def test_loop_loss_protection_breaks_chain_at_cap():
+    """Loop loss protection: once the chain's cumulative NET PnL (realized −
+    commission) reaches −cap, the loop must stop — no next run armed, loop
+    state cleared, protection event logged."""
+    from src.gridbot.binance.models import FuturesTrade
+    client = FakeClient()
+    client.all_orders = [
+        {"orderId": 1001, "clientOrderId": "cry3mn_test_entry", "origQty": "0.120", "status": "FILLED", "updateTime": 10},
+        {"orderId": 1004, "clientOrderId": "cry3mn_test_close", "origQty": "0.120", "status": "FILLED", "updateTime": 40},
+    ]
+    # Net for this run: realized −2.40, commission 0.10 → −2.50.
+    client.user_trades = [
+        FuturesTrade(2, 1004, "ETHUSDC", "SELL", 98.0, 0.120, 11.76, -2.40, 0.10, "USDC", 40, "BOTH", False, False),
+    ]
+    repo = FakeRepo()
+    telegram = FakeTelegramApp()
+    manager = MainnetOneRunManager(_settings(), client, repo, telegram)
+    # Mid-loop (run 1 of 3) with a 2 USDC cap; prior runs net 0.
+    manager._loop_total = 3
+    manager._loop_completed = 0
+    manager._loop_run_ids = ["cry3mn_test"]
+    manager._loop_loss_cap = 2.0
+    manager._loop_net_pnl = 0.0
+    run = _run(exit_reason="SL", armed_at_ms=1)
+
+    await manager._finish_flat_run(run, "flat_detected")
+
+    # −2.50 <= −2.0 → tripped: event logged, NO next run armed, state cleared.
+    assert any(et == "loop_loss_protection_tripped" for _, et, _ in repo.events)
+    assert repo.created == []
+    assert manager._loop_total == 0
+    assert manager._loop_completed == 0
+    assert manager._loop_net_pnl == 0.0
+    assert "Loop 虧損保護觸發" in telegram.bot.messages[-1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_loop_loss_within_cap_still_chains_next_run():
+    """A net loss that does NOT reach the cap must keep the chain going (the
+    protection only breaks the loop at the threshold)."""
+    from src.gridbot.binance.models import FuturesTrade
+    client = FakeClient()
+    client.position = None
+    client.all_orders = [
+        {"orderId": 1001, "clientOrderId": "cry3mn_test_entry", "origQty": "0.120", "status": "FILLED", "updateTime": 10},
+        {"orderId": 1004, "clientOrderId": "cry3mn_test_close", "origQty": "0.120", "status": "FILLED", "updateTime": 40},
+    ]
+    # Net −0.50: under the 2 USDC cap.
+    client.user_trades = [
+        FuturesTrade(2, 1004, "ETHUSDC", "SELL", 99.6, 0.120, 11.952, -0.50, 0.0, "USDC", 40, "BOTH", False, False),
+    ]
+    repo = FakeRepo()
+    manager = MainnetOneRunManager(_settings(), client, repo, FakeTelegramApp())
+    manager._loop_total = 3
+    manager._loop_completed = 0
+    manager._loop_run_ids = ["cry3mn_test"]
+    manager._loop_loss_cap = 2.0
+    manager._loop_net_pnl = 0.0
+    run = _run(exit_reason="SL", armed_at_ms=1)
+
+    await manager._finish_flat_run(run, "flat_detected")
+
+    assert not any(et == "loop_loss_protection_tripped" for _, et, _ in repo.events)
+    assert manager._loop_net_pnl == pytest.approx(-0.50)
+    # Chain continues: next run armed (no strategy_label → no cooldown set).
+    assert len(repo.created) == 1
+    assert repo.created[0]["status"] == "ARMED"

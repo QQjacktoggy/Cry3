@@ -158,17 +158,22 @@ class Settings(BaseSettings):
     mainnet_entry_requote_min_age_seconds: int = 22
     mainnet_partial_exit_pct: float = 0.40
     mainnet_partial_tp_pct: float = 0.0005
+    mainnet_mid_tp_pct: float = 0.0        # mid exit at fixed pct (0 = disabled; remaining TRAIL-only)
+    mainnet_mid_exit_pct: float = 0.50     # fraction of remaining qty (after TP1) to exit at mid TP
     mainnet_recovery_enabled: bool = True
-    # Recovery (DCA) settings — reduced from 3 steps to 1, with
-    # tighter trigger (0.09% -> 0.05%) so the first averaging happens
-    # closer to entry, yielding a better average price and limiting
-    # the maximum notional exposure to 2x the base (400 USDC).
-    mainnet_recovery_steps: int = 1
-    mainnet_recovery_trigger_pct: float = 0.0005
-    mainnet_recovery_tp_shrink: float = 0.45
+    # Recovery (DCA) settings — aligned to backtest best (wildcat_s1s5_7d):
+    # steps=3, trigger 0.09% (increments ×(count+1) per layer), tp_shrink 0.45.
+    # steps=0 disables DCA entirely.
+    mainnet_recovery_steps: int = 3
+    mainnet_recovery_trigger_pct: float = 0.0009
+    mainnet_recovery_tp_shrink: float = 0.55
+    # After each DCA layer, widen the SL distance by this fraction per layer
+    # (sl_pct × (1 + widen × dca_count)) so a freshly averaged position is not
+    # immediately swept.  Mirrors backtest_wildcat_s1s5 (0.25/layer).
+    mainnet_recovery_sl_widen_per_layer: float = 0.25
     mainnet_adverse_exit_bars: int = 10
     mainnet_adverse_exit_loss_pct: float = 0.0007
-    mainnet_max_holding_bars: int = 20
+    mainnet_max_holding_bars: int = 24
     # Trailing take-profit / profit-lock (2026-06-08). Mirrors the backtest
     # wildcat_v3_trail_c preset (arm 0.7 / giveback 0.25), which lifted 30d
     # PnL +320->+762 and cut MaxDD 45.8->15.8 by locking runner gains that
@@ -185,8 +190,38 @@ class Settings(BaseSettings):
     # mainnet_trail_exit_maker_ttl_seconds; if it has not filled by then (price
     # ran past), we cancel it and market-close the remainder. SL/ADVERSE/MAX_HOLD
     # keep their guaranteed market close — only TRAIL uses this maker-first path.
+    # Within the TTL the maker quote is re-priced every
+    # mainnet_trail_exit_reprice_seconds to chase the book, so a moving market
+    # does not strand it at a stale price (Run 61139 paid a taker fee that way).
     mainnet_trail_exit_use_maker: bool = True
-    mainnet_trail_exit_maker_ttl_seconds: int = 8
+    mainnet_trail_exit_maker_ttl_seconds: int = 12
+    mainnet_trail_exit_reprice_seconds: int = 2
+    # Fast trail-trigger watcher (2026-06-10).  While TRAIL is armed, a
+    # dedicated asyncio task polls the mark at this interval; the 10s manage
+    # cycle is too coarse for sub-minute dumps (run cry3mn_1781048052462
+    # peaked 1638.03 with theoretical trigger 1637.73, but the next cycle
+    # woke at 1636.9 and the whole trail gain was gone).
+    mainnet_trail_watch_interval_seconds: int = 2
+    # TRAIL profit floor epsilon (E2, 2026-06-10).  The V3 floor (mark > entry,
+    # zero margin) was passed by 0.002 on the 06-10 08:32 loss run — firing AT
+    # breakeven means the maker exit then bleeds ticks/fees into a net loss.
+    # TRAIL may only fire once mark clears cost basis by at least this many
+    # basis points; below the floor, SL/DCA keep ownership of the position.
+    # The same epsilon gates the maker-exit anchor (E3) and the chase floor.
+    mainnet_trail_profit_floor_bp: float = 1.5
+    # DCA directional guard toggle (2026-06-09).
+    # True  = momentum_only: block DCA only when stoch cross signals momentum reversal.
+    # False = off: no guard (higher DCA fill rate, validated in backtest_dca_guard_compare).
+    # Stable choice: True (momentum_only).
+    mainnet_dca_guard_enabled: bool = True
+    # Ladder / limit-entry offset (2026-06-09).
+    # Place maker limit this far BELOW signal price for LONG (ABOVE for SHORT) instead
+    # of entering immediately at close. 0 = current behaviour (immediate fill).
+    # Backtest sweet-spot 5bp; stable choice 3bp.
+    mainnet_entry_limit_offset: float = 0.0003   # 3bp
+    # How many 1-minute bars to wait for the limit entry to fill.  If still open
+    # after this many bars, cancel and drop the signal (miss).
+    mainnet_entry_limit_ttl_bars: int = 3
     mainnet_client_order_prefix: str = "cry3mn"
 
     # GTX post-only rejection handling.
@@ -239,14 +274,23 @@ class Settings(BaseSettings):
     # order at the top of book so it fills fast without paying taker fees.
     mainnet_residual_cleanup_notional_usdc: float = 20.0
 
-    # Loop cooldown: after an SL exit in a loop chain, the same
+    # Loop cooldown: after a NET-LOSS exit in a loop chain, the same
     # (side, strategy_label) combination is blocked for N minutes so
-    # we do not chain into an identical losing setup.
-    mainnet_loop_cooldown_minutes: int = 5
+    # we do not chain into an identical losing setup.  The cooldown escalates
+    # with the consecutive-loss streak: base + step*(streak-1) — e.g. 3, 8, 13…
+    # minutes for 1, 2, 3 losses in a row.  Any net-win resets the streak.
+    mainnet_loop_cooldown_minutes: int = 3
+    mainnet_loop_cooldown_step_minutes: int = 5
+    # Loop loss protection (2026-06-10): stop chaining new runs once the
+    # loop's cumulative NET PnL (realized − commission) falls to −cap USDC.
+    # 0 = disabled.  Runtime-adjustable from the Telegram 🛡 buttons and
+    # persisted in app_config (key mainnet_loop_loss_cap_usdc); this field
+    # is only the cold-start default.
+    mainnet_loop_loss_cap_usdc: float = 0.0
     # DCA guard cooldown: after the DCA risk guard blocks a recovery order,
     # hold that block for this many seconds regardless of regime re-classification
     # (prevents a brief range flicker from bypassing the guard within the window).
-    mainnet_dca_guard_cooldown_seconds: int = 300
+    mainnet_dca_guard_cooldown_seconds: int = 60
 
     @property
     def mainnet_effective_entry_notional_usdc(self) -> float:
