@@ -17,6 +17,7 @@ from src.gridbot.mainnet.one_run import MainnetOneRunManager
 from src.gridbot.storage.database import Database
 from src.gridbot.storage.repositories import (
     AuditLogRepository,
+    ConfigRepository,
     FuturesTradeRepository,
     GridSessionRepository,
     IncomeRepository,
@@ -64,6 +65,7 @@ class App:
         self.rec_repo = RecommendationRepository(self.db)
         self.audit_repo = AuditLogRepository(self.db)
         self.mainnet_run_repo = MainnetRunRepository(self.db)
+        self.config_repo = ConfigRepository(self.db)
 
         # Fetcher
         self.fetcher = BinanceFetcher(
@@ -478,9 +480,11 @@ class App:
                 repo=self.mainnet_run_repo,
                 trade_repo=self.trade_repo,
                 telegram_app=self.telegram_app,
+                config_repo=self.config_repo,
             )
             if self.telegram_app:
                 self.telegram_app.bot_data["mainnet_one_run_manager"] = self.mainnet_one_run_manager
+                self.telegram_app.bot_data["config_repo"] = self.config_repo
 
             # Schedule periodic tasks
             self.scheduler.add_fetch_job(

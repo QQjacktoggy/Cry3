@@ -25,12 +25,14 @@ from src.gridbot.telegram.handlers import (
     cmd_mainnet,
     cmd_pause,
     cmd_pnl,
+    cmd_rescue,
     cmd_resume,
     cmd_signal,
     cmd_start,
     cmd_testnet,
     handle_mainnet_callback,
     handle_manual_signal_callback,
+    handle_rescue_callback,
     handle_text_message,
     handle_unknown_command,
 )
@@ -100,7 +102,9 @@ def build_telegram_app(
     app.add_handler(CommandHandler("signal", cmd_signal))
     app.add_handler(CommandHandler("pause", cmd_pause))
     app.add_handler(CommandHandler("resume", cmd_resume))
+    app.add_handler(CommandHandler("rescue", cmd_rescue))
     app.add_handler(CallbackQueryHandler(handle_mainnet_callback, pattern=r"^mainnet:"))
+    app.add_handler(CallbackQueryHandler(handle_rescue_callback, pattern=r"^rescue:"))
     app.add_handler(CallbackQueryHandler(handle_manual_signal_callback, pattern=r"^manual_signal:"))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))

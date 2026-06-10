@@ -397,21 +397,43 @@ def generate_winrate_optimized_portfolio_decision(
                 _add_candidate("SHORT", strat_key, prices[idx], tp, sl)
 
     # ── Strategy 2: SuperTrend + VWAP (High-Confidence Trend Follow) ──
-    if trend in ("up", "down") and vol != "low":
+    # Strength gates mirror backtest wildcat_v3_s2_wide_c:
+    #   ema_spread_atr >= 0.15  — trend has meaningful separation
+    #   trend_share_60  >= 0.25  — at least 25% of last 60 bars were trending
+    _s2_ema_spread_atr = (
+        abs(ema_fast_1m[idx] - ema_slow_1m[idx]) / curr_atr
+        if ema_fast_1m[idx] is not None and ema_slow_1m[idx] is not None and curr_atr > 0
+        else 0.0
+    )
+    _s2_trend_count = sum(
+        1 for _i in range(max(20, idx - 59), idx + 1)
+        if (
+            ema_slow_1m[_i] is not None
+            and ema_trend_50[_i] is not None
+            and atr[_i] is not None
+            and ema_slow_1m[_i - 20] is not None
+            and (
+                (prices[_i] > ema_trend_50[_i] and (ema_slow_1m[_i] - ema_slow_1m[_i - 20]) / atr[_i] > 0.08)
+                or (prices[_i] < ema_trend_50[_i] and (ema_slow_1m[_i] - ema_slow_1m[_i - 20]) / atr[_i] < -0.08)
+            )
+        )
+    )
+    _s2_trend_share_60 = _s2_trend_count / 60
+    s2_strong = _s2_ema_spread_atr >= 0.15 and _s2_trend_share_60 >= 0.25
+
+    if trend in ("up", "down") and vol != "low" and s2_strong:
         strat_key = "S2_SuperTrend"
         if not _is_cooldown(strat_key) and vol_ratio >= min_volume_ratio:
             is_bullish = st_trend[idx] == 1 and prices[idx] > vwap[idx]
             is_bearish = st_trend[idx] == -1 and prices[idx] < vwap[idx]
-            
+
             crossover = _ema_crossed_recently(ema_fast_1m, ema_slow_1m, idx, "up", trigger_lookback_bars)
             crossunder = _ema_crossed_recently(ema_fast_1m, ema_slow_1m, idx, "down", trigger_lookback_bars)
-            continuation_long = _ema_continuation_confirmed(ema_fast_1m, ema_slow_1m, prices, candles, idx, "long", body_ratio)
-            continuation_short = _ema_continuation_confirmed(ema_fast_1m, ema_slow_1m, prices, candles, idx, "short", body_ratio)
 
-            if is_bullish and mtf_bullish and (crossover or continuation_long):
+            if is_bullish and mtf_bullish and crossover:
                 tp, sl = _get_tp_sl(0.0015, 0.0020, "LONG")
                 _add_candidate("LONG", strat_key, prices[idx], tp, sl)
-            elif is_bearish and mtf_bearish and (crossunder or continuation_short):
+            elif is_bearish and mtf_bearish and crossunder:
                 tp, sl = _get_tp_sl(0.0015, 0.0020, "SHORT")
                 _add_candidate("SHORT", strat_key, prices[idx], tp, sl)
 
@@ -629,6 +651,8 @@ def explain_winrate_optimized_portfolio_no_signal(
 
         if _is_cooldown("S2_SuperTrend"):
             reasons.append("S2_SuperTrend 冷卻中")
+        elif not s2_strong:
+            reasons.append(f"S2_SuperTrend：趨勢強度不足（ema_spread_atr={_s2_ema_spread_atr:.2f}<0.15 或 trend_share_60={_s2_trend_share_60:.2f}<0.25）")
         elif vol_ratio < min_volume_ratio:
             reasons.append(f"S2_SuperTrend：成交量不足，vol_ratio={vol_ratio:.2f} < {min_volume_ratio:.2f}")
         elif trend == "up" and not mtf_bullish:
@@ -641,16 +665,10 @@ def explain_winrate_optimized_portfolio_no_signal(
             reasons.append("S2_SuperTrend：SuperTrend / VWAP 空頭條件未齊")
         elif ema_fast_1m[idx - 1] is None or ema_slow_1m[idx - 1] is None or ema_fast_1m[idx] is None or ema_slow_1m[idx] is None:
             reasons.append("S2_SuperTrend：EMA 指標尚未就緒")
-        elif trend == "up" and not (
-            _ema_crossed_recently(ema_fast_1m, ema_slow_1m, idx, "up", trigger_lookback_bars)
-            or _ema_continuation_confirmed(ema_fast_1m, ema_slow_1m, prices, candles, idx, "long", body_ratio)
-        ):
-            reasons.append(f"S2_SuperTrend：最近 {trigger_lookback_bars} 根沒有 EMA5/EMA20 黃金交叉或延續確認")
-        elif trend == "down" and not (
-            _ema_crossed_recently(ema_fast_1m, ema_slow_1m, idx, "down", trigger_lookback_bars)
-            or _ema_continuation_confirmed(ema_fast_1m, ema_slow_1m, prices, candles, idx, "short", body_ratio)
-        ):
-            reasons.append(f"S2_SuperTrend：最近 {trigger_lookback_bars} 根沒有 EMA5/EMA20 死亡交叉或延續確認")
+        elif trend == "up" and not _ema_crossed_recently(ema_fast_1m, ema_slow_1m, idx, "up", trigger_lookback_bars):
+            reasons.append(f"S2_SuperTrend：最近 {trigger_lookback_bars} 根沒有 EMA5/EMA20 黃金交叉")
+        elif trend == "down" and not _ema_crossed_recently(ema_fast_1m, ema_slow_1m, idx, "down", trigger_lookback_bars):
+            reasons.append(f"S2_SuperTrend：最近 {trigger_lookback_bars} 根沒有 EMA5/EMA20 死亡交叉")
         else:
             reasons.append("S2_SuperTrend：趨勢存在，但本輪沒有交叉觸發")
         return reasons

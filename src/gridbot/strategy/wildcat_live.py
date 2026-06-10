@@ -96,7 +96,7 @@ def evaluate_dca_guard(candles: list[Candle], position_side: str) -> tuple[bool,
 
 
 def evaluate_entry_trend_guard(
-    candles: list[Candle], side: str, slope_block: float = 0.03
+    candles: list[Candle], side: str, slope_block: float = 0.06
 ) -> tuple[bool, str]:
     """Block fresh entries that fight an established trend (falling-knife guard).
 
@@ -143,8 +143,15 @@ def generate_wildcat_v2_adverse_guard_live_decision(
     target_daily_usdc: float = 20.0,
     notional_usdc: float = 1000.0,
     leverage: int = 75,
+    rescue_enabled: bool = True,
 ) -> WildcatLiveDecision | None:
-    """Return the latest wildcat decision using only available candles."""
+    """Return the latest wildcat decision using only available candles.
+
+    When ``rescue_enabled`` is False the catch-up / rescue "chase the daily
+    target" branch is fully disabled regardless of the preset, so only the
+    strict S1/S2/S5 setups can fire. This is the runtime kill-switch exposed
+    via the Telegram /rescue command.
+    """
     if len(candles) < 160:
         return None
     raw = [_to_wildcat_candle(c) for c in candles]
@@ -167,15 +174,19 @@ def generate_wildcat_v2_adverse_guard_live_decision(
     ):
         return None
 
+    # The Telegram /rescue switch acts as the live time-gate: when manually
+    # enabled the catch-up/rescue branch fires IMMEDIATELY (no 12:00/14:00 wait),
+    # gated only by the daily-target progress. When disabled it is fully off.
+    # The preset's catchup_start_hour/rescue_hour still drive the BACKTEST.
     catchup = (
-        params.catchup_enabled
+        rescue_enabled
+        and params.catchup_enabled
         and today_pnl_usdc < params.daily_profit_target_usdc
-        and current_time.hour >= params.catchup_start_hour
     )
     rescue = (
-        params.catchup_enabled
+        rescue_enabled
+        and params.catchup_enabled
         and today_pnl_usdc < params.target_daily_usdc
-        and current_time.hour >= params.rescue_hour
     )
     candidates = [
         row
@@ -293,8 +304,13 @@ def explain_wildcat_no_signal(
     s1_reasons = []
     if not s1_allowed:
         s1_reasons.append("RegimeGuard阻擋(趨勢佔比或均線擴張過大)")
-    if trend != "range":
-        s1_reasons.append(f"需要 range，目前為 {trend}")
+    s1_trend_ok_long = trend == "range" or (params.s1_allow_with_trend and trend == "up")
+    s1_trend_ok_short = trend == "range" or (params.s1_allow_with_trend and trend == "down")
+    if not s1_trend_ok_long and not s1_trend_ok_short:
+        s1_reasons.append(
+            f"需要 range，目前為 {trend}"
+            + ("（順勢已啟用但方向不符）" if params.s1_allow_with_trend else "")
+        )
     if vol_state not in {"low", "normal"}:
         s1_reasons.append(f"需要 low/normal 波動，目前為 {vol_state}")
     if vol_ratio < params.min_vol_ratio:
@@ -305,8 +321,8 @@ def explain_wildcat_no_signal(
     long_atr_bound = bb_lower_val + params.range_edge_atr_margin * atr_val
     short_atr_bound = bb_upper_val - params.range_edge_atr_margin * atr_val
 
-    s1_long_ok = price <= long_atr_bound and rsi_val <= params.s1_rsi_long_max
-    s1_short_ok = price >= short_atr_bound and rsi_val >= params.s1_rsi_short_min
+    s1_long_ok = s1_trend_ok_long and price <= long_atr_bound and rsi_val <= params.s1_rsi_long_max
+    s1_short_ok = s1_trend_ok_short and price >= short_atr_bound and rsi_val >= params.s1_rsi_short_min
 
     if not s1_reasons:
         s1_status = "watch"
@@ -362,5 +378,72 @@ def explain_wildcat_no_signal(
         f"<b>S5_Stoch [{s5_status}]</b>：K/D=[<code>{stoch_k_val:.1f}</code>, <code>{stoch_d_val:.1f}</code>]，VWAP=<code>${vwap_val:.2f}</code>"
         + (f"\n└ 未滿足：{', '.join(s5_reasons)}" if s5_reasons else " (已滿足)")
     )
+
+    # Check S2 — only present in this preset since S2_SuperTrend was added to
+    # enabled_strategies. Mirrors the build_candidates S2 block exactly so the
+    # /signal explanation matches the live trading logic.
+    if "S2_SuperTrend" in params.enabled_strategies:
+        s2_status = "inactive"
+        s2_reasons = []
+        trend_share_60_val = features["trend_share_60"][index]
+        ema_spread_atr_val = features["ema_spread_atr"][index]
+        s2_strong = (
+            trend_share_60_val >= params.s2_min_trend_share_60
+            and ema_spread_atr_val >= params.s2_min_ema_spread_atr
+        )
+        if trend not in {"up", "down"}:
+            s2_reasons.append(f"需要 up/down 趨勢，目前為 {trend}")
+        if vol_state == "low":
+            s2_reasons.append(f"需要 normal/high 波動，目前為 {vol_state}")
+        if vol_ratio < params.min_vol_ratio:
+            s2_reasons.append(f"量能比例 {vol_ratio:.2f} &lt; {params.min_vol_ratio:.2f}")
+        if not s2_strong:
+            s2_reasons.append(
+                f"趨勢強度不足(trend_share_60={trend_share_60_val:.2f}"
+                f"&lt;{params.s2_min_trend_share_60:.2f} 或 ema_spread_atr={ema_spread_atr_val:.2f}"
+                f"&lt;{params.s2_min_ema_spread_atr:.2f})"
+            )
+
+        st_val = features["supertrend"][index]
+        ema_fast_val = features["ema_fast"][index]
+        ema_slow_val = features["ema_slow"][index]
+        ema_fast_prev = features["ema_fast"][index - 1]
+        ema_slow_prev = features["ema_slow"][index - 1]
+        mtf_bull = features["ema_fast_5m"][index] > features["ema_slow_5m"][index]
+        mtf_bear = features["ema_fast_5m"][index] < features["ema_slow_5m"][index]
+        cross_up = ema_fast_prev <= ema_slow_prev and ema_fast_val > ema_slow_val
+        cross_dn = ema_fast_prev >= ema_slow_prev and ema_fast_val < ema_slow_val
+        continuation_up = (
+            (not params.s2_require_cross)
+            and ema_fast_val > ema_slow_val
+            and c["low"] <= max(vwap_val, ema_slow_val)
+        )
+        continuation_dn = (
+            (not params.s2_require_cross)
+            and ema_fast_val < ema_slow_val
+            and c["high"] >= min(vwap_val, ema_slow_val)
+        )
+        s2_long_ok = st_val == 1 and price > vwap_val and mtf_bull and (cross_up or continuation_up)
+        s2_short_ok = st_val == -1 and price < vwap_val and mtf_bear and (cross_dn or continuation_dn)
+
+        if not s2_reasons:
+            s2_status = "watch"
+            if not s2_long_ok and not s2_short_ok:
+                cross_hint = "EMA5/20 金叉" if params.s2_require_cross else "EMA5/20 金叉或延續"
+                cross_hint_dn = "EMA5/20 死叉" if params.s2_require_cross else "EMA5/20 死叉或延續"
+                s2_reasons.append(
+                    f"SuperTrend/VWAP/5MA/觸發未齊；ST={st_val}, 價格${price:.2f} vs VWAP${vwap_val:.2f}；"
+                    f"做多需 ST多頭+價&gt;VWAP+5m多頭+{cross_hint}；"
+                    f"做空需 ST空頭+價&lt;VWAP+5m空頭+{cross_hint_dn}"
+                )
+            else:
+                s2_status = "ready"
+
+        reasons.append(
+            f"<b>S2_SuperTrend [{s2_status}]</b>："
+            f"ST=<code>{st_val}</code>，趨勢佔比=<code>{trend_share_60_val:.2f}</code>，"
+            f"均線分離=<code>{ema_spread_atr_val:.2f}</code>"
+            + (f"\n└ 未滿足：{', '.join(s2_reasons)}" if s2_reasons else " (已滿足)")
+        )
 
     return reasons

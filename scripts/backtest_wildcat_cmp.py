@@ -34,7 +34,7 @@ from scripts.backtest_multi_strategies import (
 from scripts.backtest_smart_scalp import calculate_atr, calculate_vwap
 
 TAIPEI = ZoneInfo("Asia/Taipei")
-STRATEGIES = ("S1_BB_RSI", "S2_SuperTrend", "S3_EMA_MACD", "S4_Donchian", "S5_Stoch", "S6_TrendPull", "S7_Squeeze", "S8_TrendSnipe")
+STRATEGIES = ("S1_BB_RSI", "S2_SuperTrend", "S3_EMA_MACD", "S4_Donchian", "S5_Stoch", "S6_TrendPull", "S7_Squeeze")
 
 
 @dataclass(frozen=True)
@@ -115,18 +115,9 @@ class WildcatParams:
     s2_min_trend_share_60: float = 0.0   # last-60-bar trending fraction floor
     s2_min_ema_spread_atr: float = 0.0   # |emaFast-emaSlow|/ATR floor
     s2_require_cross: bool = False        # drop continuation entries
-    s2_min_vol_ratio: float = 0.0        # S2-specific vol_ratio floor (0 = use shared min_vol_ratio)
     # Live-accuracy guards (2026-06-08). Defaults off so existing presets are
     # unchanged.  Set both to match the A-layer live bot behaviour.
     entry_trend_guard_slope: float = 0.0  # >0 blocks counter-trend entries (live uses 0.03)
-    # Entry-quality experiments (2026-06-09). Defaults off so existing presets
-    # are unchanged.
-    # (B) deep-extension guard: block a mean-reversion entry when price is more
-    #     than K*ATR away from EMA50 (a falling/rising knife) regardless of slope.
-    entry_ema50_dist_atr: float = 0.0
-    # (C) confirmation candle: only take an entry whose bar closed in the trade
-    #     direction (LONG needs an up bar, SHORT a down bar).
-    entry_confirm_candle: bool = False
     dca_regime_guard: bool = False        # True blocks DCA outside range or on opposing stoch cross
     # Regime-coverage expansion (2026-06-08). Defaults off / 0 so existing
     # presets are unchanged.  These extend coverage into regimes S1/S5 ignore.
@@ -139,20 +130,6 @@ class WildcatParams:
     s6_sl: float = 0.0016
     s6_vwap_atr: float = 0.8   # min |price-VWAP|/ATR to call it a pullback
     s6_require_supertrend: bool = True  # only enter when SuperTrend agrees with trend
-    # (4) S8_TrendSnipe: tight EMA20-bounce in confirmed trends. Price touches
-    #     EMA20, confirmation candle closes in trend direction, RSI not extreme.
-    s8_tp: float = 0.0005
-    s8_sl: float = 0.0010
-    s8_ema20_atr: float = 0.3     # max |price-EMA20|/ATR to count as "touching"
-    s8_rsi_long_max: float = 55.0  # LONG: RSI must be below this (not overbought)
-    s8_rsi_long_min: float = 35.0  # LONG: RSI must be above this (not crashing)
-    s8_rsi_short_max: float = 65.0
-    s8_rsi_short_min: float = 45.0
-    s8_require_confirm: bool = True  # bar must close in trade direction
-    # Allow S1/S5 to fire in trending regimes when the direction matches
-    # (WITH-trend mean-reversion). Normally S1/S5 require trend=="range".
-    s1_allow_with_trend: bool = False  # S1 LONG in up, S1 SHORT in down
-    s5_allow_with_trend: bool = False  # ditto for S5
     # (3) S7_Squeeze: Bollinger squeeze breakout in LOW vol — band width is
     #     narrow (low atr_pct) then price breaks the band with volume.
     s7_tp: float = 0.0024
@@ -213,7 +190,6 @@ class Position:
     # 0.0 means "not yet initialised" (lazily set to entry_price on first use).
     peak_price: float = 0.0
     trail_armed: bool = False
-    entry_trend: str = "range"
 
 
 class RollingWinRate:
@@ -594,9 +570,8 @@ def preset_params(
         ),
         "wildcat_v2_adverse_guard": WildcatParams(
             label="wildcat_v2_adverse_guard",
-            s1_tp=0.0008,
+            s1_tp=0.0012,
             s1_sl=0.0018,
-            s1_allow_with_trend=True,
             s2_tp=0.0028,
             s2_sl=0.0015,
             s3_tp=0.0026,
@@ -622,7 +597,7 @@ def preset_params(
             sl_exit_fee_rate=0.0,
             target_daily_usdc=target_daily_usdc,
             leverage_options=leverage_options,
-            enabled_strategies=("S1_BB_RSI", "S5_Stoch", "S2_SuperTrend"),
+            enabled_strategies=("S1_BB_RSI", "S5_Stoch"),
             score_floor=0.0,
             max_open_positions=2,
             recovery_enabled=True,
@@ -650,13 +625,6 @@ def preset_params(
             adverse_exit_enabled=True,
             adverse_exit_bars=10,
             adverse_exit_loss_pct=0.0007,
-            # S2 strength gates from the winning wildcat_v3_s2_wide_c backtest:
-            # cross-only with a loose trend/separation floor, so S2 only fires in
-            # a sustained, separated trend (trades WITH a real move) instead of
-            # whipsawing in chop.
-            s2_min_trend_share_60=0.25,
-            s2_min_ema_spread_atr=0.15,
-            s2_require_cross=True,
         ),
     }
     # --- B/C experiment presets (2026-06-08) -------------------------------
@@ -1208,7 +1176,6 @@ def run_backtest(
         "S5_Stoch": RollingWinRate(20, 0.34),
         "S6_TrendPull": RollingWinRate(16, 0.36),
         "S7_Squeeze": RollingWinRate(20, 0.32),
-        "S8_TrendSnipe": RollingWinRate(20, 0.34),
     }
     cooldown_until = {key: 0 for key in STRATEGIES}
     side_cooldown_until = {(strategy, side): 0 for strategy in STRATEGIES for side in ("LONG", "SHORT")}
@@ -1284,9 +1251,7 @@ def run_backtest(
             if params.rolling_gate and not rolling[candidate.strategy].allow():
                 rejected["rolling_wr"] = rejected.get("rolling_wr", 0) + 1
                 continue
-            pos = open_position(candle, c_time, i, candidate, params)
-            pos.entry_trend = features["trend"][i]
-            positions.append(pos)
+            positions.append(open_position(candle, c_time, i, candidate, params))
             break
 
     final = candles[-1]
@@ -1405,16 +1370,12 @@ def build_candidates(
     s1_allowed = s1_regime_allowed(f, i, params)
 
     s1_vol_ok = vol_state in {"low", "normal"} or (params.s1_allow_high_vol and vol_state == "high")
-    # S1 in range (original) + optionally in trend when direction matches.
-    s1_range = trend == "range"
-    s1_with_trend_long = params.s1_allow_with_trend and trend == "up"
-    s1_with_trend_short = params.s1_allow_with_trend and trend == "down"
-    if s1_allowed and s1_vol_ok and vol_ratio >= params.min_vol_ratio and body_ratio >= params.strict_body_ratio:
-        if (s1_range or s1_with_trend_long) and price <= f["bb_lower"][i] + params.range_edge_atr_margin * atr_val and f["rsi"][i] <= params.s1_rsi_long_max:
+    if s1_allowed and trend == "range" and s1_vol_ok and vol_ratio >= params.min_vol_ratio and body_ratio >= params.strict_body_ratio:
+        if price <= f["bb_lower"][i] + params.range_edge_atr_margin * atr_val and f["rsi"][i] <= params.s1_rsi_long_max:
             stretch = max(0.0, (f["bb_lower"][i] - price) / atr_val)
             relax_penalty = max(0.0, f["rsi"][i] - 32) * 0.35 + params.range_edge_atr_margin * 14
             add("S1_BB_RSI", "LONG", 65 + min(18, stretch * 12) + (32 - min(f["rsi"][i], 32)) * 0.4 - relax_penalty, params.s1_tp, params.s1_sl, ["bb_lower", "rsi_oversold"])
-        if (s1_range or s1_with_trend_short) and price >= f["bb_upper"][i] - params.range_edge_atr_margin * atr_val and f["rsi"][i] >= params.s1_rsi_short_min:
+        if price >= f["bb_upper"][i] - params.range_edge_atr_margin * atr_val and f["rsi"][i] >= params.s1_rsi_short_min:
             stretch = max(0.0, (price - f["bb_upper"][i]) / atr_val)
             relax_penalty = max(0.0, 68 - f["rsi"][i]) * 0.35 + params.range_edge_atr_margin * 14
             add("S1_BB_RSI", "SHORT", 65 + min(18, stretch * 12) + (max(f["rsi"][i], 68) - 68) * 0.4 - relax_penalty, params.s1_tp, params.s1_sl, ["bb_upper", "rsi_overbought"])
@@ -1423,8 +1384,7 @@ def build_candidates(
         f["trend_share_60"][i] >= params.s2_min_trend_share_60
         and f["ema_spread_atr"][i] >= params.s2_min_ema_spread_atr
     )
-    s2_vol_floor = params.s2_min_vol_ratio if params.s2_min_vol_ratio > 0 else params.min_vol_ratio
-    if trend in {"up", "down"} and vol_state != "low" and vol_ratio >= s2_vol_floor and s2_strong:
+    if trend in {"up", "down"} and vol_state != "low" and vol_ratio >= params.min_vol_ratio and s2_strong:
         cross_up = f["ema_fast"][i - 1] <= f["ema_slow"][i - 1] and f["ema_fast"][i] > f["ema_slow"][i]
         cross_dn = f["ema_fast"][i - 1] >= f["ema_slow"][i - 1] and f["ema_fast"][i] < f["ema_slow"][i]
         continuation_up = (not params.s2_require_cross) and f["ema_fast"][i] > f["ema_slow"][i] and c["low"] <= max(f["vwap"][i], f["ema_slow"][i])
@@ -1450,16 +1410,13 @@ def build_candidates(
         if price < lower - params.breakout_atr_margin * atr_val:
             add("S4_Donchian", "SHORT", 70 + min(20, vol_ratio * 4), params.s4_tp, params.s4_sl, ["donchian_lower", "high_volume"])
 
-    s5_range = trend == "range"
-    s5_with_trend_long = params.s5_allow_with_trend and trend == "up"
-    s5_with_trend_short = params.s5_allow_with_trend and trend == "down"
-    if vol_state == "normal" and vol_ratio >= params.min_vol_ratio and body_ratio >= params.strict_body_ratio:
+    if trend == "range" and vol_state == "normal" and vol_ratio >= params.min_vol_ratio and body_ratio >= params.strict_body_ratio:
         stoch_up = f["stoch_k"][i - 1] <= f["stoch_d"][i - 1] and f["stoch_k"][i] > f["stoch_d"][i]
         stoch_dn = f["stoch_k"][i - 1] >= f["stoch_d"][i - 1] and f["stoch_k"][i] < f["stoch_d"][i]
-        if (s5_range or s5_with_trend_long) and stoch_up and f["stoch_d"][i] < params.s5_long_d_max and price < f["vwap"][i] + (0.25 + params.range_edge_atr_margin) * atr_val:
+        if stoch_up and f["stoch_d"][i] < params.s5_long_d_max and price < f["vwap"][i] + (0.25 + params.range_edge_atr_margin) * atr_val:
             relax_penalty = max(0.0, f["stoch_d"][i] - 24) * 0.3 + params.range_edge_atr_margin * 10
             add("S5_Stoch", "LONG", 66 + (24 - min(f["stoch_d"][i], 24)) * 0.5 - relax_penalty, params.s5_tp, params.s5_sl, ["stoch_cross_up", "range_reversion"])
-        if (s5_range or s5_with_trend_short) and stoch_dn and f["stoch_d"][i] > params.s5_short_d_min and price > f["vwap"][i] - (0.25 + params.range_edge_atr_margin) * atr_val:
+        if stoch_dn and f["stoch_d"][i] > params.s5_short_d_min and price > f["vwap"][i] - (0.25 + params.range_edge_atr_margin) * atr_val:
             relax_penalty = max(0.0, 76 - f["stoch_d"][i]) * 0.3 + params.range_edge_atr_margin * 10
             add("S5_Stoch", "SHORT", 66 + (max(f["stoch_d"][i], 76) - 76) * 0.5 - relax_penalty, params.s5_tp, params.s5_sl, ["stoch_cross_down", "range_reversion"])
 
@@ -1484,60 +1441,19 @@ def build_candidates(
         if price < f["bb_lower"][i] - params.s7_breakout_atr * atr_val:
             add("S7_Squeeze", "SHORT", 68 + min(15, vol_ratio * 4), params.s7_tp, params.s7_sl, ["squeeze_break_down", "low_vol_expansion"])
 
-    # S8_TrendSnipe: EMA20-bounce in a confirmed trend. The EMA20 is natural
-    # support (uptrend) / resistance (downtrend). Enter when price touches it,
-    # the bar confirms direction, and RSI shows a pullback (not exhaustion).
-    # Ultra-tight TP lets trend momentum carry the exit; tight SL cuts fast if
-    # the support breaks (trend weakening).
-    if "S8_TrendSnipe" in params.enabled_strategies and trend in {"up", "down"} and vol_state != "low":
-        ema20 = f["ema_slow"][i]
-        ema20_dist = abs(price - ema20) / atr_val if atr_val > 0 else 999
-        rsi_val = f["rsi"][i] if f["rsi"][i] is not None else 50
-        up_bar = c["close"] >= c["open"]
-        st_ok_long = f["supertrend"][i] == 1
-        st_ok_short = f["supertrend"][i] == -1
-        confirm_long = (not params.s8_require_confirm) or up_bar
-        confirm_short = (not params.s8_require_confirm) or (not up_bar)
-        if (
-            trend == "up" and mtf_bull and st_ok_long
-            and ema20_dist <= params.s8_ema20_atr
-            and price >= ema20  # price is AT or just above EMA20 (touching support, not broken)
-            and params.s8_rsi_long_min <= rsi_val <= params.s8_rsi_long_max
-            and confirm_long
-        ):
-            proximity_bonus = max(0, (params.s8_ema20_atr - ema20_dist) * 10)
-            add("S8_TrendSnipe", "LONG", 72 + proximity_bonus, params.s8_tp, params.s8_sl, ["ema20_bounce", "trend_confirm"])
-        if (
-            trend == "down" and mtf_bear and st_ok_short
-            and ema20_dist <= params.s8_ema20_atr
-            and price <= ema20  # price is AT or just below EMA20 (touching resistance, not broken)
-            and params.s8_rsi_short_min <= rsi_val <= params.s8_rsi_short_max
-            and confirm_short
-        ):
-            proximity_bonus = max(0, (params.s8_ema20_atr - ema20_dist) * 10)
-            add("S8_TrendSnipe", "SHORT", 72 + proximity_bonus, params.s8_tp, params.s8_sl, ["ema20_bounce", "trend_confirm"])
-
     if catchup and s1_allowed and vol_ratio >= params.min_vol_ratio * 0.45 and body_ratio >= max(0.04, params.strict_body_ratio * 0.45):
         vwap_atr = params.rescue_vwap_atr if rescue else params.catchup_vwap_atr
         rsi_long_max = params.rescue_rsi_long_max if rescue else params.catchup_rsi_long_max
         rsi_short_min = params.rescue_rsi_short_min if rescue else params.catchup_rsi_short_min
         long_edge = price < f["vwap"][i] - vwap_atr * atr_val and f["rsi"][i] <= rsi_long_max
         short_edge = price > f["vwap"][i] + vwap_atr * atr_val and f["rsi"][i] >= rsi_short_min
-        _rescue_mult = 0.62 if rescue else 0.72
-        # Ensure rescue/catchup tp_pct stays above partial_tp_pct so tp1 always
-        # fills before tp3 (avoid inverted TP ordering when tp_pct is very tight).
-        _rescue_tp = max(
-            params.partial_tp_pct + 0.0001,
-            min(params.s1_tp, params.s5_tp) * _rescue_mult,
-        )
-        _rescue_sl = max(params.s1_sl, params.s5_sl) * 0.95
         if long_edge:
             add(
                 "S1_BB_RSI",
                 "LONG",
                 61 + min(14, (f["vwap"][i] - price) / atr_val * 5) + (3 if rescue else 0),
-                _rescue_tp,
-                _rescue_sl,
+                min(params.s1_tp, params.s5_tp) * (0.62 if rescue else 0.72),
+                max(params.s1_sl, params.s5_sl) * 0.95,
                 ["rescue_vwap_reversion" if rescue else "catchup_vwap_reversion", "rsi_soft_long"],
             )
         if short_edge:
@@ -1545,8 +1461,8 @@ def build_candidates(
                 "S1_BB_RSI",
                 "SHORT",
                 61 + min(14, (price - f["vwap"][i]) / atr_val * 5) + (3 if rescue else 0),
-                _rescue_tp,
-                _rescue_sl,
+                min(params.s1_tp, params.s5_tp) * (0.62 if rescue else 0.72),
+                max(params.s1_sl, params.s5_sl) * 0.95,
                 ["rescue_vwap_reversion" if rescue else "catchup_vwap_reversion", "rsi_soft_short"],
             )
 
@@ -1561,27 +1477,6 @@ def build_candidates(
             c for c in candidates
             if not (c.side == "LONG" and price < ema_t and bt_slope < -sg)
             and not (c.side == "SHORT" and price > ema_t and bt_slope > sg)
-        ]
-
-    # B: deep-extension guard — refuse a mean-reversion entry that is more than
-    # K*ATR away from EMA50 (a falling/rising knife), independent of slope.
-    if params.entry_ema50_dist_atr > 0 and i >= 50:
-        k = params.entry_ema50_dist_atr
-        ema_t = f["ema_trend"][i]
-        candidates = [
-            cand for cand in candidates
-            if not (cand.side == "LONG" and price < ema_t - k * atr_val)
-            and not (cand.side == "SHORT" and price > ema_t + k * atr_val)
-        ]
-
-    # C: confirmation candle — only take an entry whose bar closed in the trade
-    # direction (LONG needs an up bar, SHORT a down bar), filtering knife-catches.
-    if params.entry_confirm_candle:
-        up_bar = c["close"] >= c["open"]
-        candidates = [
-            cand for cand in candidates
-            if not (cand.side == "LONG" and not up_bar)
-            and not (cand.side == "SHORT" and up_bar)
         ]
 
     return candidates
@@ -1779,7 +1674,6 @@ def close_trade(c_time: datetime, i: int, pos: Position, exit_price: float, exit
         "dca_count": pos.dca_count,
         "partial_taken": pos.partial_taken,
         "final_notional_usdc": round(pos.notional_usdc, 4),
-        "trend": pos.entry_trend,
     }
 
 
