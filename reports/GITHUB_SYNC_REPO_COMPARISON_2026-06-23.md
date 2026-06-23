@@ -74,3 +74,26 @@ That is a larger migration. It should not be mixed with the urgent task of getti
 ## Practical Decision
 
 Best next action: keep the current GitHub repo, but publish current live through a clean branch/PR sequence. Treat live VM as the source of truth for v1.3.8 behavior, and treat `origin/main` as the commit base that must not be blindly overwritten.
+
+## Execution Result
+
+Implemented through a clean temporary worktree at `C:\tmp\cry3-v138-sync-eval`.
+
+- Branch pushed: `sync/live-codex-v1-3-8`
+- Draft PR: https://github.com/QQjacktoggy/Cry3/pull/6
+- PR base: `main`
+- PR head: `sync/live-codex-v1-3-8`
+- Final branch commits:
+  - `fb200c6` `sync: add codex v1 live policy`
+  - `422d9ca` `sync: integrate live codex v1.3.8 one-run`
+  - `3128b3f` `docs: record live v1.3.8 github sync`
+  - `b4ee21b` `sync: add codex tp policy shadow`
+
+Validation from the clean worktree:
+
+```powershell
+C:\Users\pipi\Desktop\cry3\.venv\Scripts\python.exe -m py_compile config/settings.py src/gridbot/strategy/codex_v1_live.py src/gridbot/mainnet/tp_policy_shadow.py src/gridbot/mainnet/one_run.py tests/test_codex_v1_live_policy.py tests/test_codex_tp_policy_shadow.py tests/test_mainnet_one_run_maker.py
+C:\Users\pipi\Desktop\cry3\.venv\Scripts\python.exe -m pytest -q tests/test_codex_v1_live_policy.py tests/test_codex_tp_policy_shadow.py tests/test_mainnet_one_run_maker.py
+```
+
+Result: `105 passed, 3 warnings`.
