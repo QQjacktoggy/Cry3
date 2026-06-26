@@ -284,9 +284,9 @@ class Settings(BaseSettings):
     mainnet_entry_max_deviation_bps: float = 8.0
     mainnet_entry_requote_min_age_seconds: int = 22
     mainnet_partial_exit_pct: float = 0.40
-    mainnet_partial_tp_pct: float = 0.0005
-    mainnet_mid_tp_pct: float = 0.0        # mid exit at fixed pct (0 = disabled; remaining TRAIL-only)
-    mainnet_mid_exit_pct: float = 0.50     # fraction of remaining qty (after TP1) to exit at mid TP
+    mainnet_partial_tp_pct: float = 0.0004  # TP1 = 4bp
+    mainnet_mid_tp_pct: float = 0.0        # mid exit disabled — remainder is TRAIL-only
+    mainnet_mid_exit_pct: float = 0.0      # mid exit fraction disabled (was 0.50)
     mainnet_recovery_enabled: bool = True
     # Recovery (DCA) settings — aligned to backtest best (wildcat_s1s5_7d):
     # steps=3, trigger 0.09% (increments ×(count+1) per layer), tp_shrink 0.45.
@@ -321,8 +321,8 @@ class Settings(BaseSettings):
     # Backtest assumes a 1m-low fill; live samples mark every ~10s so realised
     # gain will be somewhat lower — validate on testnet before trusting fully.
     mainnet_trail_enabled: bool = True
-    mainnet_trail_arm_frac: float = 0.7      # arm once peak MFE >= this fraction of tp_pct
-    mainnet_trail_giveback_frac: float = 0.25  # lock-exit after retracing this fraction of the run
+    mainnet_trail_arm_frac: float = 0.5      # arm once peak MFE >= this fraction of tp_pct (was 0.7)
+    mainnet_trail_giveback_frac: float = 0.5   # lock-exit after retracing this fraction of the run (was 0.25)
     # TRAIL profit-lock exit fee optimisation (2026-06-08). The runner is in
     # profit and not racing a stop, so the lock-exit can be a reduce-only
     # POST_ONLY (maker, 0 USDC fee on ETHUSDC) instead of a market taker close.

@@ -12,13 +12,27 @@ from __future__ import annotations
 from dataclasses import dataclass
 from math import isfinite
 from html import escape
+import json
 import re
 from typing import Any, Mapping, Sequence
 
 
-CODEX_V1_VERSION = "_codex_v1.3.9C_live_admission_guard"
+CODEX_V1_VERSION = "_codex_v1.4.0_tp_trail"
 CODEX_V1_BASELINE = "portfolio_union_21branch_w1s6short_cluster1129"
-BASE_NOTIONAL_USDC = 200.0
+BASE_NOTIONAL_USDC = 50.0
+STALE_UPMOVE_CANARY_LANE = "codex_v1_stale_upmove_short_rng20_canary"
+STALE_UPMOVE_CANARY_LANE_CODE = "STUP-S"
+STALE_UPMOVE_CANARY_POLICY_TAG = "v1312_stale_upmove_guarded_canary"
+STALE_UPMOVE_CANARY_RNG15_MIN_BP = 20.0
+STALE_UPMOVE_CANARY_RNG15_MAX_BP = 100.0
+STALE_UPMOVE_CANARY_ADV3_MIN_BP = 0.0
+STALE_UPMOVE_CANARY_D30_MAX_BP = 80.0
+STALE_UPMOVE_CANARY_NOTIONAL_USDC = 50.0
+STALE_UPMOVE_SL19_SHADOW_TAG = "v1315_stups_sl19_shadow_only"
+STALE_UPMOVE_SL19_SHADOW_BP = 19.0
+STALE_UPMOVE_LOW_RNG_WEAK_ADV_SHADOW_TAG = "v1315_stups_low_rng_weak_adv_shadow_only"
+STALE_UPMOVE_LOW_RNG_MAX_BP = 30.0
+STALE_UPMOVE_WEAK_ADV3_MAX_BP = 3.0
 SUPPORTED_SYMBOLS = ("ETHUSDC",)
 
 
@@ -509,6 +523,13 @@ def select_codex_v1_lane(features: Mapping[str, Any]) -> CodexV1Decision:
                 risk_tags=get_short_risk_tags(features),
             )
     if is_stale_short_after_upmove(features):
+        stale_upmove_canary = build_stale_upmove_canary_decision(
+            features,
+            strategy=strategy,
+            side=side,
+        )
+        if stale_upmove_canary is not None:
+            return stale_upmove_canary
         return _reject(
             "stale_short_after_upmove_blocked",
             features=features,
@@ -675,7 +696,10 @@ def describe_codex_v1_nearest_lanes(
         if is_hot_up_extension(features):
             lines.insert(0, "SHORT veto active: hot_up_extension_short_blocked")
         elif is_stale_short_after_upmove(features):
-            lines.insert(0, "SHORT veto active: stale_short_after_upmove_blocked")
+            if build_stale_upmove_canary_decision(features) is not None:
+                lines.insert(0, "SHORT canary active: stale_upmove_guarded_canary")
+            else:
+                lines.insert(0, "SHORT veto active: stale_short_after_upmove_blocked")
         elif is_mid_up_extension_short_risk(features):
             lines.insert(0, "SHORT veto active: mid_up_extension_short_blocked")
     return tuple(lines)
@@ -1136,6 +1160,179 @@ def is_stale_short_after_upmove(features: Mapping[str, Any]) -> bool:
     )
 
 
+
+def evaluate_stups_loss_breaker(
+    completed_runs: Sequence[Mapping[str, Any]],
+    *,
+    min_net_loss_usdc: float = 0.04,
+    loss_count: int = 2,
+    window_seconds: int | None = None,
+) -> dict[str, Any]:
+    """Return whether recent completed STUP-S losses should pause new entries."""
+    threshold = max(1, int(loss_count or 1))
+    min_loss = abs(float(min_net_loss_usdc or 0.0))
+    completed_count = 0
+    net_pnl = 0.0
+    loss_rows: list[dict[str, Any]] = []
+
+    def _row_float(row: Mapping[str, Any], key: str) -> float:
+        try:
+            return float(row.get(key) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    for row in completed_runs or ():
+        if not isinstance(row, Mapping):
+            continue
+        signal_raw = row.get("signal_json")
+        if isinstance(signal_raw, str):
+            try:
+                signal = json.loads(signal_raw) if signal_raw else {}
+            except json.JSONDecodeError:
+                signal = {}
+        elif isinstance(signal_raw, Mapping):
+            signal = signal_raw
+        else:
+            signal = {}
+        codex = signal.get("codex_v1") if isinstance(signal, Mapping) else {}
+        if not isinstance(codex, Mapping):
+            codex = {}
+        lane_code = str(codex.get("lane_code") or "")
+        if lane_code != "STUP-S":
+            continue
+
+        completed_count += 1
+        realized = _row_float(row, "realized_pnl_usdc")
+        commission = _row_float(row, "commission_usdc")
+        net = realized - commission
+        net_pnl += net
+        exit_reason = str(row.get("exit_reason") or row.get("status") or "")
+        if net <= -min_loss:
+            loss_rows.append(
+                {
+                    "run_id": str(row.get("run_id") or ""),
+                    "exit_reason": exit_reason,
+                    "net_pnl_usdc": round(net, 8),
+                }
+            )
+
+    return {
+        "should_block": len(loss_rows) >= threshold and net_pnl < 0.0,
+        "lane_code": "STUP-S",
+        "completed_count": completed_count,
+        "loss_count": len(loss_rows),
+        "loss_threshold": threshold,
+        "min_net_loss_usdc": round(min_loss, 8),
+        "window_seconds": window_seconds,
+        "net_pnl_usdc": round(net_pnl, 8),
+        "loss_net_pnl_usdc": round(sum(float(x["net_pnl_usdc"]) for x in loss_rows), 8),
+        "loss_run_ids": [x["run_id"] for x in loss_rows],
+        "loss_reasons": [x["exit_reason"] for x in loss_rows],
+    }
+def build_stale_upmove_canary_decision(
+    features: Mapping[str, Any],
+    *,
+    strategy: str | None = None,
+    side: str | None = None,
+) -> CodexV1Decision | None:
+    strategy_value = strategy if strategy is not None else _string_feature(features, "strategy")
+    side_value = side if side is not None else _string_feature(features, "side")
+    if strategy_value != "S1_BB_RSI" or side_value != "SHORT":
+        return None
+
+    rng15 = _feature_value(features, "rng15")
+    if rng15 is None or rng15 <= STALE_UPMOVE_CANARY_RNG15_MIN_BP:
+        return None
+    if rng15 > STALE_UPMOVE_CANARY_RNG15_MAX_BP:
+        return None
+
+    adv3 = _feature_value(features, "adv3")
+    if adv3 is None or adv3 <= STALE_UPMOVE_CANARY_ADV3_MIN_BP:
+        return None
+
+    d30 = _feature_value(features, "d30")
+    if d30 is None or d30 > STALE_UPMOVE_CANARY_D30_MAX_BP:
+        return None
+
+    notional_mult = STALE_UPMOVE_CANARY_NOTIONAL_USDC / BASE_NOTIONAL_USDC
+    low_rng_weak_adv_shadow = (
+        rng15 <= STALE_UPMOVE_LOW_RNG_MAX_BP
+        and adv3 < STALE_UPMOVE_WEAK_ADV3_MAX_BP
+    )
+    shadow_guards = [STALE_UPMOVE_SL19_SHADOW_TAG]
+    base_tags = (
+        "post_only_entry",
+        "dca_disabled",
+        "trail_required",
+        *get_short_risk_tags(features),
+        "stale_upmove_canary",
+        "rng15_gt20",
+        "rng15_le100",
+        "adv3_gt0",
+        "d30_le80",
+        "canary_notional_50",
+        "tp_no_runner",
+        "original_sl_kept",
+        STALE_UPMOVE_SL19_SHADOW_TAG,
+    )
+    if low_rng_weak_adv_shadow:
+        base_tags = (*base_tags, STALE_UPMOVE_LOW_RNG_WEAK_ADV_SHADOW_TAG)
+        shadow_guards.append(STALE_UPMOVE_LOW_RNG_WEAK_ADV_SHADOW_TAG)
+    risk_tags = tuple(dict.fromkeys(base_tags))
+    metrics = {
+        "policy_note": STALE_UPMOVE_CANARY_POLICY_TAG,
+        "policy_tag": STALE_UPMOVE_CANARY_POLICY_TAG,
+        "shadow_lane": "SH_SHORT_STALE_UPMOVE_S1",
+        "admitted_from_shadow_lane": "SH_SHORT_STALE_UPMOVE_S1",
+        "rng15": round(float(rng15), 4),
+        "rng15_min_bp": STALE_UPMOVE_CANARY_RNG15_MIN_BP,
+        "rng15_max_bp": STALE_UPMOVE_CANARY_RNG15_MAX_BP,
+        "adv3": round(float(adv3), 4),
+        "adv3_min_bp": STALE_UPMOVE_CANARY_ADV3_MIN_BP,
+        "d30": round(float(d30), 4),
+        "d30_max_bp": STALE_UPMOVE_CANARY_D30_MAX_BP,
+        "admission_guard": "rng15_gt20_adv3_gt0_rng15_le100_d30_le80",
+        "applied_notional_cap_usdc": STALE_UPMOVE_CANARY_NOTIONAL_USDC,
+        "tp_policy_override": "no_runner_40tp1_60full",
+        "sl_policy": "keep_original_17bp",
+        "sl_policy_shadow": STALE_UPMOVE_SL19_SHADOW_TAG,
+        "sl_policy_shadow_bp": STALE_UPMOVE_SL19_SHADOW_BP,
+        "sl_policy_shadow_action": "observe_only",
+        "sl_policy_shadow_replay_note": (
+            "rng15_gt20 subset: 19bp +11.4064bp vs 17.1bp; not live"
+        ),
+        "shadow_guards": shadow_guards,
+        "replay_report": "reports/SH_SHORT_STALE_UPMOVE_S1_FULL_TP_SL_REPLAY_2026-06-24.md",
+    }
+    if low_rng_weak_adv_shadow:
+        metrics.update(
+            {
+                STALE_UPMOVE_LOW_RNG_WEAK_ADV_SHADOW_TAG: True,
+                "low_rng_weak_adv_shadow_action": "observe_only",
+                "low_rng_weak_adv_shadow_condition": "rng15_le30_adv3_lt3",
+                "low_rng_weak_adv_rng15_max_bp": STALE_UPMOVE_LOW_RNG_MAX_BP,
+                "low_rng_weak_adv_adv3_max_bp": STALE_UPMOVE_WEAK_ADV3_MAX_BP,
+            }
+        )
+    return CodexV1Decision(
+        accepted=True,
+        version=CODEX_V1_VERSION,
+        baseline=CODEX_V1_BASELINE,
+        lane=STALE_UPMOVE_CANARY_LANE,
+        lane_code=STALE_UPMOVE_CANARY_LANE_CODE,
+        strategy=strategy_value,
+        side=side_value,
+        entry_offset_bp=1.0,
+        size_mult=notional_mult,
+        notional_mult=notional_mult,
+        requested_notional_usdc=STALE_UPMOVE_CANARY_NOTIONAL_USDC,
+        reason="stale_upmove_guarded_canary",
+        regime="stale_short_after_upmove",
+        risk_tags=risk_tags,
+        metrics=metrics,
+        policy_tag=STALE_UPMOVE_CANARY_POLICY_TAG,
+        shadow_lane="SH_SHORT_STALE_UPMOVE_S1",
+    )
 def is_mid_up_extension_short_risk(features: Mapping[str, Any]) -> bool:
     side = _string_feature(features, "side")
     rsi = _feature_value(features, "rsi")
@@ -1595,6 +1792,7 @@ _LANE_CODE_BY_KEY: dict[tuple[str, str | None], str] = {
     ("w3_lane_s8short_bar2492_narrow_e0", "SHORT"): "W3C",
     ("w1_lane_s6short_cluster1129_rng57_70_d30neg75_neg49_rsi43_53_vwap38_56_rp15_063_080_e0", "SHORT"): "W1E",
     ("codex_v1_hot_up_extension_pullback_long", "LONG"): "HUE-L",
+    (STALE_UPMOVE_CANARY_LANE, "SHORT"): STALE_UPMOVE_CANARY_LANE_CODE,
 }
 
 

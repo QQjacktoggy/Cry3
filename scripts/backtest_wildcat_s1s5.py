@@ -595,7 +595,7 @@ def preset_params(
         "wildcat_v2_adverse_guard": WildcatParams(
             label="wildcat_v2_adverse_guard",
             s1_tp=0.0008,
-            s1_sl=0.0018,
+            s1_sl=0.0025,
             s1_allow_with_trend=True,
             s2_tp=0.0028,
             s2_sl=0.0015,
@@ -630,8 +630,6 @@ def preset_params(
             recovery_trigger_pct=0.0009,
             recovery_notional_scale=1.0,
             recovery_tp_shrink=0.45,
-            partial_exit_pct=0.40,
-            partial_tp_pct=0.0005,
             daily_target_stop=True,
             daily_profit_target_usdc=40.0,
             daily_floor_lock_usdc=24.0,
@@ -657,6 +655,11 @@ def preset_params(
             s2_min_trend_share_60=0.25,
             s2_min_ema_spread_atr=0.15,
             s2_require_cross=True,
+            partial_exit_pct=0.40,
+            partial_tp_pct=0.0004,
+            trail_enabled=True,
+            trail_arm_frac=0.5,
+            trail_giveback_frac=0.5,
         ),
     }
     # --- B/C experiment presets (2026-06-08) -------------------------------
