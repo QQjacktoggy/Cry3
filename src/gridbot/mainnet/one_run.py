@@ -238,6 +238,12 @@ class MainnetOneRunManager:
         self._rescue_spike_notified: set[str] = set()
         # Track run ids already notified for rng15 range filter skips.
         self._rng15_guard_notified: set[str] = set()
+        # Option A direction throttle (V6.8.5): per-direction timestamps of
+        # net-loss exits; once >= loss_count losses occur within the window,
+        # that direction is blocked for block_minutes.
+        self._dir_loss_times: dict[str, list[float]] = {}   # side -> [loss_ms]
+        self._dir_throttle_until: dict[str, float] = {}     # side -> block_until_ms
+        self._dir_throttle_notified: set[str] = set()       # run_ids already TG-notified
         # Codex v1 live gate: track run ids already notified to avoid per-cycle
         # Telegram spam while an ARMED run waits for an accepted lane.
         self._codex_v1_guard_notified: set[str] = set()
@@ -4026,6 +4032,38 @@ class MainnetOneRunManager:
         if decision is None:
             return
 
+        # Option A: direction consecutive-loss throttle (V6.8.5).
+        now_ms = time.time() * 1000
+        _dir_block_until = self._dir_throttle_until.get(decision.side, 0.0)
+        if _dir_block_until > now_ms:
+            _remaining_s = int((_dir_block_until - now_ms) / 1000)
+            _dir_count_cfg = int(getattr(self._settings, "mainnet_dir_throttle_loss_count", 2) or 2)
+            if run["run_id"] not in self._dir_throttle_notified:
+                self._dir_throttle_notified.add(run["run_id"])
+                await self._repo.log_event(
+                    run["run_id"],
+                    "direction_throttled",
+                    {
+                        "side": decision.side,
+                        "strategy": decision.strategy,
+                        "remaining_s": _remaining_s,
+                    },
+                )
+                await self._notify(
+                    f"⛔ <b>方向節流：暫停 {decision.side} 進場</b>\n"
+                    f"Run：<code>{escape(run['run_id'])}</code>\n"
+                    f"原因：60min 內同方向連續 ≥{_dir_count_cfg} 筆淨虧\n"
+                    f"剩餘：<b>{_remaining_s // 60}m{_remaining_s % 60:02d}s</b>"
+                )
+            else:
+                logger.info(
+                    "direction_throttle_skip",
+                    run_id=run["run_id"],
+                    side=decision.side,
+                    remaining_s=_remaining_s,
+                )
+            return  # stay ARMED, retry next cycle
+
         # Codex v1 canary owns entry qualification end-to-end.  The legacy
         # rng15/trend/rescue/spike guards remain active for non-Codex runs, but
         # must not pre-filter Codex samples or the live validation is biased by
@@ -7807,6 +7845,33 @@ class MainnetOneRunManager:
         elif from_loop_chain and not _is_loss_exit:
             # Net win — reset the escalation.
             self._loss_streak = 0
+
+        # Option A: direction consecutive-loss throttle.  Runs always (not
+        # just in loops) because regime state is market-wide, not loop-scoped.
+        _dir_side = str((run.get("params") or {}).get("side") or run.get("side") or "").upper()
+        _dir_block_min = float(getattr(self._settings, "mainnet_dir_throttle_block_minutes", 30.0) or 30.0)
+        _dir_window_sec = float(getattr(self._settings, "mainnet_dir_throttle_window_seconds", 3600.0) or 3600.0)
+        _dir_count = int(getattr(self._settings, "mainnet_dir_throttle_loss_count", 2) or 2)
+        if _dir_side and _dir_block_min > 0 and _dir_count > 0:
+            _now_ms = time.time() * 1000
+            if _is_loss_exit:
+                _losses = self._dir_loss_times.get(_dir_side, [])
+                _losses.append(_now_ms)
+                _losses = [t for t in _losses if _now_ms - t <= _dir_window_sec * 1000]
+                self._dir_loss_times[_dir_side] = _losses
+                if len(_losses) >= _dir_count:
+                    self._dir_throttle_until[_dir_side] = _now_ms + _dir_block_min * 60_000
+                    logger.info(
+                        "direction_throttle_armed",
+                        run_id=run["run_id"],
+                        side=_dir_side,
+                        loss_count=len(_losses),
+                        block_minutes=_dir_block_min,
+                    )
+            else:
+                # Net win: reset loss counter so it does not compound across
+                # winning periods.  Active block expires on its own timer.
+                self._dir_loss_times.pop(_dir_side, None)
         # Loop loss protection: accumulate the chain's NET PnL and break the
         # loop once it reaches the user-set cap (Telegram 🛡 buttons).  Judged
         # on net (realized − commission), same basis as the cooldown above.
