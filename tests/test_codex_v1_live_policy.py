@@ -14,7 +14,7 @@ from src.gridbot.strategy.codex_v1_live import (
 
 
 def test_codex_v1_version_is_pinned():
-    assert CODEX_V1_VERSION == "_codex_v1.3.9C_live_admission_guard"
+    assert CODEX_V1_VERSION == "_codex_v1.4.0"
 
 
 
@@ -141,7 +141,7 @@ def test_anchor_short_sizeup_lane_matches_current_baseline_w1_shape():
     assert decision.lane == "anchor_s1_preblock_broad_su6_exitA"
     assert decision.entry_offset_bp == 3.0
     assert decision.size_mult == 6.0
-    assert decision.requested_notional_usdc == 1200.0
+    assert decision.requested_notional_usdc == 300.0
     assert "sizeup" in decision.risk_tags
 
 
@@ -229,7 +229,7 @@ def test_s6_cluster1129_requires_full_feature_filter_and_scales_rng55_75():
     assert decision.accepted
     assert decision.lane.endswith("cluster1129_rng57_70_d30neg75_neg49_rsi43_53_vwap38_56_rp15_063_080_e0")
     assert decision.notional_mult == 1.2
-    assert decision.requested_notional_usdc == 240.0
+    assert decision.requested_notional_usdc == 60.0
     assert not missing.accepted
 
 

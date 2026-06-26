@@ -323,6 +323,11 @@ class Settings(BaseSettings):
     mainnet_trail_enabled: bool = True
     mainnet_trail_arm_frac: float = 0.5      # arm once peak MFE >= this fraction of tp_pct (was 0.7)
     mainnet_trail_giveback_frac: float = 0.5   # lock-exit after retracing this fraction of the run (was 0.25)
+    # Hermes runner policy (2026-06-26): after TP1 fills, leave the remainder to
+    # TRAIL only; do not rest a fixed TP3, and keep a protective hard SL at 25bp.
+    mainnet_trail_require_partial_fill: bool = True
+    mainnet_trail_disable_final_tp: bool = True
+    mainnet_hard_sl_pct_override: float = 0.0025
     # TRAIL profit-lock exit fee optimisation (2026-06-08). The runner is in
     # profit and not racing a stop, so the lock-exit can be a reduce-only
     # POST_ONLY (maker, 0 USDC fee on ETHUSDC) instead of a market taker close.

@@ -17,7 +17,7 @@ import re
 from typing import Any, Mapping, Sequence
 
 
-CODEX_V1_VERSION = "_codex_v1.4.0_tp_trail"
+CODEX_V1_VERSION = "_codex_v1.4.0"
 CODEX_V1_BASELINE = "portfolio_union_21branch_w1s6short_cluster1129"
 BASE_NOTIONAL_USDC = 50.0
 STALE_UPMOVE_CANARY_LANE = "codex_v1_stale_upmove_short_rng20_canary"
@@ -1293,8 +1293,8 @@ def build_stale_upmove_canary_decision(
         "d30_max_bp": STALE_UPMOVE_CANARY_D30_MAX_BP,
         "admission_guard": "rng15_gt20_adv3_gt0_rng15_le100_d30_le80",
         "applied_notional_cap_usdc": STALE_UPMOVE_CANARY_NOTIONAL_USDC,
-        "tp_policy_override": "no_runner_40tp1_60full",
-        "sl_policy": "keep_original_17bp",
+        "tp_policy_override": "tp1_40_then_trail_runner",
+        "sl_policy": "hard_sl_25bp",
         "sl_policy_shadow": STALE_UPMOVE_SL19_SHADOW_TAG,
         "sl_policy_shadow_bp": STALE_UPMOVE_SL19_SHADOW_BP,
         "sl_policy_shadow_action": "observe_only",

@@ -110,7 +110,7 @@ class MainnetOneRunManager:
     ) -> None:
         self._settings = settings
         if (
-            CODEX_V1_VERSION.startswith(("_codex_v1.3.7E", "_codex_v1.3.8", "_codex_v1.3.9"))
+            CODEX_V1_VERSION.startswith(("_codex_v1.3.7E", "_codex_v1.3.8", "_codex_v1.3.9", "_codex_v1.4"))
             and bool(getattr(self._settings, "mainnet_codex_tp_policy_live_override_enabled", False))
         ):
             try:
@@ -2058,7 +2058,7 @@ class MainnetOneRunManager:
 
     def _use_codex_v138_w6a_exit_policy(self, lane_code: Any) -> bool:
         return (
-            CODEX_V1_VERSION.startswith(("_codex_v1.3.8", "_codex_v1.3.9"))
+            CODEX_V1_VERSION.startswith(("_codex_v1.3.8", "_codex_v1.3.9", "_codex_v1.4"))
             and str(lane_code or "").upper() == "W6A"
         )
 
@@ -4456,7 +4456,7 @@ class MainnetOneRunManager:
             run["cumulative_notional_usdc"] = new_cumulative
         await self._cancel_stop_loss_order(symbol, run["run_id"])
         signal = json.loads(run.get("signal_json") or "{}")
-        sl_pct = float(signal.get("wildcat", {}).get("sl_pct") or 0.0)
+        sl_pct = self._effective_sl_pct(signal)
         if sl_pct > 0 and position.entry_price > 0:
             # Widen SL by widen×dca_count per layer (backtest parity):
             # a freshly averaged position needs more room or it is
@@ -5150,20 +5150,22 @@ class MainnetOneRunManager:
             final_price = float(order.get("price", 0) or entry_signal_price)
             used_gtc = order.get("timeInForce") != "GTX"
             entry_note = "\n⚠️ 使用 GTC 限價單進場（maker 保護已關閉）" if used_gtc else ""
+        sl_pct = self._effective_sl_pct({"wildcat": {"sl_pct": decision.sl_pct}})
+        stop_loss = self._sl_price_from_pct(final_price, decision.side, sl_pct)
         payload = {
             "side": decision.side,
             "strategy": decision.strategy,
             "price": decision.signal.price,
             "entry_reference_price": entry_signal_price,
             "entry_price": final_price,
-            "stop_loss": decision.signal.stop_loss,
+            "stop_loss": stop_loss,
             "take_profits": decision.signal.take_profits,
             "take_profit": decision.signal.take_profits[0] if decision.signal.take_profits else None,
             "score": decision.signal.score,
             "reasons": decision.signal.reasons,
             "wildcat": {
                 "tp_pct": decision.tp_pct,
-                "sl_pct": decision.sl_pct,
+                "sl_pct": sl_pct,
                 "partial_exit_pct": decision.partial_exit_pct,
                 "partial_tp_pct": decision.partial_tp_pct,
                 # 06-11: post-hoc analysis reads signal_json/entry_placed as
@@ -5182,6 +5184,8 @@ class MainnetOneRunManager:
                 "adverse_exit_bars": decision.adverse_exit_bars,
                 "adverse_exit_loss_pct": decision.adverse_exit_loss_pct,
                 "max_holding_bars": decision.max_holding_bars,
+                "trail_require_partial_fill": self._settings.mainnet_trail_require_partial_fill,
+                "trail_disable_final_tp": self._settings.mainnet_trail_disable_final_tp,
             },
             "entry_ladder_deadline_ms": ladder_deadline_ms,
             # V6.5: per-entry volatility context for offline stats (WR by rng15
@@ -5280,7 +5284,7 @@ class MainnetOneRunManager:
             f"Run：<code>{escape(run['run_id'])}</code>\n"
             f"策略：<b>{escape(decision.strategy)}</b> | score=<code>{decision.signal.score}</code> | rng15=<code>{rng15:.1f}bp</code> | drift=<code>{drift_note}</code>\n"
             f"Entry：<b>${final_price:.4f}</b> | Qty：<code>{escape(str(qty))}</code>\n"
-            f"Stop：<b>${float(decision.signal.stop_loss or 0):.4f}</b> | TP：<b>${float(decision.signal.take_profits[0] if decision.signal.take_profits else 0):.4f}</b>{entry_note}{codex_note}\n"
+            f"Stop：<b>${float(stop_loss or 0):.4f}</b> | TP：<b>${float(decision.signal.take_profits[0] if decision.signal.take_profits else 0):.4f}</b>{entry_note}{codex_note}\n"
             "若 maker 掛單逾時未成交，本 run 會停止，不會追價硬吃 taker。"
         )
 
@@ -5671,6 +5675,8 @@ class MainnetOneRunManager:
                 qty_closed = self._tp_layer_qty.get(run_id, {}).get("tp1") or max(0.0, ref_qty - current_qty)
                 qty_text = await self._client.format_quantity(position.symbol, qty_closed) if qty_closed > 0 else "unknown"
                 self._partial_order_armed.discard(run_id)
+                self._partial_taken.add(run_id)
+                self._partial_exits.add(run_id)
                 await self._repo.log_event(
                     run_id,
                     "partial_exit",
@@ -5684,6 +5690,7 @@ class MainnetOneRunManager:
                         "position_qty": current_qty,
                     },
                 )
+                await self._repo.log_event(run_id, "trail_runner_activated", {"mode": "tp1_then_trail"})
                 codex_note = self._codex_v1_telegram_note(run)
                 await self._notify(
                     f"✅ Mainnet one-run 已部分獲利了結：<code>{escape(run_id)}</code> qty=<code>{escape(str(qty_text))}</code>{codex_note}"
@@ -6047,7 +6054,11 @@ class MainnetOneRunManager:
             if float(mid_qty) > 0:
                 orders.append((f"{run_id}{MID_TP_SUFFIX}", mid_qty, mid_price))
                 remaining_qty = max(0.0, remaining_qty - float(mid_qty))
-        if full_tp_price > 0 and remaining_qty > 0:
+        if (
+            full_tp_price > 0
+            and remaining_qty > 0
+            and not self._settings.mainnet_trail_disable_final_tp
+        ):
             # When TP2 (mid) is disabled, apply mid_exit_pct to TP3 so the
             # remaining fraction is left unallocated for TRAIL to handle.
             final_exit_frac = (
@@ -6060,6 +6071,26 @@ class MainnetOneRunManager:
             if float(final_qty) > 0:
                 orders.append((f"{run_id}{FINAL_TP_SUFFIX}", final_qty, full_tp_price))
         return orders
+    def _trail_ready(self, run_id: str) -> bool:
+        if not self._settings.mainnet_trail_require_partial_fill:
+            return True
+        return run_id in self._partial_exits
+
+    def _effective_sl_pct(self, signal: dict) -> float:
+        override = float(getattr(self._settings, "mainnet_hard_sl_pct_override", 0.0) or 0.0)
+        if override > 0:
+            return override
+        return float(signal.get("wildcat", {}).get("sl_pct") or 0.0)
+
+    @staticmethod
+    def _sl_price_from_pct(entry_price: float, side: str, sl_pct: float) -> float:
+        if entry_price <= 0 or sl_pct <= 0:
+            return 0.0
+        if side == "LONG":
+            return entry_price * (1 - sl_pct)
+        if side == "SHORT":
+            return entry_price * (1 + sl_pct)
+        return 0.0
 
     def _partial_take_profit_price(
         self,
@@ -6388,6 +6419,8 @@ class MainnetOneRunManager:
         if tp_pct <= 0 or entry <= 0 or mark <= 0 or side not in {"LONG", "SHORT"}:
             return False
         run_id = run["run_id"]
+        if not self._trail_ready(run_id):
+            return False
         if run_id in self._trail_exiting:
             # The fast watcher already owns the lock-exit; report handled so
             # the manage cycle skips its SL/ADVERSE/MAX_HOLD close paths.
@@ -6469,17 +6502,17 @@ class MainnetOneRunManager:
         return self._codex_v1_signal_lane_code(signal) == "W6A"
 
     def _w6a_fast_trail_enabled(self) -> bool:
-        if CODEX_V1_VERSION.startswith(("_codex_v1.3.8", "_codex_v1.3.9")):
+        if CODEX_V1_VERSION.startswith(("_codex_v1.3.8", "_codex_v1.3.9", "_codex_v1.4")):
             return bool(getattr(self._settings, "mainnet_codex_v138_w6a_fast_trail_enabled", False))
         return bool(getattr(self._settings, "mainnet_codex_v137_w6a_fast_trail_enabled", True))
 
     def _w6a_fast_trail_watch_interval_seconds(self) -> int:
-        if CODEX_V1_VERSION.startswith(("_codex_v1.3.8", "_codex_v1.3.9")):
+        if CODEX_V1_VERSION.startswith(("_codex_v1.3.8", "_codex_v1.3.9", "_codex_v1.4")):
             return max(1, int(getattr(self._settings, "mainnet_codex_v138_w6a_trail_watch_interval_seconds", 1) or 1))
         return max(1, int(getattr(self._settings, "mainnet_codex_v137_w6a_trail_watch_interval_seconds", 1) or 1))
 
     def _w6a_fast_trail_arm_cap_bp(self) -> float:
-        if CODEX_V1_VERSION.startswith(("_codex_v1.3.8", "_codex_v1.3.9")):
+        if CODEX_V1_VERSION.startswith(("_codex_v1.3.8", "_codex_v1.3.9", "_codex_v1.4")):
             return float(getattr(self._settings, "mainnet_codex_v138_w6a_trail_arm_cap_bp", 3.5) or 0.0)
         return float(getattr(self._settings, "mainnet_codex_v137_w6a_trail_arm_cap_bp", 3.5) or 0.0)
 
@@ -6503,7 +6536,11 @@ class MainnetOneRunManager:
         the 10s manage cycle wakes.
         """
         run_id = run["run_id"]
-        if not self._settings.mainnet_trail_enabled or tp_pct <= 0:
+        if (
+            not self._settings.mainnet_trail_enabled
+            or tp_pct <= 0
+            or not self._trail_ready(run_id)
+        ):
             return
         existing = self._trail_watch_tasks.get(run_id)
         if existing is not None and not existing.done():
@@ -6896,10 +6933,10 @@ class MainnetOneRunManager:
         lane = codex_payload.get("lane")
         lane_code = str(codex_payload.get("lane_code") or "").upper()
         survival_profile = None
-        if CODEX_V1_VERSION.startswith("_codex_v1.3.9") and lane_code == "CNL-WPR-L":
+        if CODEX_V1_VERSION.startswith(("_codex_v1.3.9", "_codex_v1.4")) and lane_code == "CNL-WPR-L":
             survival_profile = "v139b_wpr_waiting_scratch"
         elif (
-            CODEX_V1_VERSION.startswith("_codex_v1.3.9")
+            CODEX_V1_VERSION.startswith(("_codex_v1.3.9", "_codex_v1.4"))
             and bool(getattr(self._settings, "mainnet_codex_v139_w1b_survival_enabled", False))
             and lane_code == "W1B"
         ):
@@ -7671,6 +7708,7 @@ class MainnetOneRunManager:
         self._codex_v1_reprice_shadow.pop(run["run_id"], None)
         self._clear_codex_v1_shadow_samples(run["run_id"])
         self._codex_survival_watch_notified.discard(run["run_id"])
+        self._partial_taken.discard(run["run_id"])
         self._partial_exits.discard(run["run_id"])
         self._final_taken.discard(run["run_id"])
         self._final_order_armed.discard(run["run_id"])

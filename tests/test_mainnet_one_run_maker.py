@@ -281,6 +281,7 @@ class FakeClient:
 
 def _settings(**overrides):
     data = {
+        "_env_file": None,
         "binance_api_key": "key",
         "binance_api_secret": "secret",
         "telegram_chat_id": "123",
@@ -295,6 +296,7 @@ def _settings(**overrides):
     }
     data.update(overrides)
     return Settings(**data)
+
 
 
 def _run(**overrides):
@@ -334,10 +336,10 @@ async def test_entry_fill_syncs_maker_take_profit_orders():
     await manager._run_entry_pending(run)
 
     tp_orders = [o for o in client.reduce_only_limit_orders if "tp" in (o.get("clientOrderId") or "")]
-    # TP2 (mid fixed) disabled: only TP1 (40%) + TP3 (signal, 30%) placed; remaining 30% left for TRAIL
-    assert len(tp_orders) == 2
+    # Hermes live mode: TP2/TP3 disabled, only TP1 rests and the runner is left for TRAIL.
+    assert len(tp_orders) == 1
     assert all(order["side"] == "SELL" for order in tp_orders)
-    assert {o["clientOrderId"] for o in tp_orders} == {"cry3mn_test_tp1", "cry3mn_test_tp3"}
+    assert {o["clientOrderId"] for o in tp_orders} == {"cry3mn_test_tp1"}
     # SL is a STOP_MARKET algo order, lives in algo_orders (not reduce_only_limit_orders)
     assert len(client.stop_market_sl_orders) == 1
     sl = client.stop_market_sl_orders[0]
@@ -362,7 +364,8 @@ async def test_run_running_take_profit_does_not_market_close():
         margin_type="cross",
     )
     repo = FakeRepo()
-    manager = MainnetOneRunManager(_settings(), client, repo, FakeTelegramApp())
+    manager = MainnetOneRunManager(_settings(mainnet_trail_disable_final_tp=False), client, repo, FakeTelegramApp())
+
     # armed just now so run_age_bars=0, no MAX_HOLD trigger
     run = _run(
         signal_json='{"side":"LONG","take_profit":101.0,"stop_loss":99.0}',
@@ -382,7 +385,7 @@ async def test_run_running_stop_loss_closes_with_market_and_cancels_tp_orders():
     import time as _time
     client = FakeClient()
     client.open_orders = [
-        {"orderId": 111, "symbol": "ETHUSDC", "clientOrderId": "cry3mn_test_tp1", "origQty": "0.048", "price": "100.05"},
+        {"orderId": 111, "symbol": "ETHUSDC", "clientOrderId": "cry3mn_test_tp1", "origQty": "0.048", "price": "100.04"},
         {"orderId": 112, "symbol": "ETHUSDC", "clientOrderId": "cry3mn_test_tp2", "origQty": "0.036", "price": "100.30"},
         {"orderId": 114, "symbol": "ETHUSDC", "clientOrderId": "cry3mn_test_tp3", "origQty": "0.036", "price": "101.00"},
     ]
@@ -405,8 +408,20 @@ async def test_run_running_stop_loss_closes_with_market_and_cancels_tp_orders():
     telegram = FakeTelegramApp()
     # Disable recovery so _hit_stop path is reached without DCA interference
     manager = MainnetOneRunManager(
-        _settings(mainnet_recovery_enabled=False, mainnet_mid_tp_pct=0.0030), client, repo, telegram
+        _settings(
+            mainnet_recovery_enabled=False,
+            mainnet_mid_tp_pct=0.0030,
+            mainnet_hard_sl_pct_override=0.0,
+            mainnet_trail_disable_final_tp=False,
+            mainnet_mid_exit_pct=0.5,
+        ),
+        client,
+        repo,
+        telegram,
     )
+
+
+
     run = _run(
         signal_json='{"side":"LONG","take_profit":101.0,"stop_loss":99.0}',
         avg_entry_price=100.0,
@@ -796,6 +811,7 @@ async def test_trailing_exit_locks_runner_gain_after_arm_then_retrace():
         _settings(
             mainnet_recovery_enabled=False,
             mainnet_trail_enabled=True,
+            mainnet_trail_require_partial_fill=False,
             mainnet_trail_arm_frac=0.7,
             mainnet_trail_giveback_frac=0.25,
             mainnet_trail_exit_use_maker=False,  # test the pure market lock-exit
@@ -846,6 +862,7 @@ async def test_trailing_exit_does_not_fire_before_arm_threshold():
         _settings(
             mainnet_recovery_enabled=False,
             mainnet_trail_enabled=True,
+            mainnet_trail_require_partial_fill=False,
             mainnet_trail_arm_frac=0.7,
             mainnet_trail_giveback_frac=0.25,
             mainnet_trail_exit_use_maker=False,  # test the pure market lock-exit
@@ -1672,6 +1689,7 @@ async def test_run_running_dca_shrinks_and_caps_take_profits():
             mainnet_recovery_tp_shrink=0.45,
             mainnet_partial_exit_pct=0.40,
             mainnet_mid_exit_pct=0.50,
+            mainnet_trail_disable_final_tp=False,
         ),
         client,
         repo,
@@ -1707,6 +1725,58 @@ async def test_run_running_dca_shrinks_and_caps_take_profits():
 
 
 @pytest.mark.asyncio
+async def test_trail_waits_for_tp1_before_starting_runner_mode():
+    import asyncio
+    import json
+    import time as _time
+    client = FakeClient()
+    repo = FakeRepo()
+    manager = MainnetOneRunManager(
+        _settings(
+            mainnet_recovery_enabled=False,
+            mainnet_trail_enabled=True,
+            mainnet_trail_require_partial_fill=True,
+            mainnet_trail_arm_frac=0.5,
+            mainnet_trail_giveback_frac=0.5,
+            mainnet_trail_exit_use_maker=False,
+        ),
+        client,
+        repo,
+        FakeTelegramApp(),
+    )
+    run = _run(
+        signal_json='{"side":"LONG","take_profit":101.0,"stop_loss":97.5,"wildcat":{"tp_pct":0.01,"sl_pct":0.025}}',
+        avg_entry_price=100.0,
+        armed_at_ms=int(_time.time() * 1000),
+    )
+    client.position = PositionInfo(
+        symbol="ETHUSDC",
+        position_amt=0.12,
+        entry_price=100.0,
+        mark_price=101.0,
+        unrealized_pnl=0.12,
+        liquidation_price=80.0,
+        leverage=75,
+        margin_type="cross",
+    )
+
+    manager._start_trail_watch(run, "LONG", "SELL", 0.01)
+    assert run["run_id"] not in manager._trail_watch_tasks
+    fired = await manager._maybe_trailing_exit(
+        run, json.loads(run["signal_json"]), client.position, "LONG", 101.0, 100.0, 0.12, "SELL"
+    )
+    assert fired is False
+    assert run["run_id"] not in manager._trail_armed
+
+    manager._partial_exits.add(run["run_id"])
+    manager._start_trail_watch(run, "LONG", "SELL", 0.01)
+    assert run["run_id"] in manager._trail_watch_tasks
+    manager._trail_watch_tasks[run["run_id"]].cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await manager._trail_watch_tasks[run["run_id"]]
+
+
+@pytest.mark.asyncio
 async def test_dca_fill_resets_trail_peak_and_disarms():
     """E1: a DCA fill moves the cost basis TOWARD the market, so a pre-DCA peak
     measured against the new basis would instantly re-satisfy arm_mfe and fire
@@ -1720,6 +1790,7 @@ async def test_dca_fill_resets_trail_peak_and_disarms():
         _settings(
             mainnet_recovery_enabled=False,  # fill already happened; skip preplace
             mainnet_trail_enabled=True,
+            mainnet_trail_require_partial_fill=False,
         ),
         client, repo, FakeTelegramApp(),
     )
@@ -1761,6 +1832,7 @@ async def test_trail_fire_aborted_when_book_anchor_below_floor():
         _settings(
             mainnet_recovery_enabled=False,
             mainnet_trail_enabled=True,
+            mainnet_trail_require_partial_fill=False,
             mainnet_trail_arm_frac=0.7,
             mainnet_trail_giveback_frac=0.25,
             mainnet_trail_exit_use_maker=False,  # without the gate → market close
@@ -4346,7 +4418,7 @@ async def test_v138_w6a_take_profit_orders_use_signal_partial_tp_pct():
         margin_type="cross",
     )
     manager = MainnetOneRunManager(
-        _settings(mainnet_partial_tp_pct=0.0005, mainnet_partial_exit_pct=0.40),
+        _settings(mainnet_partial_tp_pct=0.0005, mainnet_partial_exit_pct=0.40, mainnet_trail_disable_final_tp=False),
         client,
         FakeRepo(),
         FakeTelegramApp(),
@@ -4390,7 +4462,7 @@ async def test_v139b_wpr_take_profit_orders_use_signal_partial_exit_pct():
         margin_type="cross",
     )
     manager = MainnetOneRunManager(
-        _settings(mainnet_partial_tp_pct=0.0005, mainnet_partial_exit_pct=0.40),
+        _settings(mainnet_partial_tp_pct=0.0005, mainnet_partial_exit_pct=0.40, mainnet_trail_disable_final_tp=False),
         client,
         FakeRepo(),
         FakeTelegramApp(),
