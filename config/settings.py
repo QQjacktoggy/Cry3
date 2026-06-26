@@ -157,7 +157,7 @@ class Settings(BaseSettings):
     mainnet_entry_max_deviation_bps: float = 8.0
     mainnet_entry_requote_min_age_seconds: int = 22
     mainnet_partial_exit_pct: float = 0.40
-    mainnet_partial_tp_pct: float = 0.0004  # TP1 = 4bp (was 5bp) — closer fill, higher hit rate
+    mainnet_partial_tp_pct: float = 0.0004  # TP1 = 4bp
     mainnet_mid_tp_pct: float = 0.0        # mid exit disabled — remainder is TRAIL-only
     mainnet_mid_exit_pct: float = 0.0      # mid exit fraction disabled (was 0.50)
     mainnet_recovery_enabled: bool = True
