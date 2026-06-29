@@ -26,6 +26,7 @@ class Settings(BaseSettings):
 
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
+    mainnet_telegram_notice_log_path: str = "testnet/logs/mainnet_telegram_notices.jsonl"
 
     @property
     def telegram_chat_id_int(self) -> int:
@@ -131,6 +132,111 @@ class Settings(BaseSettings):
     mainnet_api_secret: str = ""
     mainnet_symbol: str = "ETHUSDC"
     mainnet_strategy_label: str = "wildcat_v2_adverse_guard"
+    mainnet_codex_v1_enabled: bool = False
+    mainnet_codex_v1_max_notional_usdc: float = 800.0
+    # Comma-separated live-only lane kill switch. The classifier can still
+    # report these lanes for research, but mainnet one-run will reject them
+    # before order placement. Anchor is disabled after live 20-run data and a
+    # fresh SL showed it was the current loss cluster.
+    mainnet_codex_v1_disabled_lanes: str = "anchor_s1_preblock_broad_su6_exitA"
+    # Research-only live gate for the current W6 LONG lane.  Disabled by
+    # default: we want the branch available for canary testing without changing
+    # the baseline until the live sample is larger.
+    mainnet_codex_v1_w6_weak_drift_block_enabled: bool = True
+    mainnet_codex_v1_w6_weak_drift_threshold_bp: float = -30.0
+    # Live-only W6A tightening block (2026-06-17, v1.2.11). Two back-to-back
+    # W6A LONG losses shared the same shape: deep negative drift, weak RSI,
+    # far-below-VWAP price, deep pullback, and still-positive short-horizon
+    # adverse drift. Keep the research lane, but reject this cluster live.
+    mainnet_codex_v1_w6_deep_pullback_block_enabled: bool = True
+    mainnet_codex_v1_w6_deep_pullback_d30_max_bp: float = -30.0
+    mainnet_codex_v1_w6_deep_pullback_adv3_min_bp: float = 6.5
+    mainnet_codex_v1_w6_deep_pullback_rsi_max: float = 39.0
+    mainnet_codex_v1_w6_deep_pullback_vwap_dist_max_bp: float = -30.0
+    mainnet_codex_v1_w6_deep_pullback_pullback_min_bp: float = 30.0
+    # Live-only W2A tightening block. Early live W2A canary trades showed the
+    # offline score+rng lane was too broad in practice; keep the base lane for
+    # research, but reject live entries outside this narrower bounce envelope.
+    mainnet_codex_v1_w2a_tight_block_enabled: bool = True
+    mainnet_codex_v1_w2a_d30_low_bp: float = -20.0
+    mainnet_codex_v1_w2a_d30_high_bp: float = -5.0
+    mainnet_codex_v1_w2a_adv3_low_bp: float = 0.0
+    mainnet_codex_v1_w2a_adv3_high_bp: float = 6.0
+    mainnet_codex_v1_w2a_bb_lower_dist_low_bp: float = 5.0
+    mainnet_codex_v1_w2a_bb_lower_dist_high_bp: float = 20.0
+    # Live-only W1B tightening block. The first v1.2.1 canary batch showed
+    # that W1B was acting as an over-broad fallback SHORT bucket: large losses
+    # clustered around stale late accepts, positive adv3 spikes, and stretched
+    # lower-band distance. Keep the base lane for research, but reject live
+    # entries outside this tighter envelope.
+    mainnet_codex_v1_w1b_tight_block_enabled: bool = True
+    mainnet_codex_v1_w1b_d30_low_bp: float = -45.0
+    mainnet_codex_v1_w1b_d30_high_bp: float = 5.0
+    mainnet_codex_v1_w1b_adv3_high_bp: float = 5.0
+    mainnet_codex_v1_w1b_bb_lower_dist_high_bp: float = 20.0
+    mainnet_codex_v1_w1b_reprice_wait_max_seconds: float = 60.0
+    # Codex-only survival manager. Starts watching after 5m, may close weak
+    # positions after 6m, and applies damage control after 7m. This is separate
+    # from the generic 10-bar adverse exit because recent Codex SLs occurred
+    # before that slower guard could react.
+    mainnet_codex_survival_enabled: bool = True
+    mainnet_codex_survival_watch_after_seconds: int = 300
+    mainnet_codex_survival_exit_after_seconds: int = 420
+    mainnet_codex_survival_force_after_seconds: int = 420
+    mainnet_codex_survival_min_mfe_bp: float = 4.0
+    mainnet_codex_survival_micro_trail_floor_bp: float = 0.5
+    mainnet_codex_survival_early_fail_loss_bp: float = 6.0
+    mainnet_codex_survival_damage_loss_bp: float = 4.0
+    # Survival exits are timed exits, not exchange-side emergency stops. Try a
+    # reduce-only maker close first to avoid taker fees, then fall back to market
+    # after a short TTL so weak trades are not stranded.
+    mainnet_codex_survival_exit_use_maker: bool = True
+    mainnet_codex_survival_exit_maker_ttl_seconds: int = 5
+    mainnet_codex_survival_exit_adverse_break_bp: float = 1.5
+    # W6A-specific hotfixes (2026-06-17, v1.2.12)
+    mainnet_codex_v1_w6a_target_max_gross_loss_usdc: float = 0.16
+    mainnet_codex_v1_w6a_no_tp1_early_exit_live: bool = False
+    mainnet_codex_v1_w6a_no_tp1_stop_tighten_live: bool = True
+    mainnet_codex_v1_w6a_no_tp1_exit_shadow: bool = True
+    # V1.3.0 guarded capital restoration: W6A defaults to $50, and only the
+    # clean raw-$200 slice can receive a $200 live cap.
+    mainnet_codex_v1_w2a_shadow_only_enabled: bool = True
+    mainnet_codex_v1_w6a_guarded_200cap_enabled: bool = True
+    mainnet_codex_v1_w6a_default_cap_usdc: float = 50.0
+    mainnet_codex_v1_w6a_clean_cap_usdc: float = 200.0
+    mainnet_codex_v1_w6a_raw240_block_min_usdc: float = 240.0
+    mainnet_codex_v1_w6a_raw240_block_wait_max_seconds: float = 60.0
+    mainnet_codex_v1_w6a_bad_rr_ratio_min: float = 2.60
+    mainnet_codex_v1_w6a_bad_rr_early_wait_max_seconds: float = 120.0
+    mainnet_codex_v1_w6a_clean_rr_ratio_max: float = 2.20
+    mainnet_codex_v1_w6a_clean_wait_min_seconds: float = 60.0
+    mainnet_codex_v1_w6a_clean_score_min: float = 70.0
+    # Codex V1.3.7E W6A entry-risk shadow/risk action tree. This replaces the
+    # older clean-RR W6A 200U promotion policy while keeping the same telemetry
+    # path: raw classifier stays visible, effective execution carries live risk.
+    mainnet_codex_v137_w6a_risk_shadow_enabled: bool = True
+    mainnet_codex_v137_w6a_stale_hard_action: str = "cap50"
+    mainnet_codex_v137_w6a_default_cap_usdc: float = 50.0
+    mainnet_codex_v137_w6a_max_keep_notional_usdc: float = 200.0
+    mainnet_codex_v137_w6a_200_risk_score_max: int = 2
+    mainnet_codex_v137_w6a_no_bounce_exit_live: bool = True
+    mainnet_codex_v137_w6a_no_bounce_exit_shadow: bool = True
+    mainnet_codex_v137_w6a_no_bounce_after_seconds: float = 60.0
+    mainnet_codex_v137_w6a_no_bounce_maker_ttl_seconds: int = 5
+    mainnet_codex_v137_w6a_no_bounce_market_fallback_unrealized_r: float = -0.55
+    mainnet_codex_v137_w6a_no_bounce_market_fallback_distance_to_sl_r: float = 0.10
+    mainnet_codex_v137_w6a_post_tp_probe_shadow: bool = True
+    mainnet_codex_v137_w6a_post_tp_probe_giveback_bp: str = "1.5,2.0,2.5"
+    mainnet_codex_v137_w6a_fast_trail_enabled: bool = True
+    mainnet_codex_v137_w6a_trail_arm_cap_bp: float = 3.5
+    mainnet_codex_v137_w6a_trail_watch_interval_seconds: int = 1
+    # Codex V1.3.8 W6A live-exit alignment: preserve the v1.3.7E risk tree,
+    # move TP1 to the backtest-selected 6bp, and default away from the extra
+    # fast-trail cap unless explicitly re-enabled for a canary.
+    mainnet_codex_v138_w6a_partial_tp_pct: float = 0.0006
+    mainnet_codex_v138_w6a_fast_trail_enabled: bool = False
+    mainnet_codex_v138_w6a_trail_arm_cap_bp: float = 3.5
+    mainnet_codex_v138_w6a_trail_watch_interval_seconds: int = 1
     mainnet_equity_cap_usdc: float = 200.0
     mainnet_initial_notional_usdc: float = 200.0
     mainnet_max_cumulative_notional_usdc: float = 800.0
@@ -164,13 +270,26 @@ class Settings(BaseSettings):
     # Recovery (DCA) settings — aligned to backtest best (wildcat_s1s5_7d):
     # steps=3, trigger 0.09% (increments ×(count+1) per layer), tp_shrink 0.45.
     # steps=0 disables DCA entirely.
-    mainnet_recovery_steps: int = 3
+    # V6.5 (2026-06-11): steps 3 → 1.  Post-fix live data (n=119): 1-layer runs
+    # 19/22=86% WR net +2.24 worst -0.25; 2-layer runs 3/7=43% net -7.14 worst
+    # -2.01 — ALL catastrophic tails were layer-2 fills during sustained dumps
+    # (pre-placed GTX resting orders fill mid-dump and bypass the placement-time
+    # guard).  steps=1 reproduces V3's mechanically-shallow DCA profile (249
+    # runs: only 2 ever reached layer 2) with modern execution (GTX 0-fee).
+    mainnet_recovery_steps: int = 1
     mainnet_recovery_trigger_pct: float = 0.0009
     mainnet_recovery_tp_shrink: float = 0.55
     # After each DCA layer, widen the SL distance by this fraction per layer
     # (sl_pct × (1 + widen × dca_count)) so a freshly averaged position is not
     # immediately swept.  Mirrors backtest_wildcat_s1s5 (0.25/layer).
     mainnet_recovery_sl_widen_per_layer: float = 0.25
+    # #25 (2026-06-10): a resting GTX DCA order can partially fill (e.g. 0.001 of
+    # an intended 0.124).  The qty-grew detector must NOT treat that as a full
+    # layer (widen SL / +1 layer / +full notional / pre-place next) — doing so
+    # caused the 21-second double-layer cascade in cry3mn_1781089775237.  A fill
+    # is only "a full layer" once filled_qty >= this fraction of the pre-placed
+    # order's intended qty; below it we just sync qty tracking and wait.
+    mainnet_dca_min_fill_ratio: float = 0.8
     mainnet_adverse_exit_bars: int = 10
     mainnet_adverse_exit_loss_pct: float = 0.0007
     mainnet_max_holding_bars: int = 24
@@ -209,11 +328,80 @@ class Settings(BaseSettings):
     # basis points; below the floor, SL/DCA keep ownership of the position.
     # The same epsilon gates the maker-exit anchor (E3) and the chase floor.
     mainnet_trail_profit_floor_bp: float = 1.5
+
+    # Codex V1.3.2 TP policy shadow optimizer. Shadow-only by default:
+    # this logs paired baseline-vs-variant TP allocation outcomes and never
+    # changes live TP orders unless a later manual version enables override.
+    mainnet_codex_tp_policy_shadow_enabled: bool = True
+    mainnet_codex_tp_policy_live_override_enabled: bool = False
+    mainnet_codex_tp_policy_path_ttl_s: int = 900
+    mainnet_codex_tp_policy_max_baseline_drift_bp: float = 3.0
+
+    # Codex V1.3.3 evidence-quality repair. These default to audit/shadow-only;
+    # live lane expansion, TP override, and maker-first profit execution remain disabled.
+    mainnet_codex_v133_no_lane_miner_enabled: bool = True
+    mainnet_codex_v133_shadow_family_quota_enabled: bool = True
+    mainnet_codex_v133_shadow_family_active_cap: int = 4
+    mainnet_codex_v133_diagnostic_fill_enabled: bool = True
+    mainnet_codex_v133_tp_terminalization_enabled: bool = True
+    mainnet_codex_v133_fee_gate_audit_only: bool = True
+    mainnet_codex_v133_fee_gate_enforce: bool = False
+    mainnet_codex_v133_estimated_slippage_bp: float = 0.4
+    mainnet_codex_v133_min_net_buffer_bp: float = 1.5
+    mainnet_codex_v133_net_floor_audit_only: bool = True
+    mainnet_codex_v133_maker_first_profit_exit: bool = False
+    mainnet_codex_v133_maker_opportunity_audit_enabled: bool = True
+
+    # Codex V1.3.4 conservative frequency recovery. This is intentionally
+    # narrow: weak-drift W6A may route only through the existing guarded $50
+    # path, while no-lane near-live buckets get better shadow priority.
+    mainnet_codex_v134_w6a_weak_drift_50_canary_enabled: bool = False
+    mainnet_codex_v134_w6a_weak_drift_50_canary_max_notional_usdc: float = 50.0
+    mainnet_codex_v134_w6a_weak_drift_50_canary_daily_limit: int = 3
+    mainnet_codex_v134_nl_near_long_priority_enabled: bool = True
+    # Codex V1.3.5 live fill-window recovery. Codex live entries do not use the
+    # legacy 3-bar ladder path, so selected live lanes can wait longer than the
+    # global maker-entry TTL while still staying post-only.
+    mainnet_codex_v135_entry_ttl_by_lane_enabled: bool = True
+    mainnet_codex_v135_entry_ttl_seconds_by_lane: str = "SPL_1:180,SCP:180,S1P-L:180,W6A:180,RP1:180,W1D:120,SH_NL_NEAR_W1D_LONG_LIVE200:120"
     # DCA directional guard toggle (2026-06-09).
     # True  = momentum_only: block DCA only when stoch cross signals momentum reversal.
     # False = off: no guard (higher DCA fill rate, validated in backtest_dca_guard_compare).
     # Stable choice: True (momentum_only).
     mainnet_dca_guard_enabled: bool = True
+    # #24 (2026-06-10): when the rescue per-candle spike gate skips an entry
+    # (sharp adverse move), block NORMAL S1 signals for this many seconds too.
+    # The rescue path keeps re-evaluating each candle (so a fast V-bounce rescue
+    # entry is still allowed), but S1 — which has no adverse-candle check —
+    # blindly caught the falling knife 110s after a spike skip in the same run
+    # (cry3mn_1781088625968, -0.71).  Time-boxed so we don't permanently block
+    # the post-spike V-bounce that fuels most TRAIL wins; 0 disables the block.
+    mainnet_spike_block_seconds: int = 120
+    # rng15 entry volatility gate (pre-entry 15m hi-lo range in bp).
+    # Live V3-V4 data: WR 89%/81%/88% at 20-35/35-55/55-75bp, cliff at 75+ (WR 33%).
+    # 0 disables the respective gate.
+    mainnet_rng15_gate_high_bp: float = 75.0
+    mainnet_rng15_gate_low_bp: float = 20.0
+    # Sweet-zone notional multiplier (applies when sweet_low <= rng15 < sweet_high).
+    # Default 1.0 = OFF: the 1.2x sizing has a bookkeeping bug (scaled entry counts
+    # toward the unscaled cumulative cap, silently eating the 3rd DCA layer).
+    mainnet_rng15_sweet_scale: float = 1.0
+    mainnet_rng15_sweet_low_bp: float = 20.0
+    mainnet_rng15_sweet_high_bp: float = 55.0
+    # Range-regime sizing boost (2026-06-11, default OFF).  Counterpart of the
+    # DCA drift gate below: golden-window forensics (06-10) showed the 93%-WR
+    # segment (13:00-18:50 TW, +2.67/30 runs) was a near-zero-drift range
+    # (+6bp over 5.1h) while the losing V5.5 segment was a −183bp/6.8h
+    # downtrend — low-|drift| tape is where this system earns.  When
+    # range_scale != 1.0 AND drift_max_bp > 0 AND the |signed net drift| of
+    # the last N 1m closes at entry is <= drift_max_bp, the entry notional is
+    # multiplied by range_scale (composes with the rng15 sweet-zone multiplier
+    # above; the V6.5 scale-aware DCA cumulative cap follows automatically).
+    # Defaults keep it OFF until the per-entry drift30 values persisted in
+    # signal_json accumulate enough samples to pick the thresholds.
+    mainnet_range_scale: float = 1.0
+    mainnet_range_drift_max_bp: float = 0.0
+    mainnet_range_drift_window_bars: int = 30
     # Ladder / limit-entry offset (2026-06-09).
     # Place maker limit this far BELOW signal price for LONG (ABOVE for SHORT) instead
     # of entering immediately at close. 0 = current behaviour (immediate fill).
@@ -290,7 +478,37 @@ class Settings(BaseSettings):
     # DCA guard cooldown: after the DCA risk guard blocks a recovery order,
     # hold that block for this many seconds regardless of regime re-classification
     # (prevents a brief range flicker from bypassing the guard within the window).
+    # NOTE (2026-06-11): the cooldown alone proved too weak — live DB 06-10~06-11
+    # showed 5 runs where a DCA layer still filled 1.1~2.8 min AFTER a
+    # dca_guard_blocked event (1W/4L, net −5.58 USDC).  One guard block now also
+    # bans DCA for the rest of that run (see MainnetOneRunManager
+    # _dca_guard_blocked_runs); this cooldown remains as the short-window brake.
     mainnet_dca_guard_cooldown_seconds: int = 60
+    # DCA-only drift gate (P1, 2026-06-11, Codex proposal).  Golden-window
+    # forensics: the 93%-WR segment (06-10 13:00-18:50 TW) drifted just +6bp
+    # over 5.1h (range) and DCA was a profit assist, while the V5.5 losing
+    # segment was a −183bp/6.8h downtrend where DCA was a loss amplifier (both
+    # −2.0 tails were DCA layer fills mid-dump).  When > 0, a DCA attempt
+    # (poll AND preplace paths) is blocked while the |signed net drift| of the
+    # last N 1m closes exceeds this many bp.  Entries are never touched, and
+    # the gate re-opens as soon as the drift fades — unlike the permanent
+    # per-run momentum-guard ban.  0 = disabled.
+    # 30.0 chosen from post-fix live DCA fills (06-11 analysis): losing-run
+    # fills sat at |d30| med 28.1bp vs winning-run 19.2bp; X=30 would have
+    # blocked 6/13 losing fills but only 6/28 winning ones, and catches the
+    # two −1.8/−1.9 tails (runs …111192475 d30=−39.5, …108474752 d30=+45)
+    # whose momentum guard never fired (so the permanent ban cannot see them).
+    mainnet_dca_drift_gate_bp: float = 30.0
+    mainnet_dca_drift_window_bars: int = 30
+    # Direction consecutive-loss throttle (Option A, V6.8.5).
+    # If >= loss_count net-loss exits for the same direction occur within
+    # window_seconds, that direction is blocked for block_minutes.
+    # Judges loss on net PnL (realized-commission), same as loop cooldown.
+    # A net win resets the loss counter for that direction.  0 on
+    # block_minutes disables the feature entirely.
+    mainnet_dir_throttle_loss_count: int = 2
+    mainnet_dir_throttle_window_seconds: float = 3600.0
+    mainnet_dir_throttle_block_minutes: float = 30.0
 
     @property
     def mainnet_effective_entry_notional_usdc(self) -> float:
