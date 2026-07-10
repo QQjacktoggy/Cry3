@@ -14,6 +14,22 @@ from config.settings import Settings
 from src.gridbot.binance.client import BinanceFuturesClient
 
 
+DEFAULT_TESTNET_DB_PATH = Path("testnet/data/gridbot_testnet.db")
+
+
+def resolve_db_path(
+    *,
+    explicit_db: Path | None,
+    environment: str,
+    settings_db_path: str,
+) -> Path:
+    if explicit_db is not None:
+        return explicit_db
+    if environment == "mainnet":
+        return Path(settings_db_path)
+    return DEFAULT_TESTNET_DB_PATH
+
+
 def classify_ownership(
     *,
     has_position: bool,
@@ -69,6 +85,11 @@ def _active_run(db_path: Path) -> dict[str, Any] | None:
 
 async def reconcile(args: argparse.Namespace) -> dict[str, Any]:
     settings = Settings()
+    db_path = resolve_db_path(
+        explicit_db=args.db,
+        environment=args.environment,
+        settings_db_path=settings.db_path,
+    )
     client_settings = settings
     if args.environment == "mainnet":
         client_settings = settings.model_copy(
@@ -93,7 +114,7 @@ async def reconcile(args: argparse.Namespace) -> dict[str, Any]:
     bot_open = [_safe_order(order) for order in open_orders if str(order.get("clientOrderId") or "").startswith(prefix)]
     external_open = [_safe_order(order) for order in open_orders if not str(order.get("clientOrderId") or "").startswith(prefix)]
     bot_recent = [_safe_order(order) for order in recent_orders if str(order.get("clientOrderId") or "").startswith(prefix)]
-    active_run = _active_run(args.db)
+    active_run = _active_run(db_path)
     trade_order_ids = {int(trade.order_id) for trade in trades}
     matched_bot_order_ids = sorted(
         {order["order_id"] for order in bot_recent if order["order_id"] in trade_order_ids}
@@ -109,6 +130,7 @@ async def reconcile(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "schema": "position_ownership_v1",
         "account_environment": args.environment,
+        "db_path": str(db_path),
         "symbol": args.symbol,
         "ownership": ownership,
         "active_run": active_run,
@@ -136,7 +158,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--symbol", default="ETHUSDC")
     parser.add_argument("--environment", choices=("mainnet", "testnet"), default="mainnet")
-    parser.add_argument("--db", type=Path, default=Path("testnet/data/gridbot_testnet.db"))
+    parser.add_argument("--db", type=Path)
     parser.add_argument("--client-order-prefix", default="cry3mn")
     parser.add_argument("--lookback-hours", type=int, default=168)
     return parser.parse_args()

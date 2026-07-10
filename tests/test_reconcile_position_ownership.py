@@ -1,4 +1,31 @@
-from scripts.reconcile_position_ownership import classify_ownership
+from pathlib import Path
+
+from scripts.reconcile_position_ownership import classify_ownership, resolve_db_path
+
+
+def test_position_ownership_mainnet_defaults_to_runtime_db_path():
+    assert resolve_db_path(
+        explicit_db=None,
+        environment="mainnet",
+        settings_db_path="runtime/mainnet.db",
+    ) == Path("runtime/mainnet.db")
+
+
+def test_position_ownership_testnet_keeps_testnet_db_default():
+    assert resolve_db_path(
+        explicit_db=None,
+        environment="testnet",
+        settings_db_path="runtime/mainnet.db",
+    ) == Path("testnet/data/gridbot_testnet.db")
+
+
+def test_position_ownership_explicit_db_wins():
+    explicit = Path("evidence/snapshot.db")
+    assert resolve_db_path(
+        explicit_db=explicit,
+        environment="mainnet",
+        settings_db_path="runtime/mainnet.db",
+    ) == explicit
 
 
 def test_position_ownership_flat():
