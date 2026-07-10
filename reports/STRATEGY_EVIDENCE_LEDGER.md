@@ -130,3 +130,12 @@ Use this repository as the historical record. A clean project should first repro
 - **RECONCILIATION**: explicit schema cutoff classifies all 1,776 retained runs as PRE_SCHEMA; there are 0 post-schema fill events and no missing/ambiguous claim yet.
 - **POSITION OWNERSHIP**: mainnet is FLAT with no active run or open orders. The earlier has_position=True log belongs to testnet: external/manual SHORT 0.043 ETHUSDC with no bot order or recent trade identity.
 - **GATE**: do not close or adopt the external testnet position. Testnet lifecycle validation and mainnet canary remain unarmed until a clean symbol/account state is available.
+
+## v1.4.56a Testnet Exchange Lifecycle - 2026-07-10
+
+- **TESTNET EXCHANGE**: clean `BTCUSDC` probe `tprobe_1783696606` completed an actual 0.002 BTC entry and exit and ended flat.
+- **FILL CONTRACT**: entry `fill_key=77551836:774923033`; exit `fill_key=77551837:774923064`; roles were `entry` and `exit`.
+- **ACCOUNTING**: gross realized PnL `-0.08219999 USDC`, commission `0.11524383 USDC`, observed net `-0.19744382 USDC`.
+- **IDEMPOTENCY**: first sync emitted 2 events and immediate second sync emitted 0.
+- **BOUNDARY**: this validates telemetry against real testnet exchange fills. It is not mainnet, strategy-profit, or recovery/DCA effectiveness evidence.
+- **SOURCE**: `reports/V1456A_FILL_V1_TESTNET_LIFECYCLE_2026-07-10.md`; `scripts/run_fill_v1_testnet_probe.py`.

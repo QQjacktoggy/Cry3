@@ -107,3 +107,11 @@ The hardening deployment keeps strategy version _codex_v1.4.56 and changes telem
 Using the explicit v1.4.56 deployment cutoff, reconciliation reports PRE_SCHEMA=1776, OBSERVED_COMPLETE=0, OBSERVED_PARTIAL=0, MISSING_EXPECTED=0, and AMBIGUOUS=0.
 
 Ownership is now separated by environment: mainnet is FLAT; testnet holds an external/manual ETHUSDC SHORT of 0.043 with no bot-prefixed open order, active run, or recent trade identity. This position is not a Codex run and must not be modified by lifecycle validation.
+
+## Testnet Exchange Telemetry Probe - 2026-07-10
+
+| run_id | environment | symbol | lane/state/action | exit reason | net PnL | DCA/recovery | evidence |
+|---|---|---|---|---|---:|---|---|
+| `tprobe_1783696606` | Binance Futures testnet | BTCUSDC | telemetry probe / N/A / market lifecycle | probe cleanup | `-0.19744382 USDC` after commission | none; not a recovery test | entry and exit `fill_v1`; second sync emitted 0; final position flat |
+
+This row is intentionally segregated from mainnet strategy runs. It validates exchange-fill telemetry and idempotency only.
