@@ -181,3 +181,11 @@ Expected output fields include:
 - Mainnet ownership check is FLAT. The service log position is a testnet external/manual SHORT 0.043 ETHUSDC and is outside Codex ownership.
 - Do not arm testnet lifecycle validation on ETHUSDC while that position exists. Do not arm mainnet canary until a controlled post-schema lifecycle plan is explicitly approved.
 - Strategy, TP/SL, DCA, sizing, lane whitelist, 50 USDC ticket, and -2 USDC loop cap are unchanged.
+
+## v1.4.56 Mainnet-Verified Addendum - 2026-07-10
+
+- Gate-passing STUP-S clean-extension TP10 is a live-observed `THIN_SCALP` route: one maker-entry/maker-exit TP lifecycle netted `+0.05012 USDC`.
+- This single win validates execution and telemetry, not broad strategy edge.
+- Mainnet recovery runtime allowlist is now verified as `CNL-WPR-L` only.
+- STUP-S recovery remains rejected by policy; do not restore the stale runtime override `CNL-WPR-L,STUP-S`.
+- No `recovery_entry_filled` exists. DCA/recovery effectiveness remains OPEN.

@@ -147,3 +147,12 @@ Use this repository as the historical record. A clean project should first repro
 - **FIX/TEST**: basket margin preflight with 5% buffer deployed; 264 tests passed, 3 warnings; service active.
 - **GATE**: do not re-arm until `USDC availableBalance >= 2.1000`; recommend at least 3 USDC.
 - **SOURCE**: `reports/V1456B_MARGIN_PREFLIGHT_INCIDENT_2026-07-10.md`.
+## v1.4.56 Mainnet Filled Canary - 2026-07-10
+
+- **LIVE**: `cry3mn_1783699350027`, STUP-S clean-extension `THIN_SCALP` TP10, maker entry/exit, completed `TP`.
+- **ACCOUNTING**: 0.028 ETH SHORT, 50.14352 USDC entry quote, realized/net `+0.05012 USDC`, commission `0`.
+- **FILL CONTRACT**: two `fill_v1` events; reconciliation v3 `OBSERVED_COMPLETE`; no missing/ambiguous/anomaly rows after cutoff.
+- **RECOVERY**: no recovery fill. Trend guard emitted `dca_guard_blocked` and `guard_permanent` skips.
+- **CONFIG INCIDENT**: runtime env still allowed STUP-S recovery; corrected and verified as CNL-WPR-L only with 0.50 USDC basket cap.
+- **HARDENING**: full-size TP1 now becomes `final_exit`; terminal no-order runs become `OBSERVED_NO_FILL`.
+- **SOURCE**: `reports/V1456_MAINNET_CANARY_LIFECYCLE_2026-07-10.md`.

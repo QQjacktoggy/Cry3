@@ -113,6 +113,8 @@ def export_reconciliation(
             evidence_status = "PRE_SCHEMA"
         elif anomalies:
             evidence_status = "AMBIGUOUS"
+        elif terminal and not fills and not run["entry_order_id"]:
+            evidence_status = "OBSERVED_NO_FILL"
         elif terminal and not fills:
             evidence_status = "MISSING_EXPECTED"
             anomalies = ["terminal_run_without_fills"]
@@ -142,11 +144,11 @@ def export_reconciliation(
         })
 
     all_statuses = (
-        "PRE_SCHEMA", "OBSERVED_COMPLETE", "OBSERVED_PARTIAL",
+        "PRE_SCHEMA", "OBSERVED_COMPLETE", "OBSERVED_PARTIAL", "OBSERVED_NO_FILL",
         "MISSING_EXPECTED", "AMBIGUOUS",
     )
     return {
-        "schema": "fill_reconciliation_v2",
+        "schema": "fill_reconciliation_v3",
         "source_db": str(db_path),
         "schema_deployment_cutoff_ms": cutoff_ms,
         "schema_deployment_cutoff_source": cutoff_source,

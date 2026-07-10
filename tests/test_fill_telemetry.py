@@ -274,3 +274,45 @@ async def test_missing_armed_time_is_noop():
         run={"run_id": "run_1", "symbol": "ETHUSDC"},
     ) == 0
     assert repo.events == []
+
+@pytest.mark.asyncio
+async def test_full_size_tp1_is_classified_as_final_exit():
+    repo = FakeRepo()
+    entry = trade(10, 20, time_ms=1234, qty=0.1)
+    entry.realized_pnl = 0.0
+    exit_fill = trade(11, 21, time_ms=2234, qty=0.1)
+    exit_fill.side = "BUY"
+    exit_fill.realized_pnl = 0.05
+    client = FakeClient(
+        [entry, exit_fill],
+        [
+            {"orderId": 20, "clientOrderId": "run_entry"},
+            {"orderId": 21, "clientOrderId": "run_tp1"},
+        ],
+    )
+
+    assert await emit_fill_v1_events(repo=repo, client=client, trade_repo=None, run=RUN) == 2
+    assert [event[2]["role"] for event in repo.events] == ["entry", "final_exit"]
+
+
+@pytest.mark.asyncio
+async def test_incremental_full_size_tp1_rebuilds_open_quantity_from_existing_entry():
+    repo = FakeRepo()
+    entry = trade(10, 20, time_ms=1234, qty=0.1)
+    entry.realized_pnl = 0.0
+    client = FakeClient(
+        [entry],
+        [
+            {"orderId": 20, "clientOrderId": "run_entry"},
+            {"orderId": 21, "clientOrderId": "run_tp1"},
+        ],
+    )
+    assert await emit_fill_v1_events(repo=repo, client=client, trade_repo=None, run=RUN) == 1
+
+    exit_fill = trade(11, 21, time_ms=2234, qty=0.1)
+    exit_fill.side = "BUY"
+    exit_fill.realized_pnl = 0.05
+    client.trades.append(exit_fill)
+
+    assert await emit_fill_v1_events(repo=repo, client=client, trade_repo=None, run=RUN) == 1
+    assert repo.events[-1][2]["role"] == "final_exit"

@@ -17,7 +17,8 @@ def _database(tmp_path):
             strategy_label TEXT,
             status TEXT,
             exit_reason TEXT,
-            armed_at_ms INTEGER
+            armed_at_ms INTEGER,
+            entry_order_id INTEGER
         );
         CREATE TABLE mainnet_run_events (
             run_id TEXT,
@@ -30,10 +31,10 @@ def _database(tmp_path):
     return path, conn
 
 
-def _run(conn, run_id, armed_at_ms, status="COMPLETED"):
+def _run(conn, run_id, armed_at_ms, status="COMPLETED", entry_order_id=1):
     conn.execute(
-        "INSERT INTO mainnet_runs VALUES (?, 'ETHUSDC', 'codex', ?, 'done', ?)",
-        (run_id, status, armed_at_ms),
+        "INSERT INTO mainnet_runs VALUES (?, 'ETHUSDC', 'codex', ?, 'done', ?, ?)",
+        (run_id, status, armed_at_ms, entry_order_id),
     )
 
 
@@ -67,6 +68,7 @@ def test_explicit_cutoff_classifies_all_reconciliation_states(tmp_path):
     _run(conn, "partial", 1001, "RUNNING")
     _run(conn, "missing", 1002)
     _run(conn, "ambiguous", 1003)
+    _run(conn, "no_fill", 1004, entry_order_id=None)
     _fill(conn, "complete", 1100, "1:11", "entry")
     _fill(conn, "complete", 1200, "2:12", "final_exit")
     _fill(conn, "partial", 1300, "3:13", "entry")
@@ -83,12 +85,14 @@ def test_explicit_cutoff_classifies_all_reconciliation_states(tmp_path):
         "partial": "OBSERVED_PARTIAL",
         "missing": "MISSING_EXPECTED",
         "ambiguous": "AMBIGUOUS",
+        "no_fill": "OBSERVED_NO_FILL",
     }
     assert payload["schema_deployment_cutoff_source"] == "explicit"
     assert payload["summary"]["status_counts"] == {
         "PRE_SCHEMA": 1,
         "OBSERVED_COMPLETE": 1,
         "OBSERVED_PARTIAL": 1,
+        "OBSERVED_NO_FILL": 1,
         "MISSING_EXPECTED": 1,
         "AMBIGUOUS": 1,
     }

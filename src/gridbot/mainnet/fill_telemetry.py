@@ -32,6 +32,16 @@ def _role(client_order_id: str) -> str:
     return "unknown_exchange_fill"
 
 
+def _effective_role(base_role: str, *, fill_qty: float, open_qty: float) -> str:
+    """Promote a nominal partial TP when it closes all observed open quantity."""
+    if base_role not in {"partial_exit", "mid_exit", "final_exit"}:
+        return base_role
+    tolerance = max(1e-12, open_qty * 1e-9)
+    if open_qty > tolerance and fill_qty + tolerance >= open_qty:
+        return "final_exit"
+    return base_role
+
+
 def _api_record(trade: Any) -> dict[str, Any]:
     return {
         "trade_id": int(trade.trade_id),
@@ -202,13 +212,15 @@ async def emit_fill_v1_events(*, repo, client, trade_repo, run: dict) -> int:
     client_ids = await _order_client_ids(client, run["symbol"], start_time)
 
     emitted = 0
+    open_qty = 0.0
     for fill in fills:
         fill_key = _record_key(fill)
-        if fill_key in existing_keys:
-            continue
         order_id = fill["order_id"]
         client_order_id = client_ids.get(order_id, "")
-        await repo.log_event(
+        base_role = _role(client_order_id)
+        role = _effective_role(base_role, fill_qty=fill["qty"], open_qty=open_qty)
+        if fill_key not in existing_keys:
+            await repo.log_event(
             run["run_id"],
             "fill_v1",
             {
@@ -229,10 +241,14 @@ async def emit_fill_v1_events(*, repo, client, trade_repo, run: dict) -> int:
                 "commission_asset": fill["commission_asset"],
                 "time_ms": fill["time_ms"],
                 "liquidity": "maker" if fill["is_maker"] else "taker",
-                "role": _role(client_order_id),
-                "source": "binance_user_trades",
-            },
-        )
-        existing_keys.add(fill_key)
-        emitted += 1
+                    "role": role,
+                    "source": "binance_user_trades",
+                },
+            )
+            existing_keys.add(fill_key)
+            emitted += 1
+        if base_role in {"entry", "recovery_entry"}:
+            open_qty += fill["qty"]
+        elif base_role in {"partial_exit", "mid_exit", "final_exit", "stop_loss_exit", "exit"}:
+            open_qty = max(0.0, open_qty - fill["qty"])
     return emitted

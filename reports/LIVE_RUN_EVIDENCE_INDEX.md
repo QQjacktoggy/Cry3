@@ -119,4 +119,4 @@ This row is intentionally segregated from mainnet strategy runs. It validates ex
 
 | run_id | version | lane/state/action | status / exit | net PnL | fill_v1 | DCA/recovery | evidence |
 |---|---|---|---|---:|---:|---|---|
-| `cry3mn_1783697000031` | `_codex_v1.4.56` | `CNL-WPR-L` / `deep_discount_stable` / `v1427_base_passthrough`, LONG 2bp post-only | `FAILED` / Binance `-2019` insufficient margin | `0 USDC` | 0 | no recovery entry | no exchange order, fill, position, or commission; margin preflight gap fixed in v1.4.56b |
+| `cry3mn_1783697000031` | `_codex_v1.4.56` | `CNL-WPR-L` / `deep_discount_stable` / `v1427_base_passthrough`, LONG 2bp post-only | `FAILED` / Binance `-2019` insufficient margin | `0 USDC` | 0 | no recovery entry | no exchange order, fill, position, or commission; margin preflight gap fixed in v1.4.56b || `cry3mn_1783699350027` | `_codex_v1.4.56` | `STUP-S` / `clean_extension` / `THIN_SCALP` TP10, SHORT 2bp post-only | `COMPLETED` / `TP` | `+0.05012 USDC` | 2 | no recovery fill; guard blocked | maker entry 1790.84 and maker full exit 1789.05; reconciliation `OBSERVED_COMPLETE` |
