@@ -177,7 +177,7 @@ Expected output fields include:
 
 - Incremental fill_v1 synchronization runs after entry detection, on every RUNNING poll, before flat terminalization, and on entry failure.
 - Existing fill_key events are reloaded before emission, so repeated polls and process restarts are idempotent.
-- Reconciliation statuses are PRE_SCHEMA, OBSERVED_COMPLETE, OBSERVED_PARTIAL, MISSING_EXPECTED, and AMBIGUOUS.
+- Reconciliation statuses are PRE_SCHEMA, OBSERVED_COMPLETE, OBSERVED_PARTIAL, OBSERVED_NO_FILL, MISSING_EXPECTED, and AMBIGUOUS.
 - Mainnet ownership check is FLAT. The service log position is a testnet external/manual SHORT 0.043 ETHUSDC and is outside Codex ownership.
 - Do not arm testnet lifecycle validation on ETHUSDC while that position exists. Do not arm mainnet canary until a controlled post-schema lifecycle plan is explicitly approved.
 - Strategy, TP/SL, DCA, sizing, lane whitelist, 50 USDC ticket, and -2 USDC loop cap are unchanged.
