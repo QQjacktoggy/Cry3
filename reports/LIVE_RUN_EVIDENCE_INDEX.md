@@ -65,6 +65,7 @@ Live DB values for the same run IDs are recorded above. They do not replace repl
 | none | v1.4.54 bounded recovery design | CNL-WPR-L and STUP-S | designed configuration | 50 USDC layers; max depth 2; 0.50 USDC basket cap | not a live result | no confirmed fill at handoff | CONFIG / OPEN | `docs/maintenance_log_2026-07-05_v1.4.54.md`; `reports/CODEX_V1_4_54_LIVE_HANDOFF_2026-07-05.md` |
 | none | `_codex_v1.4.55` checked-in implementation | CNL-WPR-L, STUP-S, SFD-S | policy/configuration | recovery canary limited to CNL-WPR-L by default | not a live result | effectiveness open | CONFIG / OPEN | `src/gridbot/strategy/codex_v1_live.py`; `config/settings.py` |
 | none | `_codex_v1.4.55` VM runtime | runtime | `cry3jack` active; version verified | ticket 50 USDC; loop cap 2 USDC; DCA true | no confirmed v1.4.55 run in latest review | effectiveness open | DEPLOYED / OPEN | `reports/archive/phase1_20260710/phase1_vm_state_20260710.txt`; maintenance handoff |
+| none | `_codex_v1.4.56` telemetry-only VM runtime | runtime | `cry3jack` active; version verified | v1.4.55 strategy/risk controls retained | 1,776 runs; 0 `fill_v1` events | `has_position=True`, `trades=0`; ownership and DCA effectiveness unresolved | HANDOFF / OPEN | VM reconciliation export; backup `/home/jack_shih/cry3/.codex_deploy_backups/pre_v1456_20260710_212327/files.tgz` |
 
 ## v1.4.55: Deployment Verified, Run Outcome Open
 
@@ -80,6 +81,16 @@ The latest review covers 50 runs over 168 hours and contains versions through `_
 
 Do not claim v1.4.55 profitability or DCA effectiveness until a DB-backed v1.4.55 run is reviewed. Deployment state, service health, and policy tests are not substitutes for a filled-run outcome.
 
+## v1.4.56: Telemetry Deployed, Fill Outcome Open
+
+On 2026-07-10, `cry3.service` remained active and the VM loaded `_codex_v1.4.56`. The release is telemetry-only: it adds the `fill_v1` evidence/export contract while retaining the v1.4.55 strategy and risk rules. Focused policy and one-run verification was **TEST**: `281 passed, 3 warnings`.
+
+Deployment rollback provenance is preserved at `/home/jack_shih/cry3/.codex_deploy_backups/pre_v1456_20260710_212327/files.tgz`.
+
+The first reconciliation export found 1,776 runs and 0 `fill_v1` events. Treat this as **HANDOFF/OPEN**, not as proof of no fills or proof that telemetry works under a real lifecycle: the run population includes pre-schema history and no post-schema filled lifecycle has been reviewed. Runtime also reported `has_position=True` while the available trade query returned `trades=0`; ownership, environment, and exchange identity remain unresolved.
+
+No v1.4.56 profitability, DCA effectiveness, or recovery effectiveness claim is permitted until a post-schema `fill_v1` lifecycle is reconciled to exchange fills, commissions, exit reason, and final net PnL.
+
 ## Refresh Sources
 
 - VM `mainnet_runs`: status, exit reason, side, prices, quantity, realized PnL, commission, signal JSON, and params JSON.
@@ -88,3 +99,11 @@ Do not claim v1.4.55 profitability or DCA effectiveness until a DB-backed v1.4.5
 - Durable snapshot: `reports/archive/phase1_20260710/`.
 
 When runtime state matters, VM DB and service-log evidence override checked-in defaults. When outcome state matters, a deployment record alone is insufficient.
+
+## v1.4.56a Runtime Verification - 2026-07-10
+
+The hardening deployment keeps strategy version _codex_v1.4.56 and changes telemetry only. VM-side compilation, service restart, runtime import, and 281 focused tests passed. Backup: .codex_deploy_backups/pre_v1456a_20260710/files.tgz (SHA-256 b21d788c2857c54588d3f4da62c471b5186fd38401572cbc58fc48c88af1a149).
+
+Using the explicit v1.4.56 deployment cutoff, reconciliation reports PRE_SCHEMA=1776, OBSERVED_COMPLETE=0, OBSERVED_PARTIAL=0, MISSING_EXPECTED=0, and AMBIGUOUS=0.
+
+Ownership is now separated by environment: mainnet is FLAT; testnet holds an external/manual ETHUSDC SHORT of 0.043 with no bot-prefixed open order, active run, or recent trade identity. This position is not a Codex run and must not be modified by lifecycle validation.

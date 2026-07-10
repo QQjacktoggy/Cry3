@@ -1,14 +1,24 @@
 # Strategy Rulebook Current
 
-Generated: 2026-07-09 TPE
+Generated: 2026-07-10 TPE
 
-Scope: current local rule surface for Codex v1.4.55 and mainnet one-run recovery behavior. This is not a strategy thesis; it is an implementation contract for operators and future developers.
+Scope: current local rule surface for Codex v1.4.56 telemetry and the retained v1.4.55 strategy/mainnet one-run recovery behavior. This is not a strategy thesis; it is an implementation contract for operators and future developers.
 
 ## Version
 
-- `CODEX_V1_VERSION = "_codex_v1.4.55"`
+- `CODEX_V1_VERSION = "_codex_v1.4.56"`
 - Source: `src/gridbot/strategy/codex_v1_live.py`
 - Policy test: `tests/test_codex_v1_live_policy.py::test_codex_v1_version_is_pinned`
+
+## v1.4.56 Telemetry-Only Contract
+
+- v1.4.56 adds `fill_v1` telemetry and reconciliation export only.
+- It does not change the v1.4.55 adaptive routes, lane admission, TP/SL, DCA conditions, ticket size, or risk caps.
+- VM handoff evidence verifies `cry3.service` active and `_codex_v1.4.56` loaded.
+- Deployment backup: `/home/jack_shih/cry3/.codex_deploy_backups/pre_v1456_20260710_212327/files.tgz`.
+- Initial reconciliation: 1,776 runs, 0 `fill_v1` events.
+- `has_position=True` with `trades=0` is unresolved and blocks any assumption that position ownership or live fill reconciliation is complete.
+- No DCA/recovery effectiveness claim is allowed without a reviewed `recovery_entry_filled` and final exchange-reconciled net outcome.
 
 ## v1.4.55 Adaptive Route
 
@@ -123,9 +133,10 @@ Required focused verification:
 python -m pytest tests/test_codex_v1_live_policy.py tests/test_mainnet_one_run_maker.py -q
 ```
 
-Current expected coverage:
+Current verified coverage (`281 passed, 3 warnings`):
 
-- Version is `_codex_v1.4.55`.
+- Version is `_codex_v1.4.56`.
+- `fill_v1` telemetry/reconciliation contracts are covered by focused tests; live fill behavior remains OPEN while the VM count is 0.
 - Clean-extension TP14 route is blocked.
 - TP8/TP10 thin scalp route remains allowed when gate passes.
 - DCA runtime config reaches payload.
@@ -159,3 +170,14 @@ Expected output fields include:
 - Do not assume DCA helped unless recovery filled and final exit is reviewed.
 - Do not assume STUP-S thin scalp evidence transfers to STUP-S TP14 or STUP-S mixed.
 - Do not assume old reports are clean git history; many evidence files are currently untracked archive material.
+- Do not interpret 1,776 runs with 0 `fill_v1` as a strategy result; the population includes pre-schema history.
+- Do not arm a new canary while `has_position=True` / `trades=0` ownership remains unresolved.
+
+## v1.4.56a Operational Gate
+
+- Incremental fill_v1 synchronization runs after entry detection, on every RUNNING poll, before flat terminalization, and on entry failure.
+- Existing fill_key events are reloaded before emission, so repeated polls and process restarts are idempotent.
+- Reconciliation statuses are PRE_SCHEMA, OBSERVED_COMPLETE, OBSERVED_PARTIAL, MISSING_EXPECTED, and AMBIGUOUS.
+- Mainnet ownership check is FLAT. The service log position is a testnet external/manual SHORT 0.043 ETHUSDC and is outside Codex ownership.
+- Do not arm testnet lifecycle validation on ETHUSDC while that position exists. Do not arm mainnet canary until a controlled post-schema lifecycle plan is explicitly approved.
+- Strategy, TP/SL, DCA, sizing, lane whitelist, 50 USDC ticket, and -2 USDC loop cap are unchanged.

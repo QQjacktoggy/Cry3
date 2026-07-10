@@ -16,7 +16,12 @@ This is an archive ledger, not a performance report or VM deployment record. Sou
 
 ## Current Position
 
-- A 2026-07-10 **HANDOFF** snapshot verifies live host `cry3jack`, `cry3.service` active, and VM import `CODEX_V1_VERSION = "_codex_v1.4.55"`.
+- A 2026-07-10 **HANDOFF** snapshot verifies live host `cry3jack`, `cry3.service` active, and VM import `CODEX_V1_VERSION = "_codex_v1.4.56"`.
+- v1.4.56 is telemetry-only: it adds the `fill_v1` event/export contract and does not change the v1.4.55 lane, TP/SL, DCA, sizing, or risk policy.
+- Focused local verification is **TEST**: `281 passed, 3 warnings` across the live-policy and one-run suites.
+- The VM deployment backup is `/home/jack_shih/cry3/.codex_deploy_backups/pre_v1456_20260710_212327/files.tgz`.
+- The first VM reconciliation export is **HANDOFF/OPEN**: 1,776 runs and 0 `fill_v1` events. This is expected to include pre-schema history and is not evidence of filled v1.4.56 behavior.
+- Runtime observation `has_position=True` with `trades=0` remains unresolved; no new live canary should be inferred from this state.
 - The same snapshot preserves separate SHA-256 values for `.codex_deploy/v1455_20260709/files.tgz` and `.codex_deploy_backups/v1455_20260709/files.tgz`; these checksums identify handoff artifacts, not strategy outcomes.
 - Local v1.4.55 policy/executor verification is **TEST**: `259 passed, 3 warnings` on 2026-07-10.
 - The latest 50-run / 168h review export contains no run confirmed as `_codex_v1.4.55`; deployment is verified, first-run behavior is not.
@@ -76,12 +81,14 @@ This is an archive ledger, not a performance report or VM deployment record. Sou
 | v1.4.53 / 2026-07-05 | Stop high-range/high-zone reopen. | Block legacy-reopened clean-extension short. | **TEST/CONFIG**; replay required before relaxing. | **LIVE**: `1783237051530`, `1783237610286` motivated it. | Monitor signal count and MFE/MAE. | `docs/maintenance_log_2026-07-05_v1.4.53.md` |
 | v1.4.54 / 2026-07-05 | Bounded recovery. | Two 50U maker DCA layers at 0.5%/0.7%; `CNL-WPR-L`/`STUP-S`; 0.50U cap. | **TEST/CONFIG**: contract/handoff. | **unknown/open**: no `recovery_entry_filled`. | Not martingale; average-entry TP sync, not independent layers. | `docs/maintenance_log_2026-07-05_v1.4.54.md`; `reports/CODEX_V1_4_54_LIVE_HANDOFF_2026-07-05.md` |
 | v1.4.55 / 2026-07-10 | Archive handoff/narrowed recovery canary. | `BLOCK`, `THIN_SCALP`, `NORMAL`, `RECOVERY_CANARY`, `OBSERVE_ONLY`; block STUP-S TP14; gate-passing TP8/10 thin scalp; default recovery `CNL-WPR-L`. | **TEST**: policy/executor contracts for version, routes, payload, skip reasons, controls. | **unknown/open**: first handoff canary; no reviewed recovery fill. | Defaults are not VM proof; STUP-S recovery default-rejected; fee-safe exits open. | `docs/maintenance_log_2026-07-10_v1.4.55.md`; `src/gridbot/strategy/codex_v1_live.py`; `src/gridbot/mainnet/one_run.py`; `config/settings.py`; `tests/test_codex_v1_live_policy.py`; `tests/test_mainnet_one_run_maker.py` |
+| v1.4.56 / 2026-07-10 | Telemetry-only fill evidence contract. | Adds `fill_v1` emission and reconciliation export; retains v1.4.55 strategy and risk behavior. | **TEST**: 281 focused tests passed, 3 warnings. | **HANDOFF/OPEN**: VM active/version verified; 1,776 runs and 0 `fill_v1`; no post-schema filled lifecycle reviewed. | `has_position=True` with `trades=0` is unresolved; no DCA/recovery effectiveness claim. | `src/gridbot/mainnet/fill_telemetry.py`; `scripts/export_fill_reconciliation.py`; `src/gridbot/mainnet/one_run.py`; VM backup `/home/jack_shih/cry3/.codex_deploy_backups/pre_v1456_20260710_212327/files.tgz` |
 
 ## Current Claim Register
 
 | Claim | Status | Source pointers | Boundary |
 |---|---|---|---|
-| Local version is `_codex_v1.4.55`. | **TEST/CONFIG** | strategy source; policy test | Not VM deployment proof. |
+| Local and VM version is `_codex_v1.4.56`. | **TEST/HANDOFF** | strategy source; policy test; VM runtime snapshot | Version/service health is not filled-trade proof. |
+| v1.4.56 records/exports `fill_v1` without changing strategy policy. | **TEST/CONFIG** | `src/gridbot/mainnet/fill_telemetry.py`; exporter and one-run tests | 0 VM events means the live lifecycle is not yet validated. |
 | `v1455_stups_clean_extension_tp14_block` blocks STUP-S clean-extension TP14. | **TEST/CONFIG** | strategy source; policy tests | Does not prove PnL of block. |
 | Gate-accepted TP8/TP10 STUP-S clean-extension may pass as `THIN_SCALP`. | **TEST/CONFIG** | strategy source; policy tests | Selective policy, not validated module. |
 | Runtime payload includes DCA/recovery enable and block metadata. | **TEST/CONFIG** | `src/gridbot/mainnet/one_run.py`; maker tests | Payload is not fill proof. |
@@ -99,6 +106,9 @@ This is an archive ledger, not a performance report or VM deployment record. Sou
 | STUP-S mixed cohort | **OPEN** | Larger fee-aware sample; v1.4.42 was 0/5 filled net wins. |
 | Fee-safe maker exits | **OPEN** | Fill/cancel/defer events, commissions, net PnL. |
 | Checked-in versus running VM config | **OPEN** | Deployed manifest, service health, runtime banner, first-loop review. |
+| v1.4.56 live fill contract | **OPEN** | A post-schema `fill_v1` entry/exit lifecycle reconciled to exchange trades and commissions. |
+| Runtime position ownership | **OPEN** | Resolve `has_position=True` / `trades=0` to account, environment, symbol, side, quantity, and order/trade identity. |
+| Qlib baseline | **REPLAY / REJECTED** | Current baseline failed the research acceptance threshold; new labels/experiment lineage are required before reconsideration. |
 
 ## Evidence Rules
 
@@ -111,3 +121,12 @@ This is an archive ledger, not a performance report or VM deployment record. Sou
 ## Migration Implication
 
 Use this repository as the historical record. A clean project should first reproduce these fixtures, failure paths, fee accounting, and replay assumptions before searching for new alpha.
+
+## v1.4.56a Telemetry Hardening Verification - 2026-07-10
+
+- **TEST**: 281 focused tests passed with 3 dependency deprecation warnings.
+- **DEPLOYED**: incremental and restart-idempotent fill_v1 sync is active on cry3jack; runtime remains _codex_v1.4.56.
+- **BACKUP**: .codex_deploy_backups/pre_v1456a_20260710/files.tgz, SHA-256 b21d788c2857c54588d3f4da62c471b5186fd38401572cbc58fc48c88af1a149.
+- **RECONCILIATION**: explicit schema cutoff classifies all 1,776 retained runs as PRE_SCHEMA; there are 0 post-schema fill events and no missing/ambiguous claim yet.
+- **POSITION OWNERSHIP**: mainnet is FLAT with no active run or open orders. The earlier has_position=True log belongs to testnet: external/manual SHORT 0.043 ETHUSDC with no bot order or recent trade identity.
+- **GATE**: do not close or adopt the external testnet position. Testnet lifecycle validation and mainnet canary remain unarmed until a clean symbol/account state is available.

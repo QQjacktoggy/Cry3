@@ -77,6 +77,8 @@ Validation uses staggered, time-separated windows and a final untouched holdout.
 
 Open decision: native Qlib, a Qlib-compatible adapter, or another experiment framework. The manifest and availability-time requirements apply in all cases.
 
+Current legacy-research evidence: the first Qlib baseline is **REPLAY / REJECTED**. Its holdout result does not qualify as a strategy candidate or live input. Preserve the experiment and rejection in the evidence store; any retry requires a new label/feature hypothesis and experiment lineage rather than tuning against the examined holdout.
+
 ## Tick Replay
 
 Replay reconstructs a decision from frozen event-time inputs and applies a declared execution model only to subsequent ticks. A replay request includes strategy manifest digest, risk-policy digest, feature snapshot ID, decision time, symbol/side, planned orders, source dataset versions, and mode.
@@ -172,6 +174,8 @@ Seed fixtures cover known DCA/trailing/order-cleanup failures, hot-entry losses,
 
 A legacy result that cannot be reproduced remains an observation, not a behavior the new system must emulate.
 
+The cry3 v1.4.56 telemetry handoff is an archive input, not a promotion signal. Preserve the VM version/service snapshot, the 281-focused-test result, deployment backup path, reconciliation population of 1,776 runs, 0 `fill_v1` events, and unresolved `has_position=True` / `trades=0` state with their evidence labels. Pre-schema runs must not be classified as missing post-schema telemetry. No DCA/recovery effectiveness claim may be imported without `recovery_entry_filled`, exchange fills/commissions, exit reason, and final net PnL.
+
 ## Migration Stages and Acceptance Gates
 
 | Stage | Scope | Exit gate |
@@ -196,3 +200,9 @@ No gate passes solely on win rate or PnL. Review worst losses, adverse overlaps,
 - Shadow and paper gates pass, including restart and reconciliation drills.
 - Capital, leverage, DCA, rollback authority, on-call ownership, and alerts are explicitly approved.
 - No cry3 value or behavior is assumed without an evidence pointer and a new-project decision.
+
+## Legacy v1.4.56a Import Note - 2026-07-10
+
+The legacy adapter must import fill_v1 by stable fill_key, preserve unknown/algo order identity as ambiguous, and retain the schema deployment cutoff. Current retained history is entirely PRE_SCHEMA (1,776 runs); zero post-schema fills exist.
+
+Position evidence must carry environment ownership. The verified snapshot is mainnet FLAT and testnet external/manual ETHUSDC SHORT 0.043. Neither the position nor historical PnL is promotion evidence. A future observed lifecycle becomes replay-eligible only after entry and exit fills, fees, order identity, and final net PnL reconcile without ambiguity.
