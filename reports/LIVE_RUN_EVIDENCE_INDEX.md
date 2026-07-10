@@ -115,3 +115,8 @@ Ownership is now separated by environment: mainnet is FLAT; testnet holds an ext
 | `tprobe_1783696606` | Binance Futures testnet | BTCUSDC | telemetry probe / N/A / market lifecycle | probe cleanup | `-0.19744382 USDC` after commission | none; not a recovery test | entry and exit `fill_v1`; second sync emitted 0; final position flat |
 
 This row is intentionally segregated from mainnet strategy runs. It validates exchange-fill telemetry and idempotency only.
+## v1.4.56 Mainnet First Canary - 2026-07-10
+
+| run_id | version | lane/state/action | status / exit | net PnL | fill_v1 | DCA/recovery | evidence |
+|---|---|---|---|---:|---:|---|---|
+| `cry3mn_1783697000031` | `_codex_v1.4.56` | `CNL-WPR-L` / `deep_discount_stable` / `v1427_base_passthrough`, LONG 2bp post-only | `FAILED` / Binance `-2019` insufficient margin | `0 USDC` | 0 | no recovery entry | no exchange order, fill, position, or commission; margin preflight gap fixed in v1.4.56b |

@@ -139,3 +139,11 @@ Use this repository as the historical record. A clean project should first repro
 - **IDEMPOTENCY**: first sync emitted 2 events and immediate second sync emitted 0.
 - **BOUNDARY**: this validates telemetry against real testnet exchange fills. It is not mainnet, strategy-profit, or recovery/DCA effectiveness evidence.
 - **SOURCE**: `reports/V1456A_FILL_V1_TESTNET_LIFECYCLE_2026-07-10.md`; `scripts/run_fill_v1_testnet_probe.py`.
+## v1.4.56b Mainnet Margin Preflight Incident - 2026-07-10
+
+- **LIVE/FAILED-NO-FILL**: `cry3mn_1783697000031` accepted `CNL-WPR-L:deep_discount_stable` at 50 USDC but Binance rejected entry with `-2019 Margin is insufficient`.
+- **ACCOUNTING**: no order/fill/position/commission; net PnL `0`; `fill_v1=0`; `recovery_entry_filled=0`.
+- **ROOT CAUSE**: 0.4234 USDC could not fund the 150 USDC / 75x recovery basket; arm preflight did not check margin capacity.
+- **FIX/TEST**: basket margin preflight with 5% buffer deployed; 264 tests passed, 3 warnings; service active.
+- **GATE**: do not re-arm until `USDC availableBalance >= 2.1000`; recommend at least 3 USDC.
+- **SOURCE**: `reports/V1456B_MARGIN_PREFLIGHT_INCIDENT_2026-07-10.md`.
