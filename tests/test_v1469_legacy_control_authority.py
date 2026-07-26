@@ -43,6 +43,17 @@ def test_exact_profile_hash_excludes_submit_price_and_caps():
     assert replace(base, sl_bp=9).execution_profile.profile_hash != base.execution_profile.profile_hash
     assert replace(base, take_profits=(TakeProfitLevel(level_id="FULL", target_bp=9, fraction=1),)).execution_profile.profile_hash != base.execution_profile.profile_hash
     assert replace(base, entry_ttl_s=91).execution_profile.profile_hash != base.execution_profile.profile_hash
+    payload = base.to_payload()
+    assert payload["profile_id"] == "LEGACY_CONTROL"
+    assert payload["execution_profile_hash"] == base.execution_profile.profile_hash
+    assert payload["submit_authority_hash"] == base.submit_authority_hash
+    assert payload["take_profits"] == [
+        {"level_id": "FULL", "target_bp": 8.0, "fraction": 1.0}
+    ]
+    # Submit-only cap/reference inputs remain observable and change the
+    # authority hash without fragmenting the execution cohort.
+    assert replace(base, lane_notional_cap_usdc=20).submit_authority_hash != base.submit_authority_hash
+    assert replace(base, reference_price=2100).submit_authority_hash != base.submit_authority_hash
 
     with pytest.raises(ValueError, match="must be positive"):
         snapshot(reference_price=float("nan"))

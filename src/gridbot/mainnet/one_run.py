@@ -123,6 +123,19 @@ from src.gridbot.mainnet.v1465_w6a_profile_selector import (
     parse_w6a_profile_evidence,
     select_w6a_winner,
 )
+from src.gridbot.mainnet.v1469_adaptive_identity import (
+    BreakevenPolicy,
+    DcaLayer,
+    DcaPolicy,
+    EarlyFailPolicy,
+    MarketStateIdentity,
+    RepricePolicy,
+    RunnerPolicy,
+    TakeProfitLevel,
+    TrailPolicy,
+    canonical_sha256,
+)
+from src.gridbot.mainnet.v1469_legacy_control import LegacyExecutionSnapshot
 from src.gridbot.mainnet.fill_telemetry import emit_fill_v1_events
 from src.gridbot.storage.repositories import FuturesTradeRepository, MainnetRunRepository
 from src.gridbot.storage.v1465_w6a_profile_repository import (
@@ -481,6 +494,10 @@ class MainnetOneRunManager:
         self._v1469_observation_tasks: set[asyncio.Task[None]] = set()
         self._v1469_observation_dropped = 0
         self._v1469_observation_repo_missing_logged = False
+        # Accepted observations are held only until _place_entry has resolved
+        # every legacy overlay.  This lets the exact paid control join the same
+        # durable opportunity without changing the legacy order path.
+        self._v1469_pending_paid_observations: dict[str, tuple[str, dict[str, Any], tuple[dict[str, Any], ...]]] = {}
         self._v1469_paired_shadow_runtime = (
             V1469PairedShadowRuntime(arm_observation_repo)
             if arm_observation_repo is not None
@@ -1754,6 +1771,38 @@ class MainnetOneRunManager:
             )
             return
 
+        # The real paid path always supplies its resolved signal reference.
+        # Observation-only/unit callers that omit it retain the original
+        # immediate, non-blocking behavior.
+        if (
+            effective_decision.accepted
+            and reference_price is not None
+            and math.isfinite(normalized_reference_price)
+            and normalized_reference_price > 0
+        ):
+            pending = getattr(self, "_v1469_pending_paid_observations", None)
+            if pending is None:
+                pending = {}
+                self._v1469_pending_paid_observations = pending
+            pending[str(run.get("run_id") or "")] = (
+                dedup_key,
+                dict(batch.opportunity),
+                tuple(dict(item) for item in batch.candidates),
+            )
+            return
+
+        self._v1469_schedule_observation(
+            repository, str(run.get("run_id") or ""), dedup_key,
+            dict(batch.opportunity), tuple(dict(item) for item in batch.candidates),
+        )
+
+    def _v1469_schedule_observation(
+        self, repository: V1469ArmObservationRepository, run_id: str,
+        dedup_key: str, opportunity: Mapping[str, Any],
+        candidates: Sequence[Mapping[str, Any]],
+    ) -> None:
+        """Schedule passive persistence; never raise into paid legacy flow."""
+
         if (
             len(self._v1469_observation_tasks)
             >= self.V1469_OBSERVATION_MAX_INFLIGHT
@@ -1761,7 +1810,7 @@ class MainnetOneRunManager:
             self._v1469_observation_dropped += 1
             logger.warning(
                 "v1469_lane_observation_queue_full",
-                run_id=run.get("run_id"),
+                run_id=run_id,
                 inflight=len(self._v1469_observation_tasks),
                 dropped=self._v1469_observation_dropped,
             )
@@ -1771,12 +1820,12 @@ class MainnetOneRunManager:
         task = asyncio.create_task(
             self._v1469_persist_lane_observation(
                 repository=repository,
-                run_id=str(run.get("run_id") or ""),
+                run_id=run_id,
                 dedup_key=dedup_key,
-                opportunity=batch.opportunity,
-                candidates=batch.candidates,
+                opportunity=opportunity,
+                candidates=candidates,
             ),
-            name=f"cry3-v1469-observation-{batch.opportunity_id[-12:]}",
+            name=f"cry3-v1469-observation-{str(opportunity.get('opportunity_id') or '')[-12:]}",
         )
         self._v1469_observation_tasks.add(task)
         task.add_done_callback(self._v1469_observation_tasks.discard)
@@ -18775,6 +18824,129 @@ class MainnetOneRunManager:
         run["_hold_start_ms"] = hold_start_ms
         return hold_start_ms
 
+    def _v1469_build_resolved_legacy_snapshot(
+        self, run: Mapping[str, Any], decision: WildcatLiveDecision,
+        codex_decision: CodexV1Decision | None, *, entry_signal_price: float,
+        entry_offset_bp: float, entry_notional: float,
+        opportunity: Mapping[str, Any], candidates: Sequence[Mapping[str, Any]],
+    ) -> LegacyExecutionSnapshot:
+        """Freeze the actual legacy controls without consulting arm defaults."""
+        selected = [item for item in candidates if bool(item.get("is_selected"))]
+        if len(selected) != 1:
+            raise ValueError(f"selected_lane_count:{len(selected)}")
+        candidate = selected[0]
+        lane = str(candidate.get("lane_code") or "").strip().upper()
+        side = str(decision.side or "").strip().upper()
+        strategy = str(run.get("strategy") or decision.strategy or "").strip().upper()
+        snapshot_value = opportunity.get("feature_snapshot")
+        features = dict(snapshot_value) if isinstance(snapshot_value, Mapping) else {}
+        regime = str(opportunity.get("coarse_regime") or "").strip().upper()
+        market_state = str(features.get("v1469_regime_market_state") or features.get("market_state") or "").strip().lower()
+        if not all((lane, side, strategy, regime, market_state)):
+            raise ValueError("selected_market_identity_incomplete")
+        identity = MarketStateIdentity(environment="MAINNET", symbol=str(run.get("symbol") or ""),
+            lane_code=lane, effective_side=side, strategy=strategy,
+            coarse_regime=regime, market_state=market_state)
+
+        if not math.isfinite(entry_signal_price) or entry_signal_price <= 0:
+            raise ValueError("entry_reference_price_invalid")
+        tp_levels: list[TakeProfitLevel] = []
+        partial_fraction = float(decision.partial_exit_pct)
+        partial_bp = float(decision.partial_tp_pct) * 10_000.0
+        remaining = 1.0
+        if 0.0 < partial_fraction < 1.0 and partial_bp > 0.0:
+            tp_levels.append(TakeProfitLevel(level_id="PARTIAL", target_bp=partial_bp, fraction=partial_fraction))
+            remaining -= partial_fraction
+        prices = tuple(decision.signal.take_profits or ())
+        if not prices:
+            raise ValueError("take_profit_ladder_missing")
+        for index, raw_price in enumerate(prices):
+            price = float(raw_price)
+            target_bp = abs(price - entry_signal_price) / entry_signal_price * 10_000.0
+            fraction = remaining if index == len(prices) - 1 else remaining / len(prices)
+            tp_levels.append(TakeProfitLevel(level_id=f"TP{index + 1}", target_bp=target_bp, fraction=fraction))
+            remaining -= fraction
+
+        sl_bp = self._entry_sl_pct_for_decision(decision, codex_decision) * 10_000.0
+        max_hold_s = int(decision.max_holding_bars) * 60
+        ttl_s = (int(self._settings.mainnet_entry_limit_ttl_bars) * 60
+                 if codex_decision is None and float(self._settings.mainnet_entry_limit_offset) > 0
+                 else int(self._codex_v1_live_entry_ttl_policy({"signal_json": {"codex_v1": {
+                     "enabled": codex_decision is not None,
+                     "lane_code": codex_decision.lane_code if codex_decision else None,
+                     "metrics": getattr(codex_decision, "metrics", None) if codex_decision else None,
+                 }}})["ttl_seconds"]))
+        reprice_enabled = int(self._settings.mainnet_entry_reprice_max_updates) > 0
+        reprice = RepricePolicy(enabled=reprice_enabled,
+            after_s=int(self._settings.mainnet_entry_requote_min_age_seconds) if reprice_enabled else 0,
+            offset_bp=float(self._settings.mainnet_entry_max_deviation_bps) if reprice_enabled else 0.0,
+            max_reprices=int(self._settings.mainnet_entry_reprice_max_updates) if reprice_enabled else 0)
+        lane_prefix = "stups" if lane == "STUP-S" else "w6a" if lane == "W6A" else "s2st" if strategy == "S2_SUPERTREND" else "wpr"
+        be_enabled = bool(getattr(self._settings, f"mainnet_codex_{lane_prefix}_use_breakeven_sl", False))
+        be_lock = float(getattr(self._settings, f"mainnet_codex_{lane_prefix}_breakeven_offset_bp", 0.0)) if be_enabled else 0.0
+        breakeven = BreakevenPolicy(enabled=be_enabled,
+            trigger_bp=partial_bp if be_enabled else 0.0, lock_bp=be_lock)
+        trail_enabled = bool(self._settings.mainnet_trail_enabled)
+        full_tp_bp = max(item.target_bp for item in tp_levels)
+        trail = TrailPolicy(enabled=trail_enabled,
+            arm_bp=full_tp_bp * float(self._settings.mainnet_trail_arm_frac) if trail_enabled else 0.0,
+            giveback_bp=full_tp_bp * float(self._settings.mainnet_trail_giveback_frac) if trail_enabled else 0.0,
+            floor_bp=float(self._settings.mainnet_trail_profit_floor_bp) if trail_enabled else 0.0)
+        runner_enabled = bool(trail_enabled and self._settings.mainnet_trail_disable_final_tp)
+        runner = RunnerPolicy(enabled=runner_enabled,
+            fraction=max(0.0, 1.0 - partial_fraction) if runner_enabled else 0.0,
+            take_profit_cap_bp=0.0)
+        early_enabled = int(decision.adverse_exit_bars) > 0 and float(decision.adverse_exit_loss_pct) > 0
+        early_fail = EarlyFailPolicy(enabled=early_enabled,
+            after_s=int(decision.adverse_exit_bars) * 60 if early_enabled else 0,
+            max_mfe_bp=0.0, adverse_bp=float(decision.adverse_exit_loss_pct) * 10_000.0 if early_enabled else 0.0)
+        recovery = self._recovery_runtime_payload(lane_code=lane, uses_codex_v1=codex_decision is not None)
+        dca_enabled = bool(recovery["effective_recovery_enabled"])
+        layers = tuple(DcaLayer(layer_id=f"L{index + 1}",
+            trigger_adverse_bp=float(self._settings.mainnet_recovery_trigger_pct) * 10_000.0 * (index + 1),
+            additional_fraction=1.0 / int(self._settings.mainnet_recovery_steps))
+            for index in range(int(self._settings.mainnet_recovery_steps))) if dca_enabled else ()
+        dca = DcaPolicy(enabled=dca_enabled, layers=layers)
+        global_cap = float(self._settings.mainnet_effective_max_cumulative_notional_usdc)
+        lane_cap = min(float(entry_notional), global_cap)
+        risk_hash = canonical_sha256({"lane_cap": lane_cap, "global_cap": global_cap,
+            "sl_bp": sl_bp, "entry_notional": float(entry_notional),
+            "leverage": int(self._settings.mainnet_leverage)})
+        return LegacyExecutionSnapshot(market_identity=identity,
+            entry_offset_bp=float(entry_offset_bp), entry_type="LIMIT",
+            entry_ttl_s=ttl_s, maker_mode="POST_ONLY", take_profits=tuple(tp_levels),
+            sl_bp=sl_bp, max_hold_s=max_hold_s, reprice=reprice,
+            breakeven=breakeven, trail=trail, runner=runner,
+            early_fail=early_fail, dca=dca, lane_notional_cap_usdc=lane_cap,
+            global_notional_cap_usdc=global_cap, risk_policy_hash=risk_hash,
+            reference_price=float(entry_signal_price))
+
+    def _v1469_finish_paid_observation(
+        self, run: Mapping[str, Any], decision: WildcatLiveDecision,
+        codex_decision: CodexV1Decision | None, *, entry_signal_price: float,
+        entry_offset_bp: float, entry_notional: float,
+    ) -> None:
+        pending_by_run = getattr(self, "_v1469_pending_paid_observations", {})
+        pending = pending_by_run.pop(str(run.get("run_id") or ""), None)
+        if pending is None or self._v1469_arm_observation_repo is None:
+            return
+        dedup_key, opportunity, candidates = pending
+        feature_snapshot = dict(opportunity.get("feature_snapshot") or {})
+        try:
+            legacy = self._v1469_build_resolved_legacy_snapshot(run, decision, codex_decision,
+                entry_signal_price=entry_signal_price, entry_offset_bp=entry_offset_bp,
+                entry_notional=entry_notional, opportunity=opportunity, candidates=candidates)
+            opportunity["legacy_execution_snapshot"] = legacy
+            feature_snapshot["legacy_control"] = legacy.to_payload()
+        except Exception as exc:  # noqa: BLE001 - evidence fails closed, paid path unchanged
+            reason = f"exact_snapshot_data_blocked:{type(exc).__name__}:{str(exc)[:160]}"
+            feature_snapshot["legacy_control_data_blocked_reason"] = reason
+            logger.error("v1469_legacy_control_snapshot_data_blocked",
+                run_id=run.get("run_id"), reason=reason)
+        opportunity["feature_snapshot"] = feature_snapshot
+        self._v1469_schedule_observation(self._v1469_arm_observation_repo,
+            str(run.get("run_id") or ""), dedup_key, opportunity, candidates)
+
     async def _place_entry(
         self,
         run: dict,
@@ -18864,8 +19036,6 @@ class MainnetOneRunManager:
                 run, decision, codex_decision, adaptive_decision_payload
             )
 
-        await self._ensure_fee_guard(run["symbol"])
-        await self._client.set_leverage(run["symbol"], self._settings.mainnet_leverage)
         side = "BUY" if decision.side == "LONG" else "SELL"
         entry_notional = decision.signal.planned_notional_usdc
 
@@ -18881,6 +19051,21 @@ class MainnetOneRunManager:
             decision.side,
             entry_offset_bp,
         )
+        self._v1469_finish_paid_observation(
+            run, decision, codex_decision,
+            entry_signal_price=entry_signal_price,
+            entry_offset_bp=(
+                entry_offset_bp
+                + (
+                    float(self._settings.mainnet_entry_limit_offset) * 10_000.0
+                    if codex_decision is None
+                    else 0.0
+                )
+            ),
+            entry_notional=entry_notional,
+        )
+        await self._ensure_fee_guard(run["symbol"])
+        await self._client.set_leverage(run["symbol"], self._settings.mainnet_leverage)
         # V6.5: remember the actual sizing scale so DCA cumulative-cap checks
         # can scale the cap with the entry (fixes the 1.2x bookkeeping bug).
         base_notional = self._settings.mainnet_effective_entry_notional_usdc

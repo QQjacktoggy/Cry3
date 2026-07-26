@@ -101,6 +101,27 @@ class LegacyExecutionSnapshot:
                 "risk_policy_hash": str(self.risk_policy_hash),
                 "reference_price": float(self.reference_price)}
 
+    def to_payload(self) -> dict[str, Any]:
+        """Return the complete canonical, JSON-safe observation snapshot."""
+        return {
+            "market_identity": self.market_identity.to_payload(),
+            "entry_offset_bp": float(self.entry_offset_bp),
+            "entry_type": str(self.entry_type).strip().upper(),
+            "entry_ttl_s": int(self.entry_ttl_s),
+            "maker_mode": str(self.maker_mode).strip().upper(),
+            "take_profits": [item.to_payload() for item in self.take_profits],
+            "sl_bp": float(self.sl_bp),
+            "max_hold_s": int(self.max_hold_s),
+            "reprice": self.reprice.to_payload(),
+            "breakeven": self.breakeven.to_payload(),
+            "trail": self.trail.to_payload(),
+            "runner": self.runner.to_payload(),
+            "early_fail": self.early_fail.to_payload(),
+            "dca": self.dca.to_payload(),
+            **self.submit_authority_payload(),
+            "submit_authority_hash": self.submit_authority_hash,
+        }
+
     @property
     def submit_authority_hash(self) -> str:
         return canonical_sha256(self.submit_authority_payload())
@@ -114,4 +135,3 @@ def build_legacy_execution_snapshot(value: Mapping[str, Any]) -> LegacyExecution
     if unknown or missing:
         raise ValueError(f"legacy snapshot incomplete: missing={sorted(missing)}, unknown={sorted(unknown)}")
     return LegacyExecutionSnapshot(**dict(value))
-

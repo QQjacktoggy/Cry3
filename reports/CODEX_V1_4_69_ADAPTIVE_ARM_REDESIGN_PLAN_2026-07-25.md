@@ -2,7 +2,7 @@
 
 日期：2026-07-25  
 對象：Cry3 Live Mainnet Adaptive  
-狀態：**R0、R1-B 與 R1-C1 完成；R1-D ownership/preflight checkpoint 完成但 order-boundary wiring 尚未完成／部署**
+狀態：**R0、R1-B、R1-C1 與 R1-D2 完成；R1-D authority/order-boundary wiring 尚未完成／部署**
 
 ## 0. 2026-07-26 implementation checkpoint
 
@@ -35,6 +35,16 @@ Binance connect 前驗證 exact 30s/15m/45m/180m/freshness/lease settings 及 01
 schema。Binance client 亦新增 deterministic CID reconciliation query。因真實 `_place_entry`
 仍未完成 caller-resolved snapshot、rolling arbiter、single outer authority 與兩種 entry callable 的
 claim-adapter 包裝，本 checkpoint 保留 enforcement startup rejection；不可視為 R1-D 完成。
+
+R1-D2 已在真實 `_place_entry` 中、所有既有 S2／Codex／lane overlays 完成後且任何
+leverage、quantity formatting 或 order API side effect 之前，凍結實際被選 paid legacy lane 的
+immutable `LEGACY_CONTROL` snapshot。snapshot 包含實際 entry/TTL/reprice、完整 TP fractions、
+SL/hold/BE/trail/runner/early-fail/DCA、effective notional/caps 與 canonical policy hashes，並附在
+同一 durable opportunity 後送進 paired-shadow runtime；只有 selected lane 取得一個 legacy arm，
+其餘 overlap candidates 仍各自取得 adaptive arms。無法精確建構時只把明確
+`exact_snapshot_data_blocked` 原因寫入 observation，legacy paid path 不受影響。
+**R1-D2 完成不代表 R1-D 完成：** lease/arbiter authority、paid claim/order adapter 與真實 order
+submission boundary 仍未接線，enforcement 仍維持 OFF 且 startup rejection 保留。
 
 ## Executive Summary
 
