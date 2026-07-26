@@ -36,16 +36,17 @@ schema。Binance client 亦新增 deterministic CID reconciliation query。因�
 仍未完成 caller-resolved snapshot、rolling arbiter、single outer authority 與兩種 entry callable 的
 claim-adapter 包裝，本 checkpoint 保留 enforcement startup rejection；不可視為 R1-D 完成。
 
-R1-D2 repair 已加入 migration 020 durable exact profile payload、strict hash-verified restart
+R1-D2 final acceptance 已將 migration 020 改為 crash-safe、可重跑的 append-only sidecar（不使用
+`ALTER TABLE`），並加入 durable exact profile payload、strict hash-verified restart
 rehydration、source-replay evidence repair 與 accepted-path durability barrier；snapshot 改在既有
 v1465/v1464 claim chain 接受後、第一個 order-create 前凍結，且不改 immutable feature snapshot。
-unsupported GTC fallback／dynamic reprice／DCA 只產生 adaptive-only evidence。snapshot 使用
+unsupported GTC fallback／dynamic reprice／DCA／無法忠實表達的 trail gating 只產生
+adaptive-only evidence。TP geometry 現在直接遵循 live executor 的 partial→remaining mid→final
+sequencing（包括 W6A 100% partial、final fallback 與 runner），global DCA cap 亦使用相同 entry
+notional scale。snapshot 使用
 同一 selected candidate identity 與 raw signal reference，effective total offset 僅編碼一次。
 
-**R1-D2 尚未完成。** 尚缺完整 normal/ladder/S2/Codex enforcement-OFF differential fixture、
-每一個 late early-return cleanup 的 integration fixture，以及 accepted barrier timeout/crash 的完整
-integration acceptance matrix；在這些測試齊備以前不得標示 D2 complete。原 checkpoint 曾宣稱
-完成的下列描述只代表已實作範圍：真實 `_place_entry` 中、所有既有 S2／Codex／lane overlays
+**R1-D2 已完成；R1-D 與 deployment 仍未完成。** 真實 `_place_entry` 中、所有既有 S2／Codex／lane overlays
 完成後凍結實際被選 paid legacy lane 的
 immutable `LEGACY_CONTROL` snapshot。snapshot 包含實際 entry/TTL/reprice、完整 TP fractions、
 SL/hold/BE/trail/runner/early-fail/DCA、effective notional/caps 與 canonical policy hashes，並附在

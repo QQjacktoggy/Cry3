@@ -418,6 +418,7 @@ class MainnetOneRunManager:
     V1469_AGGTRADE_CACHE_MAX_ENTRIES = 8
     V1469_AGGTRADE_CACHE_MAX_ROWS = 50_000
     V1469_AGGTRADE_CACHE_TTL_MS = 2 * 60 * 60 * 1000
+    V1469_PENDING_PAID_MAX = 256
     CODEX_V1_SHADOW_SAMPLE_COOLDOWN_S = 90
     CODEX_V1_SHADOW_ENTRY_REF_MOVE_BP = 5.0
     CODEX_V1_SHADOW_MAX_SAMPLES_PER_RUN = 12
@@ -1784,6 +1785,18 @@ class MainnetOneRunManager:
             if pending is None:
                 pending = {}
                 self._v1469_pending_paid_observations = pending
+            if (str(run.get("run_id") or "") not in pending and
+                    len(pending) >= self.V1469_PENDING_PAID_MAX):
+                # Never allow deferred paid context to grow without bound.
+                # The oldest insertion is immediately degraded to an
+                # adaptive-only observation rather than disappearing.
+                oldest_run_id = next(iter(pending))
+                evicted = pending.pop(oldest_run_id)
+                old_key, old_opportunity, old_candidates = evicted
+                self._v1469_schedule_observation(
+                    repository, str(old_opportunity.get("source_run_id") or ""),
+                    old_key, old_opportunity, old_candidates,
+                )
             pending[str(run.get("run_id") or "")] = (
                 dedup_key,
                 dict(batch.opportunity),
@@ -14736,11 +14749,11 @@ class MainnetOneRunManager:
         try:
             restored = await runtime.rehydrate_run(
                 environment="MAINNET",
-                symbol=ADAPTIVE_SYMBOL,
+                symbol=str(run.get("symbol") or self._settings.mainnet_symbol).upper(),
                 source_run_id=None,
-                observed_after_ms=max(
-                    0, now_ms - 2 * 60 * 60 * 1000
-                ),
+                # Old pending groups must be explicitly evaluated/dropped;
+                # age is not permission to forget durable evidence.
+                observed_after_ms=0,
             )
             if int(restored.get("invalid") or 0) > 0:
                 logger.error(
@@ -18854,22 +18867,62 @@ class MainnetOneRunManager:
         raw_reference = float(features.get("signal_reference_price"))
         if not math.isfinite(raw_reference) or raw_reference <= 0:
             raise ValueError("entry_reference_price_invalid")
-        tp_levels: list[TakeProfitLevel] = []
-        partial_fraction = float(decision.partial_exit_pct)
+        # Mirror _desired_take_profit_orders' pre-submit geometry.  Every
+        # target is relative to the same planned entry basis; formatting is
+        # intentionally excluded because it is exchange-symbol state.
+        partial_fraction = min(1.0, max(0.0, float(decision.partial_exit_pct)))
         partial_bp = float(decision.partial_tp_pct) * 10_000.0
+        mid_bp = float(self._settings.mainnet_mid_tp_pct) * 10_000.0
+        final_bp = float(decision.tp_pct) * 10_000.0
+        if any(not math.isfinite(value) or value < 0 for value in
+               (partial_fraction, partial_bp, mid_bp, final_bp)):
+            raise ValueError("take_profit_geometry_invalid")
+        if bool(self._settings.mainnet_trail_require_partial_fill) and bool(
+                self._settings.mainnet_trail_enabled):
+            raise ValueError("unsupported_trail_partial_fill_gate")
         remaining = 1.0
-        if 0.0 < partial_fraction < 1.0 and partial_bp > 0.0:
-            tp_levels.append(TakeProfitLevel(level_id="PARTIAL", target_bp=partial_bp, fraction=partial_fraction))
-            remaining -= partial_fraction
-        prices = tuple(decision.signal.take_profits or ())
-        if not prices:
-            raise ValueError("take_profit_ladder_missing")
-        for index, raw_price in enumerate(prices):
-            price = float(raw_price)
-            target_bp = abs(price - entry_signal_price) / entry_signal_price * 10_000.0
-            fraction = remaining if index == len(prices) - 1 else remaining / len(prices)
-            tp_levels.append(TakeProfitLevel(level_id=f"TP{index + 1}", target_bp=target_bp, fraction=fraction))
-            remaining -= fraction
+        raw_levels: list[tuple[str, float, float]] = []
+        if partial_fraction > 0 and partial_bp > 0:
+            raw_levels.append(("PARTIAL", min(partial_bp, final_bp), partial_fraction))
+            remaining = max(0.0, remaining - partial_fraction)
+        if remaining > 0 and mid_bp > 0 and float(
+                self._settings.mainnet_mid_exit_pct) > 0 and mid_bp < final_bp:
+            mid_fraction = remaining * float(self._settings.mainnet_mid_exit_pct)
+            raw_levels.append(("MID", mid_bp, mid_fraction))
+            remaining -= mid_fraction
+        final_disabled = bool(self._settings.mainnet_trail_disable_final_tp)
+        if remaining > 0:
+            if final_disabled:
+                raw_levels.append(("RUNNER", final_bp, remaining))
+            else:
+                # Existing fallback deliberately leaves a runner tail when
+                # mid target is disabled.
+                final_fraction = (remaining * float(self._settings.mainnet_mid_exit_pct)
+                                  if mid_bp <= 0 and
+                                  float(self._settings.mainnet_mid_exit_pct) > 0
+                                  else remaining)
+                if final_fraction > 0:
+                    raw_levels.append(("FINAL", final_bp, final_fraction))
+                remaining -= final_fraction
+                if remaining > 0:
+                    raw_levels.append(("RUNNER", final_bp, remaining))
+        if not raw_levels:
+            raise ValueError("take_profit_geometry_empty")
+        # Executor collapses equal prices rather than creating a fictitious
+        # second target.  Preserve exact total fractions while doing likewise.
+        collapsed: list[list[Any]] = []
+        for level_id, target, fraction in raw_levels:
+            if fraction <= 0:
+                continue
+            if collapsed and abs(float(collapsed[-1][1]) - target) <= 1e-9:
+                collapsed[-1][2] = float(collapsed[-1][2]) + fraction
+            else:
+                collapsed.append([level_id, target, fraction])
+        total = sum(float(item[2]) for item in collapsed)
+        if abs(total - 1.0) > 1e-9:
+            raise ValueError("unsupported_unallocated_take_profit_fraction")
+        tp_levels = [TakeProfitLevel(level_id=str(item[0]), target_bp=float(item[1]),
+                                     fraction=float(item[2])) for item in collapsed]
 
         sl_bp = self._entry_sl_pct_for_decision(decision, codex_decision) * 10_000.0
         max_hold_s = int(decision.max_holding_bars) * 60
@@ -18887,7 +18940,8 @@ class MainnetOneRunManager:
             after_s=int(self._settings.mainnet_entry_requote_min_age_seconds) if reprice_enabled else 0,
             offset_bp=float(self._settings.mainnet_entry_max_deviation_bps) if reprice_enabled else 0.0,
             max_reprices=int(self._settings.mainnet_entry_reprice_max_updates) if reprice_enabled else 0)
-        lane_prefix = "stups" if lane == "STUP-S" else "w6a" if lane == "W6A" else "s2st" if strategy == "S2_SUPERTREND" else "wpr"
+        lane_prefix = ("stups" if lane == "STUP-S" else "w6a" if lane == "W6A"
+                       else "s2st" if identity.strategy == "S2_SUPERTREND" else "wpr")
         be_enabled = bool(getattr(self._settings, f"mainnet_codex_{lane_prefix}_use_breakeven_sl", False))
         be_lock = float(getattr(self._settings, f"mainnet_codex_{lane_prefix}_breakeven_offset_bp", 0.0)) if be_enabled else 0.0
         breakeven = BreakevenPolicy(enabled=be_enabled,
@@ -18898,10 +18952,10 @@ class MainnetOneRunManager:
             arm_bp=full_tp_bp * float(self._settings.mainnet_trail_arm_frac) if trail_enabled else 0.0,
             giveback_bp=full_tp_bp * float(self._settings.mainnet_trail_giveback_frac) if trail_enabled else 0.0,
             floor_bp=float(self._settings.mainnet_trail_profit_floor_bp) if trail_enabled else 0.0)
-        runner_enabled = bool(trail_enabled and self._settings.mainnet_trail_disable_final_tp)
+        runner_enabled = bool(tp_levels[-1].level_id == "RUNNER")
         runner = RunnerPolicy(enabled=runner_enabled,
-            fraction=max(0.0, 1.0 - partial_fraction) if runner_enabled else 0.0,
-            take_profit_cap_bp=0.0)
+            fraction=tp_levels[-1].fraction if runner_enabled else 0.0,
+            take_profit_cap_bp=tp_levels[-1].target_bp if runner_enabled else 0.0)
         early_enabled = int(decision.adverse_exit_bars) > 0 and float(decision.adverse_exit_loss_pct) > 0
         early_fail = EarlyFailPolicy(enabled=early_enabled,
             after_s=int(decision.adverse_exit_bars) * 60 if early_enabled else 0,
@@ -18915,7 +18969,10 @@ class MainnetOneRunManager:
             additional_fraction=1.0 / int(self._settings.mainnet_recovery_steps))
             for index in range(int(self._settings.mainnet_recovery_steps))) if dca_enabled else ()
         dca = DcaPolicy(enabled=dca_enabled, layers=layers)
-        global_cap = float(self._settings.mainnet_effective_max_cumulative_notional_usdc)
+        base_notional = float(self._settings.mainnet_effective_entry_notional_usdc)
+        notional_scale = float(entry_notional) / base_notional if base_notional > 0 else 1.0
+        global_cap = (float(self._settings.mainnet_effective_max_cumulative_notional_usdc)
+                      * notional_scale)
         lane_cap = min(float(entry_notional), global_cap)
         risk_hash = canonical_sha256({"lane_cap": lane_cap, "global_cap": global_cap,
             "sl_bp": sl_bp, "entry_notional": float(entry_notional),

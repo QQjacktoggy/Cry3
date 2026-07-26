@@ -99,10 +99,14 @@ _SCHEMA_TABLES: dict[str, frozenset[str]] = {
         "candidate_id",
         "arm_key",
         "execution_profile_hash",
-        "execution_profile_payload_json",
         "status",
         "outcome",
         "reward_net_bp",
+    }),
+    "v1469_arm_evidence_profile_payloads": frozenset({
+        "evidence_id", "opportunity_id", "candidate_id", "source_type",
+        "execution_profile_id", "execution_profile_schema",
+        "execution_profile_hash", "canonical_payload_json", "created_at_ms",
     }),
     "v1469_arm_leases": frozenset({
         "arm_key",
@@ -367,16 +371,18 @@ class V1469ArmObservationRepository:
             problems.append(
                 "v1469_lane_candidates:missing_contract=NOT_EVALUATED"
             )
-        evidence_columns = {
-            str(row.get("name") or "")
-            for row in await self._db.fetchall(
-                "PRAGMA table_info(v1469_arm_evidence)"
-            )
-        }
-        if "execution_profile_payload_json" not in evidence_columns:
-            problems.append("v1469_arm_evidence:missing_migration=020")
-        if "trg_v1469_arm_evidence_profile_payload_immutable" not in by_name:
-            problems.append("missing_migration=020_profile_payload_trigger")
+        for trigger in ("trg_v1469_profile_payload_identity",
+                        "trg_v1469_profile_payload_no_update",
+                        "trg_v1469_profile_payload_no_delete"):
+            if trigger not in by_name:
+                problems.append(f"missing_migration=020:{trigger}")
+        payload_sql = " ".join(str((by_name.get(
+            "v1469_arm_evidence_profile_payloads") or {}).get("sql") or "").upper().split())
+        for contract in ("CHECK(EXECUTION_PROFILE_ID = 'LEGACY_CONTROL')",
+                         "JSON_VALID(CANONICAL_PAYLOAD_JSON)",
+                         "UNIQUE(OPPORTUNITY_ID, CANDIDATE_ID, SOURCE_TYPE, EXECUTION_PROFILE_ID)"):
+            if contract not in payload_sql:
+                problems.append(f"migration=020:missing_contract={contract}")
         if problems:
             raise ArmObservationPersistenceError(
                 "unsafe v1.4.69 observation schema: "
@@ -968,6 +974,35 @@ class V1469ArmObservationRepository:
                 raise ValueError(
                     "evidence_id does not match evidence identity"
                 )
+            profile_payload_json = None
+            raw_profile_payload = payload.get("execution_profile_payload")
+            if profile["execution_profile_id"] == "LEGACY_CONTROL":
+                if raw_profile_payload is None:
+                    raise ValueError("LEGACY_CONTROL requires execution_profile_payload")
+                # Dynamic legacy profiles are not registry backed.  Restore the
+                # typed snapshot, then independently parse/canonicalize its
+                # ExecutionProfile before entering the transaction.
+                from src.gridbot.mainnet.v1469_adaptive_identity import ExecutionProfile
+                from src.gridbot.mainnet.v1469_legacy_control import LegacyExecutionSnapshot
+                snapshot = LegacyExecutionSnapshot.from_payload(raw_profile_payload)
+                canonical_profile = ExecutionProfile.from_mapping(
+                    snapshot.execution_profile.to_payload()
+                )
+                if canonical_profile.profile_id != profile["execution_profile_id"]:
+                    raise ValueError("LEGACY_CONTROL payload profile_id mismatch")
+                if (canonical_profile.to_payload()["schema"]
+                        != profile["execution_profile_schema"]):
+                    raise ValueError("LEGACY_CONTROL payload schema mismatch")
+                if canonical_profile.profile_hash != profile["execution_profile_hash"]:
+                    raise ValueError("LEGACY_CONTROL payload hash mismatch")
+                profile_payload_json = json.dumps(
+                    snapshot.to_payload(), ensure_ascii=True, sort_keys=True,
+                    separators=(",", ":"), allow_nan=False,
+                )
+                if len(profile_payload_json.encode("utf-8")) > 32_768:
+                    raise ValueError("LEGACY_CONTROL payload exceeds 32768 bytes")
+            elif raw_profile_payload is not None:
+                raise ValueError("static profiles must not include a dynamic payload")
             normalized.append(
                 {
                     **identity_payload,
@@ -980,11 +1015,7 @@ class V1469ArmObservationRepository:
                     "diagnostic_only": _flag(
                         payload, "diagnostic_only"
                     ),
-                    "execution_profile_payload_json": (
-                        json.dumps(payload["execution_profile_payload"], ensure_ascii=True,
-                                   sort_keys=True, separators=(",", ":"))
-                        if payload.get("execution_profile_payload") is not None else None
-                    ),
+                    "execution_profile_payload_json": profile_payload_json,
                 }
             )
 
@@ -1054,9 +1085,6 @@ class V1469ArmObservationRepository:
                         "evidence_hash": None,
                         "created_at_ms": item["created_at_ms"],
                         "updated_at_ms": item["created_at_ms"],
-                        "execution_profile_payload_json": item[
-                            "execution_profile_payload_json"
-                        ],
                     }
                     duplicate = seen.get(row["evidence_id"])
                     if duplicate is not None:
@@ -1113,6 +1141,41 @@ class V1469ArmObservationRepository:
                                 "conflicting or already-terminal arm evidence"
                             )
                         existing_count += 1
+                    payload_json = item["execution_profile_payload_json"]
+                    existing_payload = await self._db.fetchone(
+                        """SELECT * FROM v1469_arm_evidence_profile_payloads
+                        WHERE evidence_id = ?""", (row["evidence_id"],)
+                    )
+                    if payload_json is not None:
+                        sidecar = {
+                            "evidence_id": row["evidence_id"],
+                            "opportunity_id": row["opportunity_id"],
+                            "candidate_id": row["candidate_id"],
+                            "source_type": row["source_type"],
+                            "execution_profile_id": row["execution_profile_id"],
+                            "execution_profile_schema": row["execution_profile_schema"],
+                            "execution_profile_hash": row["execution_profile_hash"],
+                            "canonical_payload_json": payload_json,
+                            "created_at_ms": row["created_at_ms"],
+                        }
+                        if existing_payload is None:
+                            columns = tuple(sidecar)
+                            await self._db.conn.execute(
+                                f"INSERT INTO v1469_arm_evidence_profile_payloads "
+                                f"({', '.join(columns)}) VALUES "
+                                f"({', '.join('?' for _ in columns)})",
+                                tuple(sidecar[name] for name in columns),
+                            )
+                        elif any(existing_payload.get(name) != value
+                                 for name, value in sidecar.items()
+                                 if name != "created_at_ms"):
+                            raise ArmEvidenceConflictError(
+                                "conflicting LEGACY_CONTROL profile payload"
+                            )
+                    elif existing_payload is not None:
+                        raise ArmEvidenceConflictError(
+                            "unexpected dynamic payload for static profile"
+                        )
                     durable_rows.append(
                         {
                             "evidence_id": row["evidence_id"],
@@ -1212,7 +1275,7 @@ class V1469ArmObservationRepository:
                 e.evidence_id, e.opportunity_id, e.candidate_id, e.arm_key,
                 e.execution_profile_id, e.execution_profile_schema,
                 e.execution_profile_hash, e.source_type,
-                e.execution_profile_payload_json,
+                p.canonical_payload_json AS execution_profile_payload_json,
                 e.diagnostic_only, e.observed_at_ms,
                 c.lane_code, c.effective_side, c.strategy,
                 c.safety_status AS candidate_status, c.data_complete,
@@ -1223,6 +1286,8 @@ class V1469ArmObservationRepository:
               ON c.candidate_id = e.candidate_id
             JOIN v1469_market_opportunities o
               ON o.opportunity_id = e.opportunity_id
+            LEFT JOIN v1469_arm_evidence_profile_payloads p
+              ON p.evidence_id = e.evidence_id
             JOIN bounded_groups g
               ON g.candidate_id = e.candidate_id
             WHERE e.status = 'PENDING'
