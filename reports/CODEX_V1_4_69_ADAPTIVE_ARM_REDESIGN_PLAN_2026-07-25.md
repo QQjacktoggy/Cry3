@@ -2,9 +2,20 @@
 
 日期：2026-07-25  
 對象：Cry3 Live Mainnet Adaptive  
-狀態：**R1-C shadow-only release candidate；R1-D paid authority deferred；尚未部署**
+狀態：**R1-C shadow-only 已部署；R1-D paid authority deferred**
 
 ## 0. 2026-07-26 implementation checkpoint
+
+Live VM 已於 2026-07-26 16:01 UTC 部署 commit `a0bfe078` 的 26 個精準
+runtime/migration files；本機受影響回歸 590/590 通過，VM `py_compile`、settings
+safety validation、migrations 016–020 與逐檔 SHA-256 驗證皆通過。重啟後
+`cry3.service=active`、僅一個 `main.py`、Mainnet FLAT、active runs/open
+orders/open algo orders 皆為 0，近期 error/traceback/exception/failed 為 0。
+Runtime 僅啟用 v1.4.69 observation 與 paired shadow；arbiter 與 live enforcement
+維持關閉。備份：
+`/home/jack_shih/cry3/.codex_deploy_backups/v1469_shadow_a0bfe078_20260726T155917Z/files.tgz`。
+因 loop 保持停止，部署驗證時 v1.4.69 opportunity/candidate/evidence counts 仍為 0；
+必須由使用者重新開啟既有 loop 後，才會產生真實 shadow cohort。
 
 R0 已完成：production observation bucket 固定為 30 秒且設定／schema 不安全時
 startup fail closed；所有 arms 共用有 8-entry、50,000-row、兩小時 expiry 的 bounded
