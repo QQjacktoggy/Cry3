@@ -137,11 +137,7 @@ def _claim_from_row(row: Mapping[str, Any]) -> DurablePaidExecutionClaim:
         raise V1469PaidClaimPersistenceError(
             "CLAIMED row must have generation 1"
         )
-    if status in {"TERMINAL", "ABANDONED"} and generation != 2:
-        raise V1469PaidClaimPersistenceError(
-            "terminal row must have generation 2"
-        )
-    if status not in {"CLAIMED", "TERMINAL", "ABANDONED"}:
+    if status not in {"CLAIMED", "SUBMITTING", "UNKNOWN", "SUBMITTED", "TERMINAL", "ABANDONED"}:
         raise V1469PaidClaimPersistenceError(
             f"unknown durable paid-claim status: {status}"
         )
@@ -448,6 +444,80 @@ class V1469PaidExecutionClaimRepository:
             target_status="TERMINAL",
         )
 
+    async def transition_submission(
+        self,
+        *,
+        claim_id: str,
+        expected_generation: int,
+        target_status: str,
+        transition_at_ms: int,
+        idempotency_key: str,
+        actor: str,
+        payload: Mapping[str, Any] | None = None,
+    ) -> PaidClaimMutationResult:
+        """CAS a non-terminal submit state, preserving crash ambiguity.
+
+        ``UNKNOWN`` is intentionally durable: callers may only move it to
+        ``SUBMITTED`` after exchange-visible client-order-id reconciliation.
+        """
+        target = _required_text(target_status, "target_status", upper=True)
+        allowed = {
+            "CLAIMED": {"SUBMITTING"},
+            "SUBMITTING": {"UNKNOWN", "SUBMITTED"},
+            "UNKNOWN": {"UNKNOWN", "SUBMITTED"},
+        }
+        claim_key = _required_text(claim_id, "claim_id")
+        expected = _non_negative_int(expected_generation, "expected_generation")
+        at_ms = _non_negative_int(transition_at_ms, "transition_at_ms")
+        event_key = _required_text(idempotency_key, "idempotency_key", max_length=256)
+        event_actor = _required_text(actor, "actor")
+        payload_json = _canonical_json(payload, name="payload")
+        async with self._write_lock:
+            began = False
+            try:
+                await self._db.conn.execute("BEGIN IMMEDIATE")
+                began = True
+                row = await self._claim_row(claim_key)
+                if row is None:
+                    raise V1469PaidClaimConflictError("paid claim is missing")
+                current = _claim_from_row(row)
+                if current.generation != expected or target not in allowed.get(current.status, set()):
+                    raise V1469PaidClaimConflictError("invalid paid submission transition")
+                if at_ms < current.updated_at_ms:
+                    raise ValueError("transition time must be monotonic")
+                generation_after = expected + 1
+                cursor = await self._db.conn.execute(
+                    """UPDATE v1469_paid_execution_claims
+                    SET status = ?, generation = ?, updated_at_ms = ?
+                    WHERE claim_id = ? AND status = ? AND generation = ?""",
+                    (target, generation_after, at_ms, claim_key, current.status, expected),
+                )
+                if cursor.rowcount != 1:
+                    raise V1469PaidClaimConflictError("paid claim generation changed")
+                updated = dict(row)
+                updated.update(status=target, generation=generation_after, updated_at_ms=at_ms)
+                await self._insert_event(
+                    idempotency_key=event_key, row=updated,
+                    generation_before=expected, generation_after=generation_after,
+                    event_time_ms=at_ms, event_type=target, actor=event_actor,
+                    payload_json=payload_json,
+                )
+                await self._db.conn.commit()
+                began = False
+                return PaidClaimMutationResult(_claim_from_row(updated), True, False)
+            except asyncio.CancelledError:
+                if began:
+                    await asyncio.shield(self._db.conn.rollback())
+                raise
+            except sqlite3.IntegrityError as exc:
+                if began:
+                    await self._db.conn.rollback()
+                raise V1469PaidClaimConflictError(str(exc)) from exc
+            except Exception:
+                if began:
+                    await self._db.conn.rollback()
+                raise
+
     async def abandon_claim(
         self,
         *,
@@ -519,7 +589,7 @@ class V1469PaidExecutionClaimRepository:
                     raise ValueError(
                         "terminal time must be >= claim creation time"
                     )
-                if current.status != "CLAIMED":
+                if current.status in {"TERMINAL", "ABANDONED"}:
                     if (
                         current.status == target_status
                         and current.terminal_at_ms == terminal_at
@@ -552,8 +622,7 @@ class V1469PaidExecutionClaimRepository:
                     SET status = ?, generation = ?, terminal_at_ms = ?,
                         terminal_reason = ?, result_payload_json = ?,
                         updated_at_ms = ?
-                    WHERE claim_id = ? AND status = 'CLAIMED'
-                      AND generation = ?""",
+                    WHERE claim_id = ? AND status = ? AND generation = ?""",
                     (
                         target_status,
                         generation_after,
@@ -562,6 +631,7 @@ class V1469PaidExecutionClaimRepository:
                         result_json,
                         terminal_at,
                         normalized_claim_id,
+                        current.status,
                         expected,
                     ),
                 )

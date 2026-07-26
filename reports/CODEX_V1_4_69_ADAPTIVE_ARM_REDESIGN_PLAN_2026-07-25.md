@@ -2,7 +2,7 @@
 
 日期：2026-07-25  
 對象：Cry3 Live Mainnet Adaptive  
-狀態：**R0 observation safety 完成；R1 paid authority 尚未開始、尚未部署**
+狀態：**R0 observation safety 完成；R1 claim lifecycle 部分完成、paid authority 尚未完成／部署**
 
 ## 0. 2026-07-26 implementation checkpoint
 
@@ -12,10 +12,16 @@ aggTrade cache；lane observation persistence 維持 non-blocking 且保留每 l
 strategy SL 不再自動視為 risk-policy hard loss；Telegram monitor 顯示 exact arm/profile、
 rolling evidence、freshness、lease/state、blockers 與 legacy-control authority 比較。
 
-R1 未開始。`mainnet_codex_v1469_live_enforcement_enabled` 仍為 `False`，legacy paid
-behavior 不變。部署 gates：完成 exact `LEGACY_CONTROL` paired arm、唯一 paid lease/claim
-authority、crash-safe deterministic order lifecycle、restart/concurrency reconciliation、
-probation/live/demotion 與完整 acceptance tests，之後仍須 human review 才能開啟 enforcement。
+R1 僅完成 repository-side submission state machine 與 deterministic Binance-safe client
+order ID adapter：durable state 可表達 `CLAIMED -> SUBMITTING -> UNKNOWN|SUBMITTED ->
+TERMINAL`，且 adapter 在 submit 前用 client ID 查詢，exception/timeout 持久化 UNKNOWN，
+restart 時只 reconciliation、不從 UNKNOWN 盲目重送。`mainnet_codex_v1469_live_enforcement_enabled`
+仍為 `False`，legacy paid behavior 不變。
+
+**R1 尚未完成，不得宣稱完成或開啟 enforcement。** 尚缺 exact `LEGACY_CONTROL` paired
+arm、`MainnetOneRunManager` 唯一 lease/arbiter admission wiring、完整 exchange adapter integration、
+authoritative TP/SL/cap/risk wiring，以及 two-runner/crash/reconciliation acceptance tests。以上皆為
+deployment gates；完成後仍須 human review。
 
 ## Executive Summary
 

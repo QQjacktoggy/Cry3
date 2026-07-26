@@ -13,7 +13,8 @@ CREATE TABLE IF NOT EXISTS v1469_paid_execution_claims (
     arm_key TEXT NOT NULL,
     lease_id TEXT NOT NULL,
     status TEXT NOT NULL CHECK(status IN (
-        'CLAIMED', 'TERMINAL', 'ABANDONED'
+        'CLAIMED', 'SUBMITTING', 'UNKNOWN', 'SUBMITTED',
+        'TERMINAL', 'ABANDONED'
     )),
     generation INTEGER NOT NULL CHECK(generation >= 1),
     claimed_at_ms INTEGER NOT NULL CHECK(claimed_at_ms >= 0),
@@ -36,14 +37,14 @@ CREATE TABLE IF NOT EXISTS v1469_paid_execution_claims (
     FOREIGN KEY(lease_id) REFERENCES v1469_arm_leases(lease_id),
     UNIQUE(environment, symbol, opportunity_id),
     CHECK(
-        (status = 'CLAIMED'
-            AND generation = 1
+        (status IN ('CLAIMED', 'SUBMITTING', 'UNKNOWN', 'SUBMITTED')
+            AND generation >= 1
             AND terminal_at_ms IS NULL
             AND terminal_reason IS NULL
             AND result_payload_json IS NULL)
         OR
         (status IN ('TERMINAL', 'ABANDONED')
-            AND generation = 2
+            AND generation >= 2
             AND terminal_at_ms IS NOT NULL
             AND length(trim(terminal_reason)) > 0
             AND result_payload_json IS NOT NULL)
@@ -103,7 +104,7 @@ END;
 
 CREATE TRIGGER IF NOT EXISTS trg_v1469_paid_claim_terminal_once
 BEFORE UPDATE ON v1469_paid_execution_claims
-WHEN OLD.status <> 'CLAIMED'
+WHEN OLD.status IN ('TERMINAL', 'ABANDONED')
 BEGIN
     SELECT RAISE(ABORT, 'v1469 paid claim is already terminal');
 END;
@@ -119,7 +120,10 @@ WHEN
     OR NEW.lease_id <> OLD.lease_id
     OR NEW.claimed_at_ms <> OLD.claimed_at_ms
     OR NEW.created_at_ms <> OLD.created_at_ms
-    OR NEW.status NOT IN ('TERMINAL', 'ABANDONED')
+    OR (OLD.status = 'CLAIMED' AND NEW.status NOT IN ('SUBMITTING', 'TERMINAL', 'ABANDONED'))
+    OR (OLD.status = 'SUBMITTING' AND NEW.status NOT IN ('UNKNOWN', 'SUBMITTED', 'TERMINAL', 'ABANDONED'))
+    OR (OLD.status = 'UNKNOWN' AND NEW.status NOT IN ('UNKNOWN', 'SUBMITTED', 'TERMINAL', 'ABANDONED'))
+    OR (OLD.status = 'SUBMITTED' AND NEW.status NOT IN ('TERMINAL', 'ABANDONED'))
     OR NEW.generation <> OLD.generation + 1
     OR NEW.updated_at_ms < OLD.updated_at_ms
 BEGIN
@@ -145,7 +149,8 @@ CREATE TABLE IF NOT EXISTS v1469_paid_execution_claim_events (
     ),
     event_time_ms INTEGER NOT NULL CHECK(event_time_ms >= 0),
     event_type TEXT NOT NULL CHECK(event_type IN (
-        'CLAIMED', 'TERMINAL', 'ABANDONED'
+        'CLAIMED', 'SUBMITTING', 'UNKNOWN', 'SUBMITTED',
+        'TERMINAL', 'ABANDONED'
     )),
     actor TEXT NOT NULL CHECK(length(trim(actor)) > 0),
     payload_json TEXT NOT NULL CHECK(
@@ -182,6 +187,11 @@ WHEN NOT EXISTS (
           (
               NEW.event_type = 'CLAIMED'
               AND claim.claimed_at_ms = NEW.event_time_ms
+          )
+          OR
+          (
+              NEW.event_type IN ('SUBMITTING', 'UNKNOWN', 'SUBMITTED')
+              AND claim.updated_at_ms = NEW.event_time_ms
           )
           OR
           (
