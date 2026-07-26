@@ -354,6 +354,7 @@ class MatchedArmOpportunity:
     candidate_status: str
     market_identity: MarketStateIdentity
     signal_price: float
+    legacy_profile: ArmProfileDefinition | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -372,6 +373,11 @@ class MatchedArmOpportunity:
             "signal_price",
             _positive_float(self.signal_price, "signal_price"),
         )
+        if self.legacy_profile is not None:
+            if not isinstance(self.legacy_profile, ArmProfileDefinition):
+                raise TypeError("legacy_profile must be ArmProfileDefinition")
+            if self.legacy_profile.profile_id != "LEGACY_CONTROL":
+                raise ValueError("legacy_profile must be LEGACY_CONTROL")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -1163,6 +1169,8 @@ def evaluate_paired_arms(
     profiles = profiles_for_matched_candidate(
         opportunity.market_identity, opportunity.candidate_status
     )
+    if opportunity.legacy_profile is not None:
+        profiles = (opportunity.legacy_profile,) + profiles
     results = tuple(
         evaluate_arm_profile(
             opportunity,

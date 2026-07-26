@@ -2,7 +2,7 @@
 
 日期：2026-07-25  
 對象：Cry3 Live Mainnet Adaptive  
-狀態：**R0 observation safety 完成；R1-B claim safety checkpoint 完成、paid authority 尚未完成／部署**
+狀態：**R0、R1-B 與 R1-C1 identity/authority service 完成；R1-D runtime wiring 尚未完成／部署**
 
 ## 0. 2026-07-26 implementation checkpoint
 
@@ -18,8 +18,14 @@ TERMINAL`，且 adapter 在 submit 前用 client ID 查詢，exception/timeout �
 restart 時只 reconciliation、不從 persisted SUBMITTING/UNKNOWN 盲目重送；只有成功取得 CLAIMED→SUBMITTING CAS 的該次 caller 可呼叫 submit，並有 two-repository race、timeout 與 restart 測試。`mainnet_codex_v1469_live_enforcement_enabled`
 仍為 `False`，legacy paid behavior 不變。
 
-**R1 尚未完成，不得宣稱完成或開啟 enforcement。** 尚缺 exact `LEGACY_CONTROL` paired
-arm、`MainnetOneRunManager` 唯一 lease/arbiter admission wiring、完整 exchange adapter integration、
+R1-C1 已加入 caller-supplied immutable exact `LEGACY_CONTROL` snapshot（完整 execution
+geometry identity；cap/risk hash/reference price 留在 submit payload）、same-envelope paired
+evaluation，以及 deterministic paid-authority resolver。自動 LIVE qualification 僅依 durable
+paid probation evidence（3 fills、2 wins、positive fee-net PnL、無 explicit hard-loss marker）和
+fresh exact identity/revision/regime，不依 UTC date 或 manual promotion。enforcement OFF 永遠
+保持 supplied legacy decision-equivalent，且不 claim adaptive lease/order。
+
+**R1 尚未完成，不得宣稱完成或開啟 enforcement。** 尚缺 `MainnetOneRunManager` 唯一 lease/arbiter admission wiring、完整 exchange adapter integration、
 authoritative TP/SL/cap/risk wiring，以及 two-runner/crash/reconciliation acceptance tests。以上皆為
 deployment gates；完成後仍須 human review。
 

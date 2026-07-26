@@ -33,6 +33,7 @@ RANGE_SCALP = "RANGE_SCALP"
 TREND_PARTIAL = "TREND_PARTIAL"
 PASSIVE_BALANCED = "PASSIVE_BALANCED"
 RISK_OFF = "RISK_OFF"
+LEGACY_CONTROL = "LEGACY_CONTROL"
 
 _MATCHED_CANDIDATE_STATUSES = frozenset({"SAFE", "NOT_EVALUATED"})
 _TREND_REGIMES = frozenset({"TREND_UP", "TREND_DOWN"})
@@ -75,6 +76,7 @@ class ArmProfileDefinition:
             str(regime or "").strip().upper() for regime in self.allowed_regimes
         )
         if profile_id not in {
+            LEGACY_CONTROL,
             RANGE_SCALP,
             TREND_PARTIAL,
             PASSIVE_BALANCED,
@@ -283,6 +285,7 @@ __all__ = [
     "ARM_PROFILE_MENU",
     "ARM_PROFILE_MENU_SCHEMA",
     "ArmProfileDefinition",
+    "LEGACY_CONTROL",
     "PASSIVE_BALANCED",
     "RANGE_SCALP",
     "RISK_OFF",

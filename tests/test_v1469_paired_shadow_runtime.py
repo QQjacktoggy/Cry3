@@ -5,6 +5,11 @@ from pathlib import Path
 
 import pytest
 
+from src.gridbot.mainnet.v1469_adaptive_identity import (
+    BreakevenPolicy, DcaPolicy, EarlyFailPolicy, MarketStateIdentity,
+    RepricePolicy, RunnerPolicy, TakeProfitLevel, TrailPolicy,
+)
+from src.gridbot.mainnet.v1469_legacy_control import LegacyExecutionSnapshot
 from src.gridbot.mainnet.v1469_arbiter_evidence_mapper import (
     map_durable_paired_evidence,
 )
@@ -71,12 +76,60 @@ def _cost_model() -> ShadowCostModel:
     )
 
 
+def _legacy_snapshot() -> LegacyExecutionSnapshot:
+    return LegacyExecutionSnapshot(
+        market_identity=MarketStateIdentity(
+            environment="MAINNET", symbol="BTCUSDC", lane_code="W6A",
+            effective_side="LONG", strategy="S1_BB_RSI",
+            coarse_regime="RANGE", market_state="RANGE_STABLE",
+        ),
+        entry_offset_bp=1.0, entry_type="LIMIT", entry_ttl_s=90,
+        maker_mode="POST_ONLY",
+        take_profits=(TakeProfitLevel(level_id="FULL", target_bp=8, fraction=1),),
+        sl_bp=8, max_hold_s=360, reprice=RepricePolicy(),
+        breakeven=BreakevenPolicy(), trail=TrailPolicy(),
+        runner=RunnerPolicy(), early_fail=EarlyFailPolicy(), dca=DcaPolicy(),
+        lane_notional_cap_usdc=25, global_notional_cap_usdc=50,
+        risk_policy_hash="risk-a", reference_price=100,
+    )
+
+
 async def _repo(
     tmp_path: Path,
 ) -> tuple[Database, V1469ArmObservationRepository]:
     db = Database(str(tmp_path / "paired.db"))
     await db.initialize()
     return db, V1469ArmObservationRepository(db)
+
+
+@pytest.mark.asyncio
+async def test_legacy_control_does_not_skip_other_matched_lanes(
+    tmp_path: Path,
+) -> None:
+    db, repo = await _repo(tmp_path)
+    opportunity = _opportunity()
+    w6a = _candidate()
+    w2a = {
+        **_candidate(),
+        "lane_code": "W2A",
+        "selection_rank": 2,
+        "suppressed_by_lane_code": "W6A",
+    }
+    try:
+        await repo.insert_observation(opportunity, [w6a, w2a])
+        runtime = V1469PairedShadowRuntime(repo)
+        started = await runtime.start_observation(
+            {**opportunity, "legacy_execution_snapshot": _legacy_snapshot()},
+            [w6a, w2a],
+        )
+        assert started == {
+            "candidates_started": 2,
+            "evidence_started": 5,
+            "skipped": 0,
+            "capacity_dropped": 0,
+        }
+    finally:
+        await db.close()
 
 
 @pytest.mark.asyncio

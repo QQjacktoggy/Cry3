@@ -22,6 +22,7 @@ from src.gridbot.mainnet.v1469_arm_profiles import (
     get_arm_profile,
     profiles_for_matched_candidate,
 )
+from src.gridbot.mainnet.v1469_legacy_control import LegacyExecutionSnapshot
 from src.gridbot.mainnet.v1469_arbiter_evidence_mapper import (
     PAIRED_CONTRACT_SCHEMA,
     paired_group_identity,
@@ -93,14 +94,23 @@ def _market_identity(
 def _tradable_profiles(
     identity: MarketStateIdentity,
     candidate_status: str,
+    legacy_profile: ArmProfileDefinition | None = None,
 ) -> tuple[ArmProfileDefinition, ...]:
-    return tuple(
+    adaptive = tuple(
         profile
         for profile in profiles_for_matched_candidate(
             identity, candidate_status
         )
         if profile.execution_profile is not None
     )
+    return ((legacy_profile,) + adaptive) if legacy_profile is not None else adaptive
+
+
+def _profile_for_group(group: PendingPairedCandidate, profile_id: str) -> ArmProfileDefinition:
+    legacy = group.opportunity.legacy_profile
+    if legacy is not None and legacy.profile_id == profile_id:
+        return legacy
+    return get_arm_profile(profile_id)
 
 
 def _max_deadline_ms(
@@ -189,6 +199,9 @@ class V1469PairedShadowRuntime:
         payloads: list[dict[str, Any]] = []
         skipped = 0
         observed_at_ms = int(opportunity.get("observed_at_ms") or 0)
+        legacy_snapshot = opportunity.get("legacy_execution_snapshot")
+        if legacy_snapshot is not None and not isinstance(legacy_snapshot, LegacyExecutionSnapshot):
+            raise TypeError("legacy_execution_snapshot must be LegacyExecutionSnapshot")
         for candidate in candidates:
             status = str(
                 candidate.get("safety_status") or ""
@@ -210,7 +223,10 @@ class V1469PairedShadowRuntime:
                     candidate=candidate,
                     snapshot=snapshot,
                 )
-                profiles = _tradable_profiles(market_identity, status)
+                legacy_profile = None
+                if (legacy_snapshot is not None and legacy_snapshot.market_identity == market_identity):
+                    legacy_profile = legacy_snapshot.profile_definition
+                profiles = _tradable_profiles(market_identity, status, legacy_profile)
             except (TypeError, ValueError):
                 skipped += 1
                 continue
@@ -222,6 +238,7 @@ class V1469PairedShadowRuntime:
                 candidate_status=status,
                 market_identity=market_identity,
                 signal_price=signal_price,
+                legacy_profile=legacy_profile,
             )
             group_specs.append((candidate_id, arm_opportunity, profiles))
             for profile in profiles:
@@ -645,7 +662,7 @@ class V1469PairedShadowRuntime:
                     expected_profile_ids,
                 )
                 for result in results:
-                    profile = get_arm_profile(result.profile_id)
+                    profile = _profile_for_group(group, result.profile_id)
                     execution = profile.execution_profile
                     if execution is None:
                         raise ValueError(
