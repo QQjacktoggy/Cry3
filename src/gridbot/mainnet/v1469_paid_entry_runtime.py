@@ -184,6 +184,10 @@ class V1469PaidEntryRuntime:
                 daily_reserved_loss_cap_usdc=(
                     risk.snapshot.remaining_daily_risk_usdc
                 ),
+                expected_risk_evidence_revision=(
+                    risk.snapshot.evidence_revision
+                ),
+                expected_risk_active_day=risk.snapshot.active_day,
             )
         ).claim
         return PaidEntryPreparation(

@@ -6,6 +6,8 @@ import sqlite3
 
 import pytest
 
+from src.gridbot.mainnet.v1469_adaptive_identity import canonical_sha256
+from src.gridbot.mainnet.v1469_risk_policy import PHASE_C_SCHEMA, active_day_key
 from src.gridbot.storage.database import Database
 from src.gridbot.storage.v1469_paid_execution_claim_repository import (
     PaidClaimMutationResult,
@@ -807,6 +809,171 @@ async def test_probation_evidence_rejects_terminal_without_fee_net_result(
                 window_start_ms=1_000,
                 as_of_ms=2_000,
                 limit=100,
+            )
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_loss_close_between_risk_evaluate_and_claim_rejects_reservation(
+    tmp_path: Path,
+) -> None:
+    db = Database(str(tmp_path / "risk-cas-race.db"))
+    await db.initialize()
+    repo = V1469PaidExecutionClaimRepository(db)
+    await _seed_opportunities_and_active_lease(db, "risk-race")
+    claimed_at_ms = 1_100
+    active_day = active_day_key(claimed_at_ms)
+    evaluated_revision = canonical_sha256(
+        {
+            "schema": PHASE_C_SCHEMA,
+            "active_day": active_day,
+            "risk_policy_hash": RISK_HASH,
+            "events": [],
+        }
+    )
+    try:
+        await db.conn.execute(
+            """INSERT INTO v1469_daily_risk_events (
+                event_id, environment, symbol, active_day, occurred_at_ms,
+                event_type, fee_net_pnl_delta_usdc, risk_policy_hash,
+                payload_json, created_at_ms
+            ) VALUES (?, ?, ?, ?, ?, 'PAID_CLOSED', ?, ?, '{}', ?)""",
+            (
+                "loss-between-evaluate-and-claim",
+                ENVIRONMENT,
+                SYMBOL,
+                active_day,
+                1_050,
+                -0.30,
+                RISK_HASH,
+                1_050,
+            ),
+        )
+        await db.conn.commit()
+        with pytest.raises(
+            V1469PaidClaimConflictError,
+            match="daily-risk evidence changed",
+        ):
+            await repo.claim(
+                **_claim_kwargs("risk-race", claimed_at_ms=claimed_at_ms),
+                expected_risk_evidence_revision=evaluated_revision,
+                expected_risk_active_day=active_day,
+            )
+        count = await db.fetchone(
+            "SELECT COUNT(*) AS count FROM v1469_paid_execution_claims"
+        )
+        assert count == {"count": 0}
+    finally:
+        await db.close()
+
+
+async def _append_paid_loss(db: Database, *, event_id: str) -> None:
+    occurred_at_ms = 1_050
+    await db.conn.execute(
+        """INSERT INTO v1469_daily_risk_events (
+            event_id, environment, symbol, active_day, occurred_at_ms,
+            event_type, fee_net_pnl_delta_usdc, risk_policy_hash,
+            payload_json, created_at_ms
+        ) VALUES (?, ?, ?, ?, ?, 'PAID_CLOSED', ?, ?, '{}', ?)""",
+        (
+            event_id, ENVIRONMENT, SYMBOL, active_day_key(occurred_at_ms),
+            occurred_at_ms, -0.30, RISK_HASH, occurred_at_ms,
+        ),
+    )
+    await db.conn.commit()
+
+
+@pytest.mark.asyncio
+async def test_claim_replay_rejects_loss_that_closed_after_claim(
+    tmp_path: Path,
+) -> None:
+    db = Database(str(tmp_path / "risk-replay-race.db"))
+    await db.initialize()
+    repo = V1469PaidExecutionClaimRepository(db)
+    await _seed_opportunities_and_active_lease(db, "risk-replay")
+    kwargs = _claim_kwargs("risk-replay", claimed_at_ms=1_100)
+    try:
+        claim = (await repo.claim(**kwargs)).claim
+        assert claim.risk_evidence_revision
+        await _append_paid_loss(db, event_id="loss-before-replay")
+        with pytest.raises(
+            V1469PaidClaimConflictError,
+            match="daily-risk evidence changed",
+        ):
+            await repo.claim(**kwargs)
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_claimed_to_submitting_rejects_loss_that_closed_after_claim(
+    tmp_path: Path,
+) -> None:
+    db = Database(str(tmp_path / "risk-submitting-race.db"))
+    await db.initialize()
+    repo = V1469PaidExecutionClaimRepository(db)
+    await _seed_opportunities_and_active_lease(db, "risk-submitting")
+    try:
+        claim = (
+            await repo.claim(
+                **_claim_kwargs("risk-submitting", claimed_at_ms=1_100)
+            )
+        ).claim
+        await _append_paid_loss(db, event_id="loss-before-submitting")
+        with pytest.raises(
+            V1469PaidClaimConflictError,
+            match="daily-risk evidence changed",
+        ):
+            await repo.transition_submission(
+                claim_id=claim.claim_id,
+                expected_generation=claim.generation,
+                target_status="SUBMITTING",
+                transition_at_ms=1_200,
+                idempotency_key="risk-submitting:submit",
+                actor="authority-contract-test",
+                payload={"client_order_id": "cid-risk-submitting"},
+            )
+        durable = await repo.get_claim_by_id(claim.claim_id)
+        assert durable is not None
+        assert durable.status == "CLAIMED"
+        assert durable.generation == 1
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_claimed_to_submitting_rejects_taipei_day_rollover(
+    tmp_path: Path,
+) -> None:
+    db = Database(str(tmp_path / "risk-day-rollover.db"))
+    await db.initialize()
+    repo = V1469PaidExecutionClaimRepository(db)
+    await _seed_scope(
+        db, environment=ENVIRONMENT, symbol=SYMBOL, arm_key=ARM_KEY,
+        lease_id=LEASE_ID, lane_code="W6A",
+        opportunity_ids=("risk-day-rollover",),
+    )
+    try:
+        claim = (
+            await repo.claim(
+                **_claim_kwargs(
+                    "risk-day-rollover", claimed_at_ms=57_599_999
+                )
+            )
+        ).claim
+        with pytest.raises(
+            V1469PaidClaimConflictError,
+            match="daily-risk active day changed",
+        ):
+            await repo.transition_submission(
+                claim_id=claim.claim_id,
+                expected_generation=claim.generation,
+                target_status="SUBMITTING",
+                transition_at_ms=57_600_000,
+                idempotency_key="risk-day-rollover:submit",
+                actor="authority-contract-test",
+                payload={"client_order_id": "cid-risk-day-rollover"},
             )
     finally:
         await db.close()

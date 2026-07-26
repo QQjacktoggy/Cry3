@@ -232,7 +232,7 @@ class App:
         if v1469_authority_enabled:
             # This entire readiness boundary deliberately precedes both
             # Binance connect calls.  Each repository validates the concrete
-            # schema it owns (migrations 016 through 022); a migration marker
+            # schema it owns (migrations 016 through 024); a migration marker
             # alone is not treated as proof of readiness.
             try:
                 if int(

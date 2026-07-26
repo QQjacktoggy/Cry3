@@ -15,6 +15,8 @@ from math import fsum, isfinite
 import sqlite3
 from typing import Any, Mapping, Sequence
 
+from src.gridbot.mainnet.v1469_adaptive_identity import canonical_sha256
+from src.gridbot.mainnet.v1469_risk_policy import PHASE_C_SCHEMA, active_day_key
 from src.gridbot.storage.database import Database
 
 
@@ -49,6 +51,8 @@ class DurablePaidExecutionClaim:
     result_payload: Mapping[str, Any] | None
     created_at_ms: int
     updated_at_ms: int
+    risk_active_day: str | None = None
+    risk_evidence_revision: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,6 +93,8 @@ _CLAIM_SELECT = ", ".join(
     (
         *(f"claim.{column}" for column in _CLAIM_COLUMNS),
         *(f"authority.{column}" for column in _AUTHORITY_COLUMNS),
+        "risk.risk_active_day",
+        "risk.risk_evidence_revision",
     )
 )
 
@@ -235,6 +241,16 @@ def _claim_from_row(row: Mapping[str, Any]) -> DurablePaidExecutionClaim:
             "risk_policy_hash",
         )
     }
+    risk_active_day = _optional_text(
+        row.get("risk_active_day"), "risk_active_day"
+    )
+    risk_evidence_revision = _optional_text(
+        row.get("risk_evidence_revision"), "risk_evidence_revision"
+    )
+    if (risk_active_day is None) != (risk_evidence_revision is None):
+        raise V1469PaidClaimPersistenceError(
+            "paid claim risk evidence snapshot is incomplete"
+        )
     if (
         lease_generation < 0
         or not all(authority_text.values())
@@ -272,6 +288,8 @@ def _claim_from_row(row: Mapping[str, Any]) -> DurablePaidExecutionClaim:
         regime=authority_text["regime"],
         execution_profile_hash=authority_text["execution_profile_hash"],
         risk_policy_hash=authority_text["risk_policy_hash"],
+        risk_active_day=risk_active_day,
+        risk_evidence_revision=risk_evidence_revision,
         approved_notional_usdc=approved_notional_usdc,
         reserved_loss_usdc=reserved_loss_usdc,
         status=status,
@@ -331,6 +349,16 @@ class V1469PaidExecutionClaimRepository:
             )
         }
 
+        required_risk_evidence_columns = {
+            "claim_id", "risk_active_day", "risk_evidence_revision"
+        }
+        risk_evidence_columns = {
+            str(row.get("name") or "")
+            for row in await self._db.fetchall(
+                "PRAGMA table_info(v1469_paid_claim_risk_evidence)"
+            )
+        }
+
         required_event_columns = {
             "id",
             "idempotency_key",
@@ -362,6 +390,10 @@ class V1469PaidExecutionClaimRepository:
         watermark_migration = await self._db.fetchone(
             "SELECT filename FROM _migrations WHERE filename = ?",
             ("023_v1469_paid_promotion_evidence_clock.sql",),
+        )
+        risk_evidence_migration = await self._db.fetchone(
+            "SELECT filename FROM _migrations WHERE filename = ?",
+            ("024_v1469_paid_claim_risk_evidence.sql",),
         )
         watermark_objects = {
             str(row.get("name") or "")
@@ -395,11 +427,17 @@ class V1469PaidExecutionClaimRepository:
             "trg_v1469_paid_claim_authority_claim_exists",
             "trg_v1469_paid_claim_authority_no_update",
             "trg_v1469_paid_claim_authority_no_delete",
+            "trg_v1469_paid_claim_risk_evidence_claim_exists",
+            "trg_v1469_paid_claim_risk_evidence_no_update",
+            "trg_v1469_paid_claim_risk_evidence_no_delete",
             "trg_v1469_paid_terminal_evidence_clock",
         }
         missing_claim = sorted(required_claim_columns - claim_columns)
         missing_authority = sorted(
             required_authority_columns - authority_columns
+        )
+        missing_risk_evidence = sorted(
+            required_risk_evidence_columns - risk_evidence_columns
         )
         missing_event = sorted(required_event_columns - event_columns)
         missing_triggers = sorted(required_triggers - triggers)
@@ -415,12 +453,14 @@ class V1469PaidExecutionClaimRepository:
             migration is None
             or authority_migration is None
             or watermark_migration is None
+            or risk_evidence_migration is None
             or watermark_objects != {
                 "v1469_paid_terminal_evidence_clocks",
                 "v1469_paid_promotion_evidence_snapshots",
             }
             or missing_claim
             or missing_authority
+            or missing_risk_evidence
             or missing_event
             or missing_triggers
             or unbound_count
@@ -429,12 +469,14 @@ class V1469PaidExecutionClaimRepository:
                 "unsafe v1.4.69 paid-claim schema: "
                 f"missing_claim_columns={missing_claim}, "
                 f"missing_authority_columns={missing_authority}, "
+                f"missing_risk_evidence_columns={missing_risk_evidence}, "
                 f"missing_event_columns={missing_event}, "
                 f"missing_triggers={missing_triggers}, "
                 f"unbound_claims={unbound_count}, "
                 f"upgrade_019_applied={migration is not None}, "
                 f"upgrade_021_applied={authority_migration is not None}, "
                 f"upgrade_023_applied={watermark_migration is not None}, "
+                f"upgrade_024_applied={risk_evidence_migration is not None}, "
                 f"watermark_objects={sorted(watermark_objects)}"
             )
 
@@ -457,6 +499,8 @@ class V1469PaidExecutionClaimRepository:
             FROM v1469_paid_execution_claims AS claim
             JOIN v1469_paid_execution_claim_authority AS authority
               ON authority.claim_id = claim.claim_id
+            LEFT JOIN v1469_paid_claim_risk_evidence AS risk
+              ON risk.claim_id = claim.claim_id
             WHERE claim.environment = ? AND claim.symbol = ?
               AND claim.opportunity_id = ?""",
             (scope_environment, scope_symbol, opportunity),
@@ -498,6 +542,8 @@ class V1469PaidExecutionClaimRepository:
             FROM v1469_paid_execution_claims AS claim
             JOIN v1469_paid_execution_claim_authority AS authority
               ON authority.claim_id = claim.claim_id
+            LEFT JOIN v1469_paid_claim_risk_evidence AS risk
+              ON risk.claim_id = claim.claim_id
             WHERE {" AND ".join(predicates)}
             ORDER BY claim.updated_at_ms ASC, claim.claim_id ASC
             LIMIT ?""",
@@ -875,6 +921,8 @@ class V1469PaidExecutionClaimRepository:
         global_notional_cap_usdc: float | None = None,
         lane_notional_cap_usdc: float | None = None,
         daily_reserved_loss_cap_usdc: float | None = None,
+        expected_risk_evidence_revision: str | None = None,
+        expected_risk_active_day: str | None = None,
     ) -> PaidClaimMutationResult:
         """Atomically claim one opportunity before any paid order submission."""
 
@@ -935,6 +983,18 @@ class V1469PaidExecutionClaimRepository:
                 "daily_reserved_loss_cap_usdc",
             ),
         )
+        expected_risk_revision = _optional_text(
+            expected_risk_evidence_revision,
+            "expected_risk_evidence_revision",
+        )
+        expected_active_day = _optional_text(
+            expected_risk_active_day,
+            "expected_risk_active_day",
+        )
+        if (expected_risk_revision is None) != (expected_active_day is None):
+            raise ValueError(
+                "risk evidence revision and active day must be provided together"
+            )
         if any(value is not None for value in cap_values) and not all(
             value is not None for value in cap_values
         ):
@@ -992,7 +1052,26 @@ class V1469PaidExecutionClaimRepository:
                         expected_risk_policy_hash=expected_risk_hash,
                         approved_notional_usdc=requested_approved,
                         reserved_loss_usdc=requested_reserved,
+                        expected_risk_active_day=expected_active_day,
+                        expected_risk_evidence_revision=expected_risk_revision,
                     )
+                    if durable.status == "CLAIMED":
+                        if (
+                            durable.risk_active_day is None
+                            or durable.risk_evidence_revision is None
+                        ):
+                            raise V1469PaidClaimConflictError(
+                                "paid claim has no durable risk evidence"
+                            )
+                        await self._assert_risk_evidence_current(
+                            environment=durable.environment,
+                            symbol=durable.symbol,
+                            expected_risk_policy_hash=durable.risk_policy_hash,
+                            expected_active_day=durable.risk_active_day,
+                            expected_evidence_revision=(
+                                durable.risk_evidence_revision
+                            ),
+                        )
                     await self._db.conn.rollback()
                     began = False
                     return PaidClaimMutationResult(
@@ -1018,6 +1097,31 @@ class V1469PaidExecutionClaimRepository:
                     expected_risk_policy_hash=expected_risk_hash,
                     approved_notional_usdc=requested_approved,
                     reserved_loss_usdc=requested_reserved,
+                )
+                risk_active_day = (
+                    expected_active_day or active_day_key(claimed_at)
+                )
+                if expected_risk_revision is None:
+                    risk_evidence_revision = (
+                        await self._current_risk_evidence_revision(
+                            environment=scope_environment,
+                            symbol=scope_symbol,
+                            risk_policy_hash=str(authority["risk_policy_hash"]),
+                            active_day=risk_active_day,
+                        )
+                    )
+                else:
+                    await self._assert_risk_evidence_current(
+                        environment=scope_environment,
+                        symbol=scope_symbol,
+                        expected_risk_policy_hash=expected_risk_hash,
+                        expected_active_day=risk_active_day,
+                        expected_evidence_revision=expected_risk_revision,
+                    )
+                    risk_evidence_revision = expected_risk_revision
+                authority.update(
+                    risk_active_day=risk_active_day,
+                    risk_evidence_revision=risk_evidence_revision,
                 )
                 if cap_values[0] is not None:
                     await self._assert_outstanding_reservation_capacity(
@@ -1061,6 +1165,16 @@ class V1469PaidExecutionClaimRepository:
                         {", ".join("?" for _ in authority_columns)}
                     )""",
                     tuple(authority_row[column] for column in authority_columns),
+                )
+                await self._db.conn.execute(
+                    """INSERT INTO v1469_paid_claim_risk_evidence (
+                        claim_id, risk_active_day, risk_evidence_revision
+                    ) VALUES (?, ?, ?)""",
+                    (
+                        deterministic_claim_id,
+                        risk_active_day,
+                        risk_evidence_revision,
+                    ),
                 )
                 await self._insert_event(
                     idempotency_key=event_key,
@@ -1392,6 +1506,24 @@ class V1469PaidExecutionClaimRepository:
             approved_notional_usdc=claim.approved_notional_usdc,
             reserved_loss_usdc=claim.reserved_loss_usdc,
         )
+        if (
+            claim.risk_active_day is None
+            or claim.risk_evidence_revision is None
+        ):
+            raise V1469PaidClaimConflictError(
+                "paid claim has no durable risk evidence"
+            )
+        if active_day_key(transition_at_ms) != claim.risk_active_day:
+            raise V1469PaidClaimConflictError(
+                "daily-risk active day changed before paid submission"
+            )
+        await self._assert_risk_evidence_current(
+            environment=claim.environment,
+            symbol=claim.symbol,
+            expected_risk_policy_hash=claim.risk_policy_hash,
+            expected_active_day=claim.risk_active_day,
+            expected_evidence_revision=claim.risk_evidence_revision,
+        )
 
     async def _assert_outstanding_reservation_capacity(
         self,
@@ -1424,6 +1556,8 @@ class V1469PaidExecutionClaimRepository:
             FROM v1469_paid_execution_claims AS claim
             JOIN v1469_paid_execution_claim_authority AS authority
               ON authority.claim_id = claim.claim_id
+            LEFT JOIN v1469_paid_claim_risk_evidence AS risk
+              ON risk.claim_id = claim.claim_id
             WHERE claim.environment = ?
               AND claim.status IN (
                   'CLAIMED', 'SUBMITTING', 'UNKNOWN', 'SUBMITTED'
@@ -1439,6 +1573,8 @@ class V1469PaidExecutionClaimRepository:
             FROM v1469_paid_execution_claims AS claim
             JOIN v1469_paid_execution_claim_authority AS authority
               ON authority.claim_id = claim.claim_id
+            LEFT JOIN v1469_paid_claim_risk_evidence AS risk
+              ON risk.claim_id = claim.claim_id
             LEFT JOIN v1469_arm_leases AS lease
               ON lease.arm_key = claim.arm_key
              AND lease.lease_id = claim.lease_id
@@ -1479,6 +1615,72 @@ class V1469PaidExecutionClaimRepository:
             if requested > cap + 1e-12:
                 raise V1469PaidClaimConflictError(reason)
 
+    async def _current_risk_evidence_revision(
+        self,
+        *,
+        environment: str,
+        symbol: str,
+        risk_policy_hash: str,
+        active_day: str,
+    ) -> str:
+        rows = await self._db.fetchall(
+            """SELECT event_id, occurred_at_ms, fee_net_pnl_delta_usdc,
+                      risk_policy_hash, event_type
+            FROM v1469_daily_risk_events
+            WHERE environment = ? AND symbol = ? AND active_day = ?
+            ORDER BY occurred_at_ms, event_id
+            LIMIT 10001""",
+            (environment, symbol, active_day),
+        )
+        if len(rows) > 10_000:
+            raise V1469PaidClaimConflictError(
+                "unsafe v1.4.69 daily-risk ledger: active-day event "
+                "count exceeds bounded CAS limit (10000)"
+            )
+        return canonical_sha256(
+            {
+                "schema": PHASE_C_SCHEMA,
+                "active_day": active_day,
+                "risk_policy_hash": risk_policy_hash,
+                "events": [
+                    {
+                        "event_id": str(row["event_id"]),
+                        "occurred_at_ms": int(row["occurred_at_ms"]),
+                        "fee_net_pnl_delta_usdc": float(
+                            row["fee_net_pnl_delta_usdc"]
+                        ),
+                        "risk_policy_hash": str(row["risk_policy_hash"]),
+                        "event_type": str(row["event_type"]),
+                    }
+                    for row in rows
+                ],
+            }
+        )
+
+    async def _assert_risk_evidence_current(
+        self,
+        *,
+        environment: str,
+        symbol: str,
+        expected_risk_policy_hash: str | None,
+        expected_active_day: str,
+        expected_evidence_revision: str,
+    ) -> None:
+        if expected_risk_policy_hash is None:
+            raise V1469PaidClaimConflictError(
+                "risk evidence CAS requires a risk-policy hash"
+            )
+        current_revision = await self._current_risk_evidence_revision(
+            environment=environment,
+            symbol=symbol,
+            risk_policy_hash=expected_risk_policy_hash,
+            active_day=expected_active_day,
+        )
+        if current_revision != expected_evidence_revision:
+            raise V1469PaidClaimConflictError(
+                "daily-risk evidence changed before paid submission"
+            )
+
     @staticmethod
     def _assert_requested_authority_matches(
         durable: DurablePaidExecutionClaim,
@@ -1490,6 +1692,8 @@ class V1469PaidExecutionClaimRepository:
         expected_risk_policy_hash: str | None,
         approved_notional_usdc: float | None,
         reserved_loss_usdc: float | None,
+        expected_risk_active_day: str | None,
+        expected_risk_evidence_revision: str | None,
     ) -> None:
         requested = {
             "lease_generation": expected_lease_generation,
@@ -1499,6 +1703,8 @@ class V1469PaidExecutionClaimRepository:
             "risk_policy_hash": expected_risk_policy_hash,
             "approved_notional_usdc": approved_notional_usdc,
             "reserved_loss_usdc": reserved_loss_usdc,
+            "risk_active_day": expected_risk_active_day,
+            "risk_evidence_revision": expected_risk_evidence_revision,
         }
         actual = {
             "lease_generation": durable.lease_generation,
@@ -1508,6 +1714,8 @@ class V1469PaidExecutionClaimRepository:
             "risk_policy_hash": durable.risk_policy_hash,
             "approved_notional_usdc": durable.approved_notional_usdc,
             "reserved_loss_usdc": durable.reserved_loss_usdc,
+            "risk_active_day": durable.risk_active_day,
+            "risk_evidence_revision": durable.risk_evidence_revision,
         }
         mismatches = [
             name
@@ -1640,6 +1848,8 @@ class V1469PaidExecutionClaimRepository:
             FROM v1469_paid_execution_claims AS claim
             JOIN v1469_paid_execution_claim_authority AS authority
               ON authority.claim_id = claim.claim_id
+            LEFT JOIN v1469_paid_claim_risk_evidence AS risk
+              ON risk.claim_id = claim.claim_id
             WHERE claim.environment = ? AND claim.symbol = ?
               AND claim.opportunity_id = ?""",
             (environment, symbol, opportunity_id),
@@ -1654,6 +1864,8 @@ class V1469PaidExecutionClaimRepository:
             FROM v1469_paid_execution_claims AS claim
             JOIN v1469_paid_execution_claim_authority AS authority
               ON authority.claim_id = claim.claim_id
+            LEFT JOIN v1469_paid_claim_risk_evidence AS risk
+              ON risk.claim_id = claim.claim_id
             WHERE claim.claim_id = ?""",
             (claim_id,),
         )

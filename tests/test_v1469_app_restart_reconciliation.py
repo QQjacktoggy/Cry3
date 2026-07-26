@@ -317,7 +317,7 @@ def test_app_wires_paid_runtimes_only_after_authority_readiness() -> None:
         "v1469_paid_close_runtime",
     ):
         assert runtime_name in init_source
-    assert "migrations 016 through 022" in inspect.getsource(App.initialize)
+    assert "migrations 016 through 024" in inspect.getsource(App.initialize)
     assert start_source.index(
         "await self._reconcile_v1469_paid_claims_on_restart()"
     ) < start_source.index(

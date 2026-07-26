@@ -73,6 +73,8 @@ def _claim() -> DurablePaidExecutionClaim:
         lease_id="lease-id",
         lease_generation=1,
         evidence_revision="evidence-revision",
+        risk_active_day="2026-07-27",
+        risk_evidence_revision="risk-evidence-revision",
         regime="RANGE",
         execution_profile_hash="profile-hash",
         risk_policy_hash="risk-policy-hash",
@@ -695,3 +697,337 @@ async def test_prebound_abandoned_claim_finishes_without_order_id():
 
     assert repo.completed[-1][1] == "ENTRY_REJECTED"
     assert repo.completed[-1][2] == "EXCHANGE_REJECTED"
+
+class _TPHistoryClient(FakeClient):
+    def __init__(self, history=None):
+        super().__init__()
+        self.history = dict(history or {})
+        self.lookup_calls = []
+
+    async def get_order_by_client_order_id(self, symbol, client_order_id):
+        self.lookup_calls.append((symbol, client_order_id))
+        value = self.history.get(client_order_id)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+
+def _tp3_open(run_id: str):
+    return {
+        "orderId": 102,
+        "clientOrderId": f"{run_id}_tp3",
+        "origQty": "0.6",
+        "executedQty": "0",
+        "price": "100.12",
+        "side": "SELL",
+        "status": "NEW",
+    }
+
+
+def _tp_restart_position():
+    return PositionInfo(
+        symbol="ETHUSDC",
+        position_amt=0.6,
+        entry_price=100.0,
+        mark_price=100.1,
+        unrealized_pnl=0.06,
+        liquidation_price=90.0,
+        leverage=75,
+        margin_type="cross",
+    )
+
+
+@pytest.mark.asyncio
+async def test_exact_tp_restart_recovers_filled_missing_layer_from_history():
+    run_id = "cry3mn_v1469_tp_restart_fill"
+    tp1_cid = f"{run_id}_tp1"
+    client = _TPHistoryClient(
+        {
+            tp1_cid: {
+                "symbol": "ETHUSDC",
+                "orderId": 101,
+                "clientOrderId": tp1_cid,
+                "origQty": "0.4",
+                "executedQty": "0.4",
+                "side": "SELL",
+                "reduceOnly": True,
+                "status": "FILLED",
+            }
+        }
+    )
+    client.open_orders = [_tp3_open(run_id)]
+    repo = FakeRepo()
+    signal = {
+        "v1469_paid_execution": _preparation().plan.to_payload(),
+        "v1469_paid_initial_qty": 1.0,
+    }
+    run = _run(
+        run_id=run_id,
+        status="RUNNING",
+        side="LONG",
+        signal_json=signal,
+        qty=0.6,
+    )
+    await repo.log_event(
+        run_id,
+        "take_profit_synced",
+        {
+            "orders": [
+                {"client_order_id": tp1_cid},
+                {"client_order_id": f"{run_id}_tp3"},
+            ]
+        },
+    )
+    manager = MainnetOneRunManager(
+        _settings(), client, repo, FakeTelegramApp()
+    )
+
+    desired = await manager._sync_take_profit_orders(
+        run, _tp_restart_position(), signal
+    )
+
+    assert [item[0] for item in desired] == [f"{run_id}_tp3"]
+    assert client.cancelled == []
+    assert client.lookup_calls == [("ETHUSDC", tp1_cid)]
+    progress = [
+        details
+        for _, event_type, details in repo.events
+        if event_type == "v1469_tp_layer_progress"
+    ]
+    assert progress[-1]["client_order_id"] == tp1_cid
+    assert progress[-1]["executed_qty"] == pytest.approx(0.4)
+
+    restarted_client = _TPHistoryClient()
+    restarted_client.open_orders = [_tp3_open(run_id)]
+    restarted = MainnetOneRunManager(
+        _settings(), restarted_client, repo, FakeTelegramApp()
+    )
+    rebuilt = await restarted._sync_take_profit_orders(
+        run, _tp_restart_position(), signal
+    )
+    assert [item[0] for item in rebuilt] == [f"{run_id}_tp3"]
+    assert restarted_client.lookup_calls == []
+
+
+@pytest.mark.asyncio
+async def test_exact_tp_restart_halts_when_prior_layer_history_is_missing():
+    run_id = "cry3mn_v1469_tp_restart_ambiguous"
+    tp1_cid = f"{run_id}_tp1"
+    client = _TPHistoryClient()
+    client.open_orders = [_tp3_open(run_id)]
+    repo = FakeRepo()
+    signal = {
+        "v1469_paid_execution": _preparation().plan.to_payload(),
+        "v1469_paid_initial_qty": 1.0,
+    }
+    run = _run(
+        run_id=run_id,
+        status="RUNNING",
+        side="LONG",
+        signal_json=signal,
+        qty=0.6,
+    )
+    await repo.log_event(
+        run_id,
+        "take_profit_synced",
+        {
+            "orders": [
+                {"client_order_id": tp1_cid},
+                {"client_order_id": f"{run_id}_tp3"},
+            ]
+        },
+    )
+    manager = MainnetOneRunManager(
+        _settings(), client, repo, FakeTelegramApp()
+    )
+    manager._adaptive_session = {"rearm_enabled": True}
+
+    with pytest.raises(RuntimeError, match="prior placement has no history"):
+        await manager._sync_take_profit_orders(
+            run, _tp_restart_position(), signal
+        )
+
+    assert client.cancelled == []
+    assert client.all_orders == []
+    assert manager._adaptive_session["rearm_enabled"] is False
+    assert manager._adaptive_session["stop_requested"] is True
+    assert any(
+        event_type == "v1469_tp_history_fail_closed"
+        for _, event_type, _ in repo.events
+    )
+
+@pytest.mark.asyncio
+async def test_exact_tp_restart_halts_on_intent_without_exchange_history():
+    run_id = "cry3mn_v1469_tp_intent_crash"
+    tp1_cid = f"{run_id}_tp1"
+    client = _TPHistoryClient()
+    client.open_orders = [_tp3_open(run_id)]
+    repo = FakeRepo()
+    signal = {
+        "v1469_paid_execution": _preparation().plan.to_payload(),
+        "v1469_paid_initial_qty": 1.0,
+    }
+    run = _run(
+        run_id=run_id,
+        status="RUNNING",
+        side="LONG",
+        signal_json=signal,
+        qty=0.6,
+    )
+    await repo.log_event(
+        run_id,
+        "v1469_tp_layer_submit_intent",
+        {
+            "client_order_id": tp1_cid,
+            "symbol": "ETHUSDC",
+            "side": "SELL",
+            "qty": "0.4",
+            "price": 100.05,
+        },
+    )
+    manager = MainnetOneRunManager(
+        _settings(), client, repo, FakeTelegramApp()
+    )
+    manager._adaptive_session = {"rearm_enabled": True}
+
+    with pytest.raises(RuntimeError, match="prior placement has no history"):
+        await manager._sync_take_profit_orders(
+            run, _tp_restart_position(), signal
+        )
+
+    assert client.lookup_calls == [("ETHUSDC", tp1_cid)]
+    assert client.cancelled == []
+    assert client.all_orders == []
+    assert manager._adaptive_session["rearm_enabled"] is False
+    assert manager._adaptive_session["stop_requested"] is True
+
+def _tp_rejection(code: int):
+    from binance.exceptions import BinanceAPIException
+
+    return BinanceAPIException(
+        response=None,
+        status_code=400,
+        text=f'{{"code":{code},"msg":"explicit rejection"}}',
+    )
+
+
+def _tp_full_position():
+    position = _tp_restart_position()
+    position.position_amt = 1.0
+    return position
+
+
+@pytest.mark.asyncio
+async def test_exact_tp_explicit_rejections_resolve_intents_without_false_halt():
+    class RejectingClient(_TPHistoryClient):
+        def __init__(self):
+            super().__init__()
+            self.create_calls = 0
+
+        async def create_reduce_only_limit_order(self, *args, **kwargs):
+            self.create_calls += 1
+            raise _tp_rejection(-5022)
+
+    run_id = "cry3mn_v1469_tp_explicit_reject"
+    client = RejectingClient()
+    repo = FakeRepo()
+    signal = {
+        "v1469_paid_execution": _preparation().plan.to_payload(),
+        "v1469_paid_initial_qty": 1.0,
+    }
+    run = _run(
+        run_id=run_id,
+        status="RUNNING",
+        side="LONG",
+        signal_json=signal,
+        qty=1.0,
+    )
+    manager = MainnetOneRunManager(
+        _settings(mainnet_tp_fallback_to_gtc=False),
+        client,
+        repo,
+        FakeTelegramApp(),
+    )
+    manager._adaptive_session = {"rearm_enabled": True}
+
+    with pytest.raises(Exception) as first:
+        await manager._sync_take_profit_orders(run, _tp_full_position(), signal)
+    assert getattr(first.value, "code", None) == -5022
+    with pytest.raises(Exception) as second:
+        await manager._sync_take_profit_orders(run, _tp_full_position(), signal)
+    assert getattr(second.value, "code", None) == -5022
+
+    intents = [
+        details for _, kind, details in repo.events
+        if kind == "v1469_tp_layer_submit_intent"
+    ]
+    rejected = [
+        details for _, kind, details in repo.events
+        if kind == "v1469_tp_layer_submit_rejected"
+    ]
+    assert len(intents) == len(rejected) == 2
+    assert len({row["intent_id"] for row in intents}) == 2
+    assert {row["intent_id"] for row in intents} == {
+        row["intent_id"] for row in rejected
+    }
+    assert client.create_calls == 2
+    assert manager._adaptive_session["rearm_enabled"] is True
+    assert not any(
+        kind == "v1469_tp_history_fail_closed" for _, kind, _ in repo.events
+    )
+
+
+@pytest.mark.asyncio
+async def test_exact_tp_requote_ambiguous_intent_halts_next_cycle():
+    class RequoteCrashClient(_TPHistoryClient):
+        def __init__(self):
+            super().__init__()
+            self.create_calls = 0
+
+        async def create_reduce_only_limit_order(self, *args, **kwargs):
+            self.create_calls += 1
+            if self.create_calls == 1:
+                raise _tp_rejection(-5022)
+            raise TimeoutError("requote outcome unknown")
+
+    run_id = "cry3mn_v1469_tp_requote_ambiguous"
+    client = RequoteCrashClient()
+    repo = FakeRepo()
+    signal = {
+        "v1469_paid_execution": _preparation().plan.to_payload(),
+        "v1469_paid_initial_qty": 1.0,
+    }
+    run = _run(
+        run_id=run_id,
+        status="RUNNING",
+        side="LONG",
+        signal_json=signal,
+        qty=1.0,
+    )
+    manager = MainnetOneRunManager(
+        _settings(mainnet_tp_fallback_to_gtc=True),
+        client,
+        repo,
+        FakeTelegramApp(),
+    )
+    manager._adaptive_session = {"rearm_enabled": True}
+
+    with pytest.raises(TimeoutError, match="outcome unknown"):
+        await manager._sync_take_profit_orders(run, _tp_full_position(), signal)
+    intents = [
+        details for _, kind, details in repo.events
+        if kind == "v1469_tp_layer_submit_intent"
+    ]
+    rejected = [
+        details for _, kind, details in repo.events
+        if kind == "v1469_tp_layer_submit_rejected"
+    ]
+    assert len(intents) == 2
+    assert intents[0]["intent_id"] != intents[1]["intent_id"]
+    assert [row["intent_id"] for row in rejected] == [intents[0]["intent_id"]]
+
+    with pytest.raises(RuntimeError, match="prior placement has no history"):
+        await manager._sync_take_profit_orders(run, _tp_full_position(), signal)
+    assert client.create_calls == 2
+    assert manager._adaptive_session["rearm_enabled"] is False
+    assert manager._adaptive_session["stop_requested"] is True

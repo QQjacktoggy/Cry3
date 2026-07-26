@@ -21930,6 +21930,266 @@ class MainnetOneRunManager:
             },
         )
 
+    async def _v1469_recover_missing_tp_history(
+        self,
+        run: Mapping[str, Any],
+        position: PositionInfo,
+        signal: Mapping[str, Any],
+        existing_tp: Sequence[Mapping[str, Any]],
+        close_side: str,
+    ) -> list[Mapping[str, Any]]:
+        """Prove paid TP fills that vanished from the open-order snapshot."""
+
+        plan = self._v1469_paid_exact_plan(signal)
+        if plan is None:
+            return list(existing_tp)
+        raw_levels = plan.get("take_profits")
+        if (
+            not isinstance(raw_levels, Sequence)
+            or isinstance(raw_levels, (str, bytes, bytearray))
+            or not 1 <= len(raw_levels) <= 3
+        ):
+            raise RuntimeError("v1469 paid TP history plan is invalid")
+        suffixes = (
+            (FINAL_TP_SUFFIX,)
+            if len(raw_levels) == 1
+            else (PARTIAL_TP_SUFFIX, FINAL_TP_SUFFIX)
+            if len(raw_levels) == 2
+            else (PARTIAL_TP_SUFFIX, MID_TP_SUFFIX, FINAL_TP_SUFFIX)
+        )
+        run_id = str(run.get("run_id") or "")
+        if not run_id:
+            raise RuntimeError("v1469 paid TP history run identity is invalid")
+        expected = [f"{run_id}{suffix}" for suffix in suffixes]
+        open_ids = {
+            str(order.get("clientOrderId") or "") for order in existing_tp
+        }
+        missing = [cid for cid in expected if cid not in open_ids]
+        if not missing:
+            return list(existing_tp)
+
+        event_types = (
+            "v1469_tp_layer_submit_intent",
+            "v1469_tp_layer_submit_rejected",
+            "take_profit_synced",
+            "partial_exit",
+            "mid_exit",
+            "final_exit",
+            "v1469_tp_layer_progress",
+        )
+        get_events = getattr(self._repo, "get_events_by_types", None)
+        rows = (
+            await get_events(run_id, event_types, limit=500)
+            if callable(get_events)
+            else []
+        )
+        attempted: set[str] = set()
+        intents_by_id: dict[str, str] = {}
+        rejected_by_id: dict[str, tuple[str, int]] = {}
+        legacy_unresolved_intents: set[str] = set()
+        completed: set[str] = set()
+        exit_indexes = {
+            "partial_exit": 0,
+            "mid_exit": 1,
+            "final_exit": len(expected) - 1,
+        }
+        for row in rows:
+            event_type = str(row.get("event_type") or "")
+            details = row.get("details")
+            if not isinstance(details, Mapping):
+                try:
+                    details = json.loads(str(row.get("details_json") or "{}"))
+                except (TypeError, json.JSONDecodeError):
+                    details = {}
+            if not isinstance(details, Mapping):
+                continue
+            if event_type == "v1469_tp_layer_submit_intent":
+                cid = str(details.get("client_order_id") or "")
+                if cid in expected:
+                    intent_id = str(details.get("intent_id") or "")
+                    if intent_id:
+                        intents_by_id[intent_id] = cid
+                    else:
+                        legacy_unresolved_intents.add(cid)
+                continue
+            if event_type == "v1469_tp_layer_submit_rejected":
+                intent_id = str(details.get("intent_id") or "")
+                cid = str(details.get("client_order_id") or "")
+                try:
+                    code = int(details.get("code"))
+                except (TypeError, ValueError, OverflowError):
+                    code = 0
+                if intent_id and cid in expected and code in {-2022, -5022}:
+                    rejected_by_id[intent_id] = (cid, code)
+                continue
+            if event_type == "take_profit_synced":
+                orders = details.get("orders")
+                if isinstance(orders, Sequence) and not isinstance(
+                    orders, (str, bytes, bytearray)
+                ):
+                    for order in orders:
+                        if not isinstance(order, Mapping):
+                            continue
+                        cid = str(
+                            order.get("client_order_id")
+                            or order.get("clientOrderId")
+                            or ""
+                        )
+                        if cid in expected:
+                            attempted.add(cid)
+                continue
+            if event_type in exit_indexes:
+                index = exit_indexes[event_type]
+                if 0 <= index < len(expected):
+                    attempted.add(expected[index])
+                    completed.add(expected[index])
+                continue
+            if event_type != "v1469_tp_layer_progress":
+                continue
+            cid = str(details.get("client_order_id") or "")
+            if cid not in expected:
+                continue
+            attempted.add(cid)
+            try:
+                executed = float(details.get("executed_qty"))
+                target = float(details.get("target_qty"))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if (
+                math.isfinite(executed)
+                and math.isfinite(target)
+                and target > 0
+                and executed + 1e-9 >= target
+            ):
+                completed.add(cid)
+
+        attempted.update(legacy_unresolved_intents)
+        for intent_id, cid in intents_by_id.items():
+            resolution = rejected_by_id.get(intent_id)
+            if resolution is None or resolution[0] != cid:
+                attempted.add(cid)
+
+        lookup = getattr(self._client, "get_order_by_client_order_id", None)
+        if not callable(lookup):
+            raise RuntimeError(
+                "v1469 paid TP exact history endpoint is unavailable"
+            )
+        start_time = max(0, int(run.get("armed_at_ms") or 0) - 60_000)
+
+        def trade_field(row: Any, *names: str) -> Any:
+            if isinstance(row, Mapping):
+                for name in names:
+                    if name in row:
+                        return row.get(name)
+                return None
+            for name in names:
+                value = getattr(row, name, None)
+                if value is not None:
+                    return value
+            return None
+
+        async def trade_quantity(order_id: int) -> float:
+            get_trades = getattr(self._client, "get_user_trades", None)
+            if not callable(get_trades):
+                return 0.0
+            try:
+                trades = await get_trades(
+                    position.symbol,
+                    start_time=start_time or None,
+                    limit=1000,
+                )
+            except Exception as exc:  # noqa: BLE001 - ambiguity must halt.
+                raise RuntimeError(
+                    "v1469 paid TP trade history lookup failed"
+                ) from exc
+            total = 0.0
+            for trade in trades:
+                try:
+                    trade_order_id = int(
+                        trade_field(trade, "order_id", "orderId") or 0
+                    )
+                    qty = float(trade_field(trade, "qty", "quantity") or 0.0)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if trade_order_id == order_id and math.isfinite(qty) and qty > 0:
+                    total += qty
+            return total
+
+        recovered: list[Mapping[str, Any]] = list(existing_tp)
+        for cid in missing:
+            if cid in completed:
+                continue
+            try:
+                history = await lookup(position.symbol, cid)
+            except Exception as exc:  # noqa: BLE001 - ambiguity must halt.
+                raise RuntimeError(
+                    f"v1469 paid TP history lookup failed for {cid}"
+                ) from exc
+            if history is None:
+                if cid in attempted:
+                    raise RuntimeError(
+                        f"v1469 paid TP prior placement has no history: {cid}"
+                    )
+                continue
+            if not isinstance(history, Mapping):
+                raise RuntimeError(
+                    f"v1469 paid TP history payload is invalid for {cid}"
+                )
+            history_cid = str(history.get("clientOrderId") or "")
+            history_symbol = str(history.get("symbol") or "").upper()
+            history_side = str(history.get("side") or "").upper()
+            try:
+                order_id = int(history.get("orderId") or 0)
+            except (TypeError, ValueError, OverflowError):
+                order_id = 0
+            if (
+                history_cid != cid
+                or history_symbol != str(position.symbol).upper()
+                or history_side != close_side
+                or order_id <= 0
+            ):
+                raise RuntimeError(
+                    f"v1469 paid TP history identity mismatch for {cid}"
+                )
+            if str(history.get("reduceOnly")).strip().lower() not in {
+                "true",
+                "1",
+            }:
+                raise RuntimeError(
+                    f"v1469 paid TP history is not reduce-only for {cid}"
+                )
+            if str(history.get("status") or "").upper() != "FILLED":
+                raise RuntimeError(
+                    f"v1469 paid TP missing order is not provably filled for {cid}"
+                )
+            try:
+                original_qty = float(
+                    history.get("origQty") or history.get("quantity") or 0.0
+                )
+                executed_qty = float(
+                    history.get("executedQty") or history.get("cumQty") or 0.0
+                )
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise RuntimeError(
+                    f"v1469 paid TP history quantity is invalid for {cid}"
+                ) from exc
+            if not math.isfinite(executed_qty) or executed_qty <= 0:
+                executed_qty = await trade_quantity(order_id)
+            if (
+                not math.isfinite(original_qty)
+                or original_qty <= 0
+                or not math.isfinite(executed_qty)
+                or executed_qty <= 0
+                or executed_qty > original_qty + 1e-9
+            ):
+                raise RuntimeError(
+                    f"v1469 paid TP fill quantity is not provable for {cid}"
+                )
+            proof = dict(history)
+            proof["executedQty"] = executed_qty
+            proof["_v1469_history_proof"] = True
+            recovered.append(proof)
+        return recovered
     async def _sync_take_profit_orders(self, run: dict, position: PositionInfo, signal: dict) -> list[tuple[str, str, float]]:
         run_id = run["run_id"]
         side = str(run.get("side") or signal.get("side") or position.position_direction).upper()
@@ -21944,8 +22204,27 @@ class MainnetOneRunManager:
             order for order in existing_orders
             if str(order.get("clientOrderId") or "").startswith(f"{run_id}_tp")
         ]
+        paid_exact_plan = self._v1469_paid_exact_plan(signal)
+        tp_evidence: Sequence[Mapping[str, Any]] = existing_tp
+        if paid_exact_plan is not None:
+            try:
+                tp_evidence = await self._v1469_recover_missing_tp_history(
+                    run, position, signal, existing_tp, close_side
+                )
+            except RuntimeError as exc:
+                await self._v1460_halt_paid_path(
+                    run,
+                    "v1469_tp_history_ambiguous",
+                    {"error": str(exc)[:300]},
+                )
+                await self._repo.log_event(
+                    run_id,
+                    "v1469_tp_history_fail_closed",
+                    {"error": str(exc)[:300]},
+                )
+                raise
         desired = await self._desired_take_profit_orders(
-            run, position, signal, close_side, existing_tp
+            run, position, signal, close_side, tp_evidence
         )
         await self._audit_tp1_touch_no_fill(run, position, desired, existing_tp, signal)
         current_qty = abs(position.position_amt)
@@ -21969,6 +22248,21 @@ class MainnetOneRunManager:
                     raise
         actual_orders: list[tuple[str, str, float]] = []
         for client_order_id, qty, price in desired:
+            submit_intent_id: str | None = None
+            if paid_exact_plan is not None:
+                submit_intent_id = uuid.uuid4().hex
+                await self._repo.log_event(
+                    run_id,
+                    "v1469_tp_layer_submit_intent",
+                    {
+                        "intent_id": submit_intent_id,
+                        "client_order_id": client_order_id,
+                        "symbol": position.symbol,
+                        "side": close_side,
+                        "qty": qty,
+                        "price": price,
+                    },
+                )
             try:
                 await self._client.create_reduce_only_limit_order(
                     position.symbol,
@@ -21980,6 +22274,16 @@ class MainnetOneRunManager:
                 )
                 actual_orders.append((client_order_id, qty, price))
             except BinanceAPIException as exc:
+                if submit_intent_id is not None and exc.code in {-2022, -5022}:
+                    await self._repo.log_event(
+                        run_id,
+                        "v1469_tp_layer_submit_rejected",
+                        {
+                            "intent_id": submit_intent_id,
+                            "client_order_id": client_order_id,
+                            "code": exc.code,
+                        },
+                    )
                 if exc.code == -2022:
                     # Position is gone (race with exchange-side SL/TP fill).
                     # Stop placing TP orders; next cycle will detect flat.
@@ -22013,6 +22317,21 @@ class MainnetOneRunManager:
                         side=close_side,
                     )
                     try:
+                        requote_intent_id: str | None = None
+                        if paid_exact_plan is not None:
+                            requote_intent_id = uuid.uuid4().hex
+                            await self._repo.log_event(
+                                run_id,
+                                "v1469_tp_layer_submit_intent",
+                                {
+                                    "intent_id": requote_intent_id,
+                                    "client_order_id": client_order_id,
+                                    "symbol": position.symbol,
+                                    "side": close_side,
+                                    "qty": qty,
+                                    "price": book_price,
+                                },
+                            )
                         await self._client.create_reduce_only_limit_order(
                             position.symbol,
                             close_side,
@@ -22023,6 +22342,19 @@ class MainnetOneRunManager:
                         )
                         actual_orders.append((client_order_id, qty, book_price))
                     except BinanceAPIException as requote_exc:
+                        if (
+                            requote_intent_id is not None
+                            and requote_exc.code in {-2022, -5022}
+                        ):
+                            await self._repo.log_event(
+                                run_id,
+                                "v1469_tp_layer_submit_rejected",
+                                {
+                                    "intent_id": requote_intent_id,
+                                    "client_order_id": client_order_id,
+                                    "code": requote_exc.code,
+                                },
+                            )
                         if requote_exc.code == -2022:
                             logger.info(
                                 "tp_requote_reduce_only_rejected_position_gone",
@@ -22246,6 +22578,20 @@ class MainnetOneRunManager:
                 continue
             if not math.isfinite(order_executed) or order_executed <= 0:
                 continue
+            if order.get("_v1469_history_proof") is True:
+                try:
+                    original_qty = float(order.get("origQty") or 0.0)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise RuntimeError(
+                        "v1469 paid TP historical quantity is invalid"
+                    ) from exc
+                if (
+                    abs(original_qty - target_quantities[index]) > 1e-9
+                    or abs(order_executed - original_qty) > 1e-9
+                ):
+                    raise RuntimeError(
+                        "v1469 paid TP historical fill does not match exact layer"
+                    )
             order_key = str(order.get("orderId") or client_order_id)
             already_recorded = executed_by_order.get(order_key, 0.0)
             newly_executed = max(0.0, order_executed - already_recorded)
