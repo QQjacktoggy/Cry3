@@ -61,6 +61,26 @@ def test_exact_profile_hash_excludes_submit_price_and_caps():
         snapshot(lane_notional_cap_usdc=60, global_notional_cap_usdc=50)
 
 
+def test_legacy_snapshot_strict_round_trip_and_corruption_fails_closed():
+    snap = snapshot()
+    assert LegacyExecutionSnapshot.from_payload(snap.to_payload()) == snap
+    corrupt = snap.to_payload()
+    corrupt["execution_profile_hash"] = "0" * 64
+    with pytest.raises(ValueError, match="profile hash mismatch"):
+        LegacyExecutionSnapshot.from_payload(corrupt)
+    extra = {**snap.to_payload(), "future_execution_control": True}
+    with pytest.raises(ValueError, match="schema mismatch"):
+        LegacyExecutionSnapshot.from_payload(extra)
+
+
+def test_take_profit_fractions_must_be_exact_and_finite():
+    with pytest.raises(ValueError, match="sum exactly"):
+        snapshot(take_profits=(
+            TakeProfitLevel(level_id="A", target_bp=5, fraction=.4),
+            TakeProfitLevel(level_id="B", target_bp=9, fraction=.59),
+        ))
+
+
 def _decision(snap):
     arm = ArmIdentity(arm_key="adaptive-a", lane_code="W6A", side="LONG",
         strategy="S1_BB_RSI", regime="RANGE", execution_profile_id="RANGE_SCALP",

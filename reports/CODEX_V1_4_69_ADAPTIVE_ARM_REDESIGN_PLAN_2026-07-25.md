@@ -31,19 +31,28 @@ deployment gates；完成後仍須 human review。
 
 R1-D 本次安全 checkpoint 已由 `App` 使用同一 DB 建立並注入 observation、lease、daily-risk、
 paid-claim repositories 與 paid-execution adapter；arbiter/enforcement flag 啟用時，會在任何
-Binance connect 前驗證 exact 30s/15m/45m/180m/freshness/lease settings 及 016–019 所有 owner
+Binance connect 前驗證 exact 30s/15m/45m/180m/freshness/lease settings 及 016–020 所有 owner
 schema。Binance client 亦新增 deterministic CID reconciliation query。因真實 `_place_entry`
 仍未完成 caller-resolved snapshot、rolling arbiter、single outer authority 與兩種 entry callable 的
 claim-adapter 包裝，本 checkpoint 保留 enforcement startup rejection；不可視為 R1-D 完成。
 
-R1-D2 已在真實 `_place_entry` 中、所有既有 S2／Codex／lane overlays 完成後且任何
-leverage、quantity formatting 或 order API side effect 之前，凍結實際被選 paid legacy lane 的
+R1-D2 repair 已加入 migration 020 durable exact profile payload、strict hash-verified restart
+rehydration、source-replay evidence repair 與 accepted-path durability barrier；snapshot 改在既有
+v1465/v1464 claim chain 接受後、第一個 order-create 前凍結，且不改 immutable feature snapshot。
+unsupported GTC fallback／dynamic reprice／DCA 只產生 adaptive-only evidence。snapshot 使用
+同一 selected candidate identity 與 raw signal reference，effective total offset 僅編碼一次。
+
+**R1-D2 尚未完成。** 尚缺完整 normal/ladder/S2/Codex enforcement-OFF differential fixture、
+每一個 late early-return cleanup 的 integration fixture，以及 accepted barrier timeout/crash 的完整
+integration acceptance matrix；在這些測試齊備以前不得標示 D2 complete。原 checkpoint 曾宣稱
+完成的下列描述只代表已實作範圍：真實 `_place_entry` 中、所有既有 S2／Codex／lane overlays
+完成後凍結實際被選 paid legacy lane 的
 immutable `LEGACY_CONTROL` snapshot。snapshot 包含實際 entry/TTL/reprice、完整 TP fractions、
 SL/hold/BE/trail/runner/early-fail/DCA、effective notional/caps 與 canonical policy hashes，並附在
 同一 durable opportunity 後送進 paired-shadow runtime；只有 selected lane 取得一個 legacy arm，
 其餘 overlap candidates 仍各自取得 adaptive arms。無法精確建構時只把明確
 `exact_snapshot_data_blocked` 原因寫入 observation，legacy paid path 不受影響。
-**R1-D2 完成不代表 R1-D 完成：** lease/arbiter authority、paid claim/order adapter 與真實 order
+**R1-D2 完成後仍不代表 R1-D 完成：** lease/arbiter authority、paid claim/order adapter 與真實 order
 submission boundary 仍未接線，enforcement 仍維持 OFF 且 startup rejection 保留。
 
 ## Executive Summary

@@ -22,7 +22,7 @@ from src.gridbot.mainnet.v1469_arm_profiles import (
     get_arm_profile,
     profiles_for_matched_candidate,
 )
-from src.gridbot.mainnet.v1469_legacy_control import LegacyExecutionSnapshot
+from src.gridbot.mainnet.v1469_legacy_control import LEGACY_CONTROL, LegacyExecutionSnapshot
 from src.gridbot.mainnet.v1469_arbiter_evidence_mapper import (
     PAIRED_CONTRACT_SCHEMA,
     paired_group_identity,
@@ -256,6 +256,12 @@ class V1469PairedShadowRuntime:
                         "diagnostic_only": False,
                         "observed_at_ms": observed_at_ms,
                         "created_at_ms": observed_at_ms,
+                        "execution_profile_payload": (
+                            legacy_snapshot.to_payload()
+                            if profile.profile_id == LEGACY_CONTROL
+                            and legacy_snapshot is not None
+                            else None
+                        ),
                     }
                 )
 
@@ -385,6 +391,17 @@ class V1469PairedShadowRuntime:
                     snapshot=snapshot,
                 )
                 status = str(first.get("candidate_status") or "").upper()
+                legacy_members = [member for member in members if str(
+                    member["execution_profile_id"]).upper() == LEGACY_CONTROL]
+                legacy_snapshot = None
+                if legacy_members:
+                    if len(legacy_members) != 1:
+                        raise ValueError("duplicate durable legacy profile")
+                    legacy_snapshot = LegacyExecutionSnapshot.from_payload(
+                        legacy_members[0].get("execution_profile_payload")
+                    )
+                    if legacy_snapshot.market_identity != identity:
+                        raise ValueError("durable legacy market identity mismatch")
                 arm_opportunity = MatchedArmOpportunity(
                     opportunity_id=str(first["opportunity_id"]),
                     candidate_status=status,
@@ -392,17 +409,25 @@ class V1469PairedShadowRuntime:
                     signal_price=_float(
                         snapshot.get("signal_reference_price")
                     ),
+                    legacy_profile=(legacy_snapshot.profile_definition
+                                    if legacy_snapshot is not None else None),
                 )
                 expected_profiles = {
                     profile.profile_id: profile
-                    for profile in _tradable_profiles(identity, status)
+                    for profile in _tradable_profiles(
+                        identity, status,
+                        legacy_snapshot.profile_definition
+                        if legacy_snapshot is not None else None,
+                    )
                 }
                 evidence_map: dict[str, str] = {}
                 for member in members:
                     profile_id = str(
                         member["execution_profile_id"]
                     ).upper()
-                    profile = get_arm_profile(profile_id)
+                    profile = (legacy_snapshot.profile_definition
+                               if profile_id == LEGACY_CONTROL and legacy_snapshot is not None
+                               else get_arm_profile(profile_id))
                     execution = profile.execution_profile
                     if (
                         profile_id not in expected_profiles

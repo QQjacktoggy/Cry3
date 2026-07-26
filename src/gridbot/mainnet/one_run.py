@@ -1853,7 +1853,14 @@ class MainnetOneRunManager:
                 isinstance(persistence_result, Mapping)
                 and persistence_result.get("source_replay")
             )
-            if paired_runtime is not None and not source_replay:
+            if source_replay and str(persistence_result.get(
+                "durable_opportunity_id") or "") != str(
+                    opportunity.get("opportunity_id") or ""):
+                raise RuntimeError("source replay opportunity identity mismatch")
+            # A source replay can mean the prior process committed the
+            # opportunity/candidates and crashed before starting evidence.
+            # append_evidence_bundle is idempotent, so always repair it.
+            if paired_runtime is not None:
                 paired_summary = (
                     await paired_runtime.start_observation(
                         opportunity,
@@ -18835,20 +18842,17 @@ class MainnetOneRunManager:
         if len(selected) != 1:
             raise ValueError(f"selected_lane_count:{len(selected)}")
         candidate = selected[0]
-        lane = str(candidate.get("lane_code") or "").strip().upper()
-        side = str(decision.side or "").strip().upper()
-        strategy = str(run.get("strategy") or decision.strategy or "").strip().upper()
         snapshot_value = opportunity.get("feature_snapshot")
         features = dict(snapshot_value) if isinstance(snapshot_value, Mapping) else {}
-        regime = str(opportunity.get("coarse_regime") or "").strip().upper()
-        market_state = str(features.get("v1469_regime_market_state") or features.get("market_state") or "").strip().lower()
-        if not all((lane, side, strategy, regime, market_state)):
-            raise ValueError("selected_market_identity_incomplete")
-        identity = MarketStateIdentity(environment="MAINNET", symbol=str(run.get("symbol") or ""),
-            lane_code=lane, effective_side=side, strategy=strategy,
-            coarse_regime=regime, market_state=market_state)
+        from .v1469_paired_shadow_runtime import _market_identity
+        identity = _market_identity(opportunity=opportunity, candidate=candidate,
+                                    snapshot=features)
+        lane = identity.lane_code
+        if identity.effective_side != str(decision.side or "").strip().upper():
+            raise ValueError("selected_market_identity_mismatch")
 
-        if not math.isfinite(entry_signal_price) or entry_signal_price <= 0:
+        raw_reference = float(features.get("signal_reference_price"))
+        if not math.isfinite(raw_reference) or raw_reference <= 0:
             raise ValueError("entry_reference_price_invalid")
         tp_levels: list[TakeProfitLevel] = []
         partial_fraction = float(decision.partial_exit_pct)
@@ -18877,6 +18881,8 @@ class MainnetOneRunManager:
                      "metrics": getattr(codex_decision, "metrics", None) if codex_decision else None,
                  }}})["ttl_seconds"]))
         reprice_enabled = int(self._settings.mainnet_entry_reprice_max_updates) > 0
+        if reprice_enabled:
+            raise ValueError("unsupported_dynamic_reprice_policy")
         reprice = RepricePolicy(enabled=reprice_enabled,
             after_s=int(self._settings.mainnet_entry_requote_min_age_seconds) if reprice_enabled else 0,
             offset_bp=float(self._settings.mainnet_entry_max_deviation_bps) if reprice_enabled else 0.0,
@@ -18902,6 +18908,8 @@ class MainnetOneRunManager:
             max_mfe_bp=0.0, adverse_bp=float(decision.adverse_exit_loss_pct) * 10_000.0 if early_enabled else 0.0)
         recovery = self._recovery_runtime_payload(lane_code=lane, uses_codex_v1=codex_decision is not None)
         dca_enabled = bool(recovery["effective_recovery_enabled"])
+        if dca_enabled:
+            raise ValueError("unsupported_dynamic_dca_policy")
         layers = tuple(DcaLayer(layer_id=f"L{index + 1}",
             trigger_adverse_bp=float(self._settings.mainnet_recovery_trigger_pct) * 10_000.0 * (index + 1),
             additional_fraction=1.0 / int(self._settings.mainnet_recovery_steps))
@@ -18919,31 +18927,45 @@ class MainnetOneRunManager:
             breakeven=breakeven, trail=trail, runner=runner,
             early_fail=early_fail, dca=dca, lane_notional_cap_usdc=lane_cap,
             global_notional_cap_usdc=global_cap, risk_policy_hash=risk_hash,
-            reference_price=float(entry_signal_price))
+            reference_price=raw_reference)
 
-    def _v1469_finish_paid_observation(
+    async def _v1469_finish_paid_observation(
         self, run: Mapping[str, Any], decision: WildcatLiveDecision,
         codex_decision: CodexV1Decision | None, *, entry_signal_price: float,
         entry_offset_bp: float, entry_notional: float,
-    ) -> None:
+    ) -> str | None:
         pending_by_run = getattr(self, "_v1469_pending_paid_observations", {})
         pending = pending_by_run.pop(str(run.get("run_id") or ""), None)
         if pending is None or self._v1469_arm_observation_repo is None:
-            return
+            return None
         dedup_key, opportunity, candidates = pending
-        feature_snapshot = dict(opportunity.get("feature_snapshot") or {})
         try:
             legacy = self._v1469_build_resolved_legacy_snapshot(run, decision, codex_decision,
                 entry_signal_price=entry_signal_price, entry_offset_bp=entry_offset_bp,
                 entry_notional=entry_notional, opportunity=opportunity, candidates=candidates)
             opportunity["legacy_execution_snapshot"] = legacy
-            feature_snapshot["legacy_control"] = legacy.to_payload()
         except Exception as exc:  # noqa: BLE001 - evidence fails closed, paid path unchanged
             reason = f"exact_snapshot_data_blocked:{type(exc).__name__}:{str(exc)[:160]}"
-            feature_snapshot["legacy_control_data_blocked_reason"] = reason
             logger.error("v1469_legacy_control_snapshot_data_blocked",
                 run_id=run.get("run_id"), reason=reason)
-        opportunity["feature_snapshot"] = feature_snapshot
+        try:
+            await asyncio.wait_for(asyncio.shield(self._v1469_persist_lane_observation(
+                repository=self._v1469_arm_observation_repo,
+                run_id=str(run.get("run_id") or ""), dedup_key=dedup_key,
+                opportunity=opportunity, candidates=candidates)), timeout=5.0)
+        except (TimeoutError, Exception) as exc:  # noqa: BLE001 - legacy remains authoritative
+            logger.error("v1469_accepted_durability_barrier_failed",
+                run_id=run.get("run_id"), opportunity_id=opportunity.get("opportunity_id"),
+                error=str(exc)[:300])
+        return str(opportunity.get("opportunity_id") or "")
+
+    def _v1469_flush_adaptive_only(self, run: Mapping[str, Any]) -> None:
+        """Release a deferred paid observation after a later legacy rejection."""
+        pending = self._v1469_pending_paid_observations.pop(
+            str(run.get("run_id") or ""), None)
+        if pending is None or self._v1469_arm_observation_repo is None:
+            return
+        dedup_key, opportunity, candidates = pending
         self._v1469_schedule_observation(self._v1469_arm_observation_repo,
             str(run.get("run_id") or ""), dedup_key, opportunity, candidates)
 
@@ -18959,6 +18981,7 @@ class MainnetOneRunManager:
     ) -> None:
         await self._ensure_runtime_config_loaded()
         if self._codex_v1_execution_enabled() and codex_decision is None:
+            self._v1469_flush_adaptive_only(run)
             await self._repo.log_event(
                 run["run_id"],
                 "entry_codex_v1_hard_blocked",
@@ -19031,6 +19054,7 @@ class MainnetOneRunManager:
                 features=codex_features,
             )
             if await self._adaptive_gate_before_submit(run, adaptive_decision_payload):
+                self._v1469_flush_adaptive_only(run)
                 return
             await self._maybe_start_adaptive_stup_fill_shadow(
                 run, decision, codex_decision, adaptive_decision_payload
@@ -19050,19 +19074,6 @@ class MainnetOneRunManager:
             decision.signal.price,
             decision.side,
             entry_offset_bp,
-        )
-        self._v1469_finish_paid_observation(
-            run, decision, codex_decision,
-            entry_signal_price=entry_signal_price,
-            entry_offset_bp=(
-                entry_offset_bp
-                + (
-                    float(self._settings.mainnet_entry_limit_offset) * 10_000.0
-                    if codex_decision is None
-                    else 0.0
-                )
-            ),
-            entry_notional=entry_notional,
         )
         await self._ensure_fee_guard(run["symbol"])
         await self._client.set_leverage(run["symbol"], self._settings.mainnet_leverage)
@@ -19104,6 +19115,7 @@ class MainnetOneRunManager:
                     )
                 )
             if claimed_decision is None:
+                self._v1469_flush_adaptive_only(run)
                 await self._repo.log_event(
                     run["run_id"],
                     (
@@ -19129,6 +19141,29 @@ class MainnetOneRunManager:
                 return
             codex_decision = claimed_decision
         ladder_offset = 0.0 if codex_decision is not None else self._settings.mainnet_entry_limit_offset
+        if codex_decision is None and not ladder_offset and bool(
+            self._settings.mainnet_entry_fallback_to_gtc
+        ):
+            # The paired evaluator cannot represent an execution that may
+            # dynamically fall back from post-only to GTC.
+            self._v1469_flush_adaptive_only(run)
+            logger.error("v1469_legacy_control_snapshot_data_blocked",
+                         run_id=run.get("run_id"),
+                         reason="exact_snapshot_data_blocked:unsupported_gtc_fallback")
+        else:
+            snapshot_raw = None
+            pending = self._v1469_pending_paid_observations.get(str(run.get("run_id") or ""))
+            if pending is not None:
+                snapshot_raw = float(dict(pending[1].get("feature_snapshot") or {}).get(
+                    "signal_reference_price"))
+            intended_price = entry_signal_price * (
+                1 - ladder_offset if side == "BUY" else 1 + ladder_offset
+            )
+            total_offset_bp = (abs(intended_price - snapshot_raw) / snapshot_raw * 10_000.0
+                               if snapshot_raw else entry_offset_bp)
+            run["_v1469_durable_opportunity_id"] = await self._v1469_finish_paid_observation(
+                run, decision, codex_decision, entry_signal_price=intended_price,
+                entry_offset_bp=total_offset_bp, entry_notional=entry_notional)
         ladder_deadline_ms: int | None = None
         entry_note = ""
         s = self._settings

@@ -99,6 +99,7 @@ _SCHEMA_TABLES: dict[str, frozenset[str]] = {
         "candidate_id",
         "arm_key",
         "execution_profile_hash",
+        "execution_profile_payload_json",
         "status",
         "outcome",
         "reward_net_bp",
@@ -366,6 +367,16 @@ class V1469ArmObservationRepository:
             problems.append(
                 "v1469_lane_candidates:missing_contract=NOT_EVALUATED"
             )
+        evidence_columns = {
+            str(row.get("name") or "")
+            for row in await self._db.fetchall(
+                "PRAGMA table_info(v1469_arm_evidence)"
+            )
+        }
+        if "execution_profile_payload_json" not in evidence_columns:
+            problems.append("v1469_arm_evidence:missing_migration=020")
+        if "trg_v1469_arm_evidence_profile_payload_immutable" not in by_name:
+            problems.append("missing_migration=020_profile_payload_trigger")
         if problems:
             raise ArmObservationPersistenceError(
                 "unsafe v1.4.69 observation schema: "
@@ -969,6 +980,11 @@ class V1469ArmObservationRepository:
                     "diagnostic_only": _flag(
                         payload, "diagnostic_only"
                     ),
+                    "execution_profile_payload_json": (
+                        json.dumps(payload["execution_profile_payload"], ensure_ascii=True,
+                                   sort_keys=True, separators=(",", ":"))
+                        if payload.get("execution_profile_payload") is not None else None
+                    ),
                 }
             )
 
@@ -1038,6 +1054,9 @@ class V1469ArmObservationRepository:
                         "evidence_hash": None,
                         "created_at_ms": item["created_at_ms"],
                         "updated_at_ms": item["created_at_ms"],
+                        "execution_profile_payload_json": item[
+                            "execution_profile_payload_json"
+                        ],
                     }
                     duplicate = seen.get(row["evidence_id"])
                     if duplicate is not None:
@@ -1193,6 +1212,7 @@ class V1469ArmObservationRepository:
                 e.evidence_id, e.opportunity_id, e.candidate_id, e.arm_key,
                 e.execution_profile_id, e.execution_profile_schema,
                 e.execution_profile_hash, e.source_type,
+                e.execution_profile_payload_json,
                 e.diagnostic_only, e.observed_at_ms,
                 c.lane_code, c.effective_side, c.strategy,
                 c.safety_status AS candidate_status, c.data_complete,
@@ -1221,6 +1241,12 @@ class V1469ArmObservationRepository:
             except json.JSONDecodeError:
                 row["feature_snapshot"] = {}
                 row["data_quality"] = "DATA_INCOMPLETE"
+            raw_profile = row.pop("execution_profile_payload_json", None)
+            if raw_profile is not None:
+                try:
+                    row["execution_profile_payload"] = json.loads(str(raw_profile))
+                except json.JSONDecodeError:
+                    row["execution_profile_payload"] = {"corrupt": True}
         return rows
 
     async def count_pending_evidence(

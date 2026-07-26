@@ -11,7 +11,7 @@ from math import isfinite
 from typing import Any, Mapping
 
 from .v1469_adaptive_identity import (
-    BreakevenPolicy, DcaPolicy, EarlyFailPolicy, ExecutionProfile,
+    BreakevenPolicy, DcaLayer, DcaPolicy, EarlyFailPolicy, ExecutionProfile,
     MarketStateIdentity, RepricePolicy, RunnerPolicy, TakeProfitLevel,
     TrailPolicy, canonical_sha256,
 )
@@ -53,6 +53,10 @@ class LegacyExecutionSnapshot:
                 raise TypeError(f"{name} must be {kind.__name__}")
         if not isinstance(self.take_profits, tuple) or not self.take_profits:
             raise TypeError("take_profits must be a non-empty tuple")
+        if any(not isinstance(item, TakeProfitLevel) for item in self.take_profits):
+            raise TypeError("take_profits must contain TakeProfitLevel values")
+        if abs(sum(item.fraction for item in self.take_profits) - 1.0) > 1e-9:
+            raise ValueError("take-profit fractions must sum exactly to 1")
         if str(self.entry_type).strip().upper() not in {"LIMIT", "MARKET"}:
             raise ValueError("entry_type must be LIMIT or MARKET")
         for name in ("lane_notional_cap_usdc", "global_notional_cap_usdc", "reference_price"):
@@ -121,6 +125,51 @@ class LegacyExecutionSnapshot:
             **self.submit_authority_payload(),
             "submit_authority_hash": self.submit_authority_hash,
         }
+
+    @classmethod
+    def from_payload(cls, value: Mapping[str, Any]) -> "LegacyExecutionSnapshot":
+        """Strictly restore a canonical snapshot and verify both hashes."""
+        if not isinstance(value, Mapping):
+            raise TypeError("legacy snapshot payload must be a mapping")
+        expected = {
+            "market_identity", "entry_offset_bp", "entry_type", "entry_ttl_s",
+            "maker_mode", "take_profits", "sl_bp", "max_hold_s", "reprice",
+            "breakeven", "trail", "runner", "early_fail", "dca",
+            "lane_notional_cap_usdc", "global_notional_cap_usdc",
+            "risk_policy_hash", "reference_price", "profile_id",
+            "execution_profile_hash", "submit_authority_hash",
+        }
+        if set(value) != expected:
+            raise ValueError("legacy snapshot payload schema mismatch")
+        if value["profile_id"] != LEGACY_CONTROL:
+            raise ValueError("legacy snapshot profile_id mismatch")
+        market = dict(value["market_identity"])
+        market.pop("schema", None)
+        dca_value = dict(value["dca"])
+        layers = tuple(DcaLayer(**dict(item)) for item in dca_value.pop("layers"))
+        result = cls(
+            market_identity=MarketStateIdentity(**market),
+            entry_offset_bp=value["entry_offset_bp"], entry_type=value["entry_type"],
+            entry_ttl_s=value["entry_ttl_s"], maker_mode=value["maker_mode"],
+            take_profits=tuple(TakeProfitLevel(**dict(item)) for item in value["take_profits"]),
+            sl_bp=value["sl_bp"], max_hold_s=value["max_hold_s"],
+            reprice=RepricePolicy(**dict(value["reprice"])),
+            breakeven=BreakevenPolicy(**dict(value["breakeven"])),
+            trail=TrailPolicy(**dict(value["trail"])),
+            runner=RunnerPolicy(**dict(value["runner"])),
+            early_fail=EarlyFailPolicy(**dict(value["early_fail"])),
+            dca=DcaPolicy(**dca_value, layers=layers),
+            lane_notional_cap_usdc=value["lane_notional_cap_usdc"],
+            global_notional_cap_usdc=value["global_notional_cap_usdc"],
+            risk_policy_hash=value["risk_policy_hash"], reference_price=value["reference_price"],
+        )
+        if value["execution_profile_hash"] != result.execution_profile.profile_hash:
+            raise ValueError("legacy snapshot execution profile hash mismatch")
+        if value["submit_authority_hash"] != result.submit_authority_hash:
+            raise ValueError("legacy snapshot submit authority hash mismatch")
+        if result.to_payload() != dict(value):
+            raise ValueError("legacy snapshot payload is not canonical")
+        return result
 
     @property
     def submit_authority_hash(self) -> str:
