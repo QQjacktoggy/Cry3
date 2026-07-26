@@ -26,6 +26,12 @@ from src.gridbot.storage.repositories import AuditLogRepository
 from src.gridbot.telegram.formatters import (
     format_testnet_dashboard,
 )
+from src.gridbot.telegram.lane_monitor import (
+    build_lane_detail,
+    build_lane_monitor,
+    lane_monitor_html_chunks,
+    lane_monitor_keyboard,
+)
 from src.gridbot.testnet.pnl import calculate_testnet_pnl_breakdown
 from src.gridbot.utils.logging import get_logger
 
@@ -34,6 +40,13 @@ TAIPEI = ZoneInfo("Asia/Taipei")
 
 
 TELEGRAM_HTML_SAFE_LIMIT = 3900
+
+
+def _lane_monitor_database(context: ContextTypes.DEFAULT_TYPE):
+    """Prefer the read-dedicated connection so status views cannot queue trades."""
+
+    bot_data = context.application.bot_data
+    return bot_data.get("lane_monitor_db") or bot_data.get("db")
 
 
 def _telegram_html_chunks(text: str, *, limit: int = TELEGRAM_HTML_SAFE_LIMIT) -> list[str]:
@@ -54,8 +67,20 @@ def _telegram_html_chunks(text: str, *, limit: int = TELEGRAM_HTML_SAFE_LIMIT) -
             # forced split cannot leave an unclosed HTML tag in Telegram.
             escaped_line = escape(line)
             while len(escaped_line) > limit:
-                chunks.append(escaped_line[:limit])
-                escaped_line = escaped_line[limit:]
+                split_at = limit
+                # html.escape() emits entities such as ``&amp;``.  Splitting
+                # between ``&`` and ``;`` makes Telegram reject the entire
+                # parse-mode=HTML message, so move the boundary to the start of
+                # the incomplete entity.  Production's 3900-char limit is far
+                # longer than every entity emitted by html.escape().
+                entity_start = escaped_line.rfind("&", 0, split_at)
+                entity_end = escaped_line.rfind(";", 0, split_at)
+                if entity_start > entity_end:
+                    split_at = entity_start
+                if split_at <= 0:  # Defensive fallback for impractically tiny limits.
+                    split_at = limit
+                chunks.append(escaped_line[:split_at])
+                escaped_line = escaped_line[split_at:]
             current = escaped_line
             continue
         if current and len(current) + len(line) > limit:
@@ -556,8 +581,11 @@ async def cmd_testnet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not await _authorized(update, context):
         return
     app_data = context.application.bot_data
-    binance_client: BinanceFuturesClient = app_data["binance_client"]
     settings: Settings = app_data["settings"]
+    if not settings.testnet_legacy_enabled:
+        await update.message.reply_text("ℹ️ 舊 Testnet 功能已停用；請使用 /status、/mainnet 或 /pnl。")
+        return
+    binance_client: BinanceFuturesClient = app_data["binance_client"]
 
     if settings.testnet_telegram_signal_only:
         await update.message.reply_text("ℹ️ 目前為手動訊號模式，這個 bot 不會自動下 testnet 單；主要請看 Telegram 開單通知與 /signal。")
@@ -873,7 +901,9 @@ async def _build_codex_signal_stats(context: ContextTypes.DEFAULT_TYPE) -> str:
     since_ms = int(start_tpe.astimezone(timezone.utc).timestamp() * 1000)
     now_ms = int(now_tpe.astimezone(timezone.utc).timestamp() * 1000)
     current_version_fragment = "v1.4"
-    runtime_version = "_codex_v1.4.0"
+    # Keep the operator-facing identity tied to the imported strategy runtime;
+    # a hard-coded copy previously drifted all the way back to v1.4.2.
+    runtime_version = CODEX_V1_VERSION
     schema_version = "2026_06_20_v133"
     settings = context.application.bot_data.get("settings")
     config_keys = (
@@ -1408,6 +1438,7 @@ async def cmd_signal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             getattr(settings, "mainnet_codex_v1_enabled", False)
             or getattr(settings, "mainnet_strategy_label", "") in {
                 CODEX_V1_VERSION,
+                "_codex_v1.4.1",
                 "_codex_v1.4.0",
                 "_codex_v1.3.3_fee_and_evidence_quality_fix",
                 "codex_v1.3.0_w6a_guarded_200cap",
@@ -1527,6 +1558,27 @@ async def cmd_mainnet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text(status.text, parse_mode="HTML", reply_markup=status.reply_markup)
 
 
+async def cmd_lanes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/lanes — Read-only status for every frozen legacy lane."""
+    if not await _authorized(update, context):
+        return
+    message = update.message
+    if message is None:
+        return
+    db = _lane_monitor_database(context)
+    if db is None:
+        await message.reply_text("❌ Lane evidence database 尚未初始化。")
+        return
+    text = await build_lane_monitor(db)
+    chunks = lane_monitor_html_chunks(text)
+    for index, chunk in enumerate(chunks):
+        await message.reply_text(
+            chunk,
+            parse_mode="HTML",
+            reply_markup=lane_monitor_keyboard() if index == len(chunks) - 1 else None,
+        )
+
+
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _authorized(update, context):
         return
@@ -1599,12 +1651,65 @@ async def handle_mainnet_callback(update: Update, context: ContextTypes.DEFAULT_
     query = update.callback_query
     if query is None:
         return
+    data = query.data or ""
+    lane_monitor_request = data in {"mainnet:lanes", "mainnet:lanes:refresh"} or data.startswith(
+        "mainnet:lane:"
+    )
     manager = context.application.bot_data.get("mainnet_one_run_manager")
-    if manager is None:
+    if manager is None and not lane_monitor_request:
         await query.answer("Mainnet manager 尚未初始化。", show_alert=True)
         return
-    data = query.data or ""
     await query.answer("處理中...")
+    message = query.message
+    if message is None:
+        return
+    if data in {"mainnet:lanes", "mainnet:lanes:refresh"}:
+        db = _lane_monitor_database(context)
+        if db is None:
+            await message.reply_text("❌ Lane evidence database 尚未初始化。")
+            return
+        text = await build_lane_monitor(db)
+        chunks = lane_monitor_html_chunks(text)
+        for index, chunk in enumerate(chunks):
+            await message.reply_text(
+                chunk,
+                parse_mode="HTML",
+                reply_markup=lane_monitor_keyboard() if index == len(chunks) - 1 else None,
+            )
+        return
+    if data.startswith("mainnet:lane:"):
+        db = _lane_monitor_database(context)
+        if db is None:
+            await message.reply_text("❌ Lane evidence database 尚未初始化。")
+            return
+        lane_code = data.removeprefix("mainnet:lane:")
+        text = await build_lane_detail(db, lane_code)
+        chunks = lane_monitor_html_chunks(text)
+        for index, chunk in enumerate(chunks):
+            await message.reply_text(
+                chunk,
+                parse_mode="HTML",
+                reply_markup=lane_monitor_keyboard() if index == len(chunks) - 1 else None,
+            )
+        return
+    if data == "mainnet:adaptive:start":
+        result = await manager.start_adaptive_session(actor="telegram")
+        text = result if isinstance(result, str) else result.text
+        reply_markup = None if isinstance(result, str) else getattr(result, "reply_markup", None)
+        await query.message.reply_text(text, parse_mode="HTML", reply_markup=reply_markup)
+        return
+    if data == "mainnet:adaptive:status":
+        result = await manager.adaptive_status()
+        text = result if isinstance(result, str) else result.text
+        reply_markup = None if isinstance(result, str) else getattr(result, "reply_markup", None)
+        await query.message.reply_text(text, parse_mode="HTML", reply_markup=reply_markup)
+        return
+    if data == "mainnet:adaptive:review":
+        result = await manager.adaptive_review()
+        text = result if isinstance(result, str) else result.text
+        reply_markup = None if isinstance(result, str) else getattr(result, "reply_markup", None)
+        await query.message.reply_text(text, parse_mode="HTML", reply_markup=reply_markup)
+        return
     if data == "mainnet:cancel":
         text = await manager.cancel()
         await query.message.reply_text(text, parse_mode="HTML")

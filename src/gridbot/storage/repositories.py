@@ -5,6 +5,7 @@ Each repository handles one table or a closely related group.
 
 import json
 import time
+from typing import Any, Sequence
 
 from src.gridbot.storage.database import Database
 
@@ -556,6 +557,339 @@ class MainnetRunRepository:
             (run_id, limit),
         )
 
+    async def get_events_by_types(
+        self,
+        run_id: str,
+        event_types: Sequence[str],
+        limit: int | None = 30,
+    ) -> list[dict]:
+        """Read a run's selected event ledger, optionally without truncation.
+
+        Rehydrating active shadow samples must see both the oldest ``started``
+        record and every later terminal record.  A rolling limit can otherwise
+        resurrect a terminal sample or silently lose an old active sample.
+        """
+
+        normalized = tuple(str(event_type) for event_type in event_types if event_type)
+        if not normalized:
+            return []
+        placeholders = ",".join("?" for _ in normalized)
+        query = f"""SELECT * FROM mainnet_run_events
+            WHERE run_id = ? AND event_type IN ({placeholders})
+            ORDER BY event_time_ms DESC"""
+        values: tuple[Any, ...] = (run_id, *normalized)
+        if limit is not None:
+            query += " LIMIT ?"
+            values = (*values, max(0, int(limit)))
+        return await self._db.fetchall(query, values)
+
+    async def get_incomplete_v1465_w6a_profile_start_groups(
+        self,
+        *,
+        version: str,
+        expected_profile_count: int = 3,
+        limit: int = 500,
+    ) -> list[dict]:
+        """Return current W6A base starts missing one or more profile starts.
+
+        The base started event is the durable intent to create the paired
+        v1.4.65 profile group.  Profile starts are intentionally written as
+        separate immutable ledger rows, so a process/SQLite failure between
+        rows must remain discoverable after restart.
+        """
+
+        return await self._db.fetchall(
+            """SELECT base.*
+            FROM mainnet_run_events AS base
+            WHERE base.event_type = 'entry_codex_v1_shadow_sample_started'
+              AND json_extract(base.details_json, '$.version') = ?
+              AND COALESCE(
+                    json_extract(
+                        base.details_json,
+                        '$.v1465_profile_evidence'
+                    ),
+                    0
+                  ) <> 1
+              AND UPPER(
+                    COALESCE(
+                        json_extract(base.details_json, '$.lane_code'),
+                        json_extract(base.details_json, '$.effective_lane'),
+                        json_extract(base.details_json, '$.shadow_lane'),
+                        ''
+                    )
+                  ) = 'W6A'
+              AND (
+                    SELECT COUNT(DISTINCT COALESCE(
+                        json_extract(profile.details_json, '$.sample_id'),
+                        ''
+                    ))
+                    FROM mainnet_run_events AS profile
+                    WHERE profile.run_id = base.run_id
+                      AND profile.event_type =
+                          'entry_codex_v1_shadow_sample_started'
+                      AND json_extract(
+                            profile.details_json,
+                            '$.v1465_profile_evidence'
+                          ) = 1
+                      AND json_extract(
+                            profile.details_json,
+                            '$.v1465_opportunity_id'
+                          ) = json_extract(
+                            base.details_json,
+                            '$.v1462_opportunity_id'
+                          )
+                  ) < ?
+            ORDER BY base.id ASC
+            LIMIT ?""",
+            (
+                str(version),
+                max(1, int(expected_profile_count)),
+                max(1, int(limit)),
+            ),
+        )
+
+    async def get_unacked_v1465_w6a_profile_outcomes(
+        self,
+        *,
+        limit: int = 500,
+    ) -> list[dict]:
+        """Return profile outcomes lacking a durable projection/recompute ack."""
+
+        return await self._db.fetchall(
+            """SELECT terminal.*
+            FROM mainnet_run_events AS terminal
+            WHERE terminal.event_type = 'entry_codex_v1_shadow_outcome'
+              AND json_extract(
+                    terminal.details_json,
+                    '$.v1465_profile_evidence'
+                  ) = 1
+              AND LOWER(COALESCE(
+                    json_extract(terminal.details_json, '$.shadow_outcome'),
+                    ''
+                  )) IN (
+                    'tp1_first', 'tp_first', 'tp', 'sl_first', 'sl',
+                    'max_hold', 'no_fill', 'ambiguous_both'
+                  )
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM mainnet_run_events AS ack
+                    WHERE ack.run_id = terminal.run_id
+                      AND ack.event_type =
+                          'entry_codex_v1465_profile_evidence_projected'
+                      AND json_extract(
+                            ack.details_json,
+                            '$.sample_id'
+                          ) = json_extract(
+                            terminal.details_json,
+                            '$.sample_id'
+                          )
+                      AND json_extract(
+                            ack.details_json,
+                            '$.v1465_opportunity_id'
+                          ) = json_extract(
+                            terminal.details_json,
+                            '$.v1465_opportunity_id'
+                          )
+                      AND json_extract(
+                            ack.details_json,
+                            '$.v1465_profile_id'
+                          ) = json_extract(
+                            terminal.details_json,
+                            '$.v1465_profile_id'
+                          )
+                      AND json_extract(
+                            ack.details_json,
+                            '$.v1465_resolved_profile_hash'
+                          ) = json_extract(
+                            terminal.details_json,
+                            '$.v1465_resolved_profile_hash'
+                          )
+                  )
+            ORDER BY terminal.id ASC
+            LIMIT ?""",
+            (max(1, int(limit)),),
+        )
+
+    async def get_v1465_w6a_profile_events(
+        self,
+        run_id: str,
+        opportunity_id: str,
+        *,
+        limit: int = 50,
+    ) -> list[dict]:
+        """Read the small exact event group used by start reconciliation."""
+
+        return await self._db.fetchall(
+            """SELECT *
+            FROM mainnet_run_events
+            WHERE run_id = ?
+              AND event_type IN (
+                    'entry_codex_v1_shadow_sample_started',
+                    'entry_codex_v1_shadow_outcome',
+                    'entry_codex_v1_shadow_sample_dropped'
+                  )
+              AND COALESCE(
+                    json_extract(details_json, '$.v1465_opportunity_id'),
+                    ''
+                  ) = ?
+            ORDER BY id ASC
+            LIMIT ?""",
+            (
+                str(run_id),
+                str(opportunity_id),
+                max(1, int(limit)),
+            ),
+        )
+
+    async def get_terminal_runs_with_unresolved_v1463_shadow_samples(
+        self,
+    ) -> list[dict]:
+        """Return every terminal run with a started sample lacking a terminal."""
+
+        return await self._db.fetchall(
+            """WITH
+            watermark(value) AS (
+                SELECT COALESCE(
+                    (SELECT snapshot_max_event_id
+                     FROM v1463_lane_monitor_snapshot_meta
+                     WHERE singleton_id = 1),
+                    0
+                )
+            ),
+            starts AS (
+                SELECT
+                    run_id,
+                    COALESCE(
+                        json_extract(details_json, '$.sample_id'),
+                        ''
+                    ) AS sample_id
+                FROM mainnet_run_events
+                WHERE event_type = 'entry_codex_v1_shadow_sample_started'
+                  AND id > (SELECT value FROM watermark)
+            ),
+            terminals AS (
+                SELECT
+                    run_id,
+                    COALESCE(
+                        json_extract(details_json, '$.sample_id'),
+                        ''
+                    ) AS sample_id
+                FROM mainnet_run_events
+                WHERE event_type IN (
+                    'entry_codex_v1_shadow_outcome',
+                    'entry_codex_v1_shadow_sample_dropped'
+                )
+                  AND id > (SELECT value FROM watermark)
+            ),
+            unresolved_runs AS (
+                SELECT DISTINCT s.run_id
+                FROM starts AS s
+                LEFT JOIN terminals AS t
+                  ON t.run_id = s.run_id
+                 AND t.sample_id = s.sample_id
+                WHERE t.run_id IS NULL
+            )
+            SELECT r.*
+            FROM mainnet_runs AS r
+            JOIN unresolved_runs AS u ON u.run_id = r.run_id
+            WHERE r.status IN ('COMPLETED', 'ENTRY_EXPIRED', 'ENTRY_REJECTED',
+                               'FAILED', 'CANCELLED', 'EMERGENCY_CLOSED')
+            ORDER BY r.armed_at_ms ASC"""
+        )
+
+    async def get_unresolved_v1462_shadow_opportunity_events(self) -> list[dict]:
+        """Return durable opportunities without a linked sample or terminal."""
+
+        return await self._db.fetchall(
+            """SELECT o.*
+            FROM mainnet_run_events AS o
+            WHERE o.event_type = 'entry_codex_v1462_shadow_opportunity'
+              AND o.id > COALESCE(
+                (SELECT snapshot_max_event_id
+                 FROM v1463_lane_monitor_snapshot_meta
+                 WHERE singleton_id = 1),
+                0
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM mainnet_run_events AS linked
+                WHERE linked.run_id = o.run_id
+                  AND linked.id > o.id
+                  AND linked.event_type IN (
+                    'entry_codex_v1_shadow_sample_started',
+                    'entry_codex_v1_shadow_sample_dropped',
+                    'entry_codex_v1_shadow_outcome'
+                  )
+                  AND COALESCE(
+                    json_extract(linked.details_json, '$.v1462_opportunity_id'),
+                    json_extract(linked.details_json, '$.opportunity_id'),
+                    ''
+                  ) = COALESCE(
+                    json_extract(o.details_json, '$.v1462_opportunity_id'),
+                    json_extract(o.details_json, '$.opportunity_id'),
+                    ''
+                  )
+              )
+            ORDER BY o.event_time_ms ASC"""
+        )
+
+    async def get_terminal_runs_with_unresolved_v132_tp_policy_samples(
+        self,
+    ) -> list[dict]:
+        """Return terminal runs whose TP-policy batch lacks a commit/drop."""
+
+        return await self._db.fetchall(
+            """WITH
+            watermark(value) AS (
+                SELECT COALESCE(
+                    (SELECT snapshot_max_event_id
+                     FROM v1463_lane_monitor_snapshot_meta
+                     WHERE singleton_id = 1),
+                    0
+                )
+            ),
+            starts AS (
+                SELECT
+                    run_id,
+                    COALESCE(
+                        json_extract(details_json, '$.paired_sample_id'),
+                        ''
+                    ) AS paired_sample_id
+                FROM mainnet_run_events
+                WHERE event_type = 'entry_codex_v1_tp_policy_shadow_started'
+                  AND id > (SELECT value FROM watermark)
+            ),
+            terminals AS (
+                SELECT
+                    run_id,
+                    COALESCE(
+                        json_extract(details_json, '$.paired_sample_id'),
+                        ''
+                    ) AS paired_sample_id
+                FROM mainnet_run_events
+                WHERE event_type IN (
+                    'entry_codex_v1_tp_policy_shadow_outcome',
+                    'entry_codex_v1_tp_policy_shadow_dropped',
+                    'entry_codex_v1_tp_policy_shadow_terminal_committed'
+                )
+                  AND id > (SELECT value FROM watermark)
+            ),
+            unresolved_runs AS (
+                SELECT DISTINCT s.run_id
+                FROM starts AS s
+                LEFT JOIN terminals AS t
+                  ON t.run_id = s.run_id
+                 AND t.paired_sample_id = s.paired_sample_id
+                WHERE t.run_id IS NULL
+            )
+            SELECT r.*
+            FROM mainnet_runs AS r
+            JOIN unresolved_runs AS u ON u.run_id = r.run_id
+            WHERE r.status IN ('COMPLETED', 'ENTRY_EXPIRED', 'ENTRY_REJECTED',
+                               'FAILED', 'CANCELLED', 'EMERGENCY_CLOSED')
+            ORDER BY r.armed_at_ms ASC"""
+        )
+
     async def get_first_event_time(self, run_id: str, event_type: str) -> int | None:
         row = await self._db.fetchone(
             """SELECT MIN(event_time_ms) AS event_time_ms
@@ -574,6 +908,12 @@ class MainnetRunRepository:
         return await self._db.fetchall(
             f"SELECT * FROM mainnet_runs WHERE run_id IN ({placeholders})",
             tuple(run_ids),
+        )
+
+    async def get_recent_runs(self, limit: int = 200) -> list[dict]:
+        return await self._db.fetchall(
+            "SELECT * FROM mainnet_runs ORDER BY armed_at_ms DESC LIMIT ?",
+            (limit,),
         )
 
 

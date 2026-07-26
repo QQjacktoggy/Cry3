@@ -9,17 +9,401 @@ candles.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import isfinite
 from html import escape
 import json
 import re
 from typing import Any, Mapping, Sequence
 
+from src.gridbot.strategy.codex_v1427_tree import (
+    V1427_FDT_RNG90_BLOCK_BY_WINDOW,
+    V1427_FIVE_WINDOW_TREE,
+    V1427_FIVE_WINDOW_TREE_SOURCE,
+    V1427_OVERLAY_SOURCE,
+)
 
-CODEX_V1_VERSION = "_codex_v1.4.0"
+
+CODEX_V1_VERSION = "_codex_v1.4.69"
 CODEX_V1_BASELINE = "portfolio_union_21branch_w1s6short_cluster1129"
 BASE_NOTIONAL_USDC = 50.0
+V1421_DECISION_TREE_SOURCE = "reports/v1421_decision_tree_three_window_success.md"
+V1421_POLICY_TAG = "v1421_decision_tree_adaptive_exec"
+V1421_REQUIRED_FEATURES = (
+    "slope30",
+    "slope60",
+    "slope120",
+    "rng15",
+    "d30",
+    "adv3",
+    "rsi",
+    "vwap",
+    "range_pos",
+    "pullback",
+)
+V1421_LIVE_LANE_CODES = frozenset({"CNL-WPR-L", "STUP-S", "SFD-S"})
+V1421_ACTION_PROFILES: dict[str, dict[str, Any]] = {
+    "LONG_DEEP_TP4_SL6": {
+        "side": "LONG",
+        "entry_bp": 2.0,
+        "tp1_bp": 4.0,
+        "full_tp_bp": 8.0,
+        "sl_bp": 6.0,
+        "be_bp": 2.0,
+        "partial_exit_pct": 1.0,
+        "ttl_s": 180,
+        "profile_anchor": "long_deep_e2_tp4_full8_sl6_p100_ttl180",
+    },
+    "LONG_FALL_TP8_SL6": {
+        "side": "LONG",
+        "entry_bp": 4.0,
+        "tp1_bp": 8.0,
+        "full_tp_bp": 20.0,
+        "sl_bp": 6.0,
+        "be_bp": 4.0,
+        "partial_exit_pct": 0.5,
+        "ttl_s": 180,
+        "profile_anchor": "long_fall_e4_tp8_full20_sl6_p50_ttl180",
+    },
+    "LONG_OVERSOLD_E8_TP8": {
+        "side": "LONG",
+        "entry_bp": 8.0,
+        "tp1_bp": 8.0,
+        "full_tp_bp": 30.0,
+        "sl_bp": 6.0,
+        "be_bp": 2.0,
+        "partial_exit_pct": 0.5,
+        "ttl_s": 180,
+        "profile_anchor": "long_oversold_e8_tp8_full30_sl6_p50_ttl180",
+    },
+    "SHORT_FAST30_E2": {
+        "side": "SHORT",
+        "entry_bp": 2.0,
+        "tp1_bp": 30.0,
+        "full_tp_bp": 30.0,
+        "sl_bp": 8.0,
+        "be_bp": 0.0,
+        "partial_exit_pct": 1.0,
+        "ttl_s": 60,
+        "hold_s": 2100,
+        "profile_anchor": "short_fast_e2_tp30_full30_sl8_p100_ttl60",
+    },
+    "SHORT_RUNNER_E2": {
+        "side": "SHORT",
+        "entry_bp": 2.0,
+        "tp1_bp": 30.0,
+        "full_tp_bp": 100.0,
+        "sl_bp": 12.0,
+        "be_bp": 2.0,
+        "partial_exit_pct": 0.3,
+        "ttl_s": 60,
+        "hold_s": 2100,
+        "profile_anchor": "short_runner_e2_tp30_full100_sl12_p30_ttl60",
+    },
+    "SHORT_RUNNER_E6": {
+        "side": "SHORT",
+        "entry_bp": 6.0,
+        "tp1_bp": 30.0,
+        "full_tp_bp": 100.0,
+        "sl_bp": 12.0,
+        "be_bp": 2.0,
+        "partial_exit_pct": 0.3,
+        "ttl_s": 180,
+        "hold_s": 2100,
+        "profile_anchor": "short_runner_e6_tp30_full100_sl12_p30_ttl180",
+    },
+    "SHORT_WIDE_E8": {
+        "side": "SHORT",
+        "entry_bp": 8.0,
+        "tp1_bp": 60.0,
+        "full_tp_bp": 120.0,
+        "sl_bp": 15.0,
+        "be_bp": 2.0,
+        "partial_exit_pct": 0.2,
+        "ttl_s": 60,
+        "hold_s": 2100,
+        "profile_anchor": "short_wide_e8_tp60_full120_sl15_p20_ttl60",
+    },
+}
+V1423_DECISION_TREE_SOURCE = "reports/v1423_four_window_conservative_tree_target1p4_summary.md"
+V1423_POLICY_TAG = "v1423_four_window_conservative_tree_exec"
+V1424_STUPS_BASE_BLOCK_TAG = "v1424_stups_base_shadow_block"
+V1425_STUPS_WEAK_CHOP_DIRECT_LONG_BLOCK_TAG = "v1425_stups_weak_chop_direct_long_block"
+V1425_WPR_FALLING_TRAP_DIRECT_LONG_BLOCK_TAG = "v1425_wpr_falling_trap_direct_long_block"
+V1425_WPR_FALLING_TRAP_SHORT_SCALP_TAG = "v1425_wpr_falling_trap_short_scalp_exec"
+V1426_WPR_BASE_FALLBACK_BLOCK_TAG = "v1426_wpr_base_fallback_shadow_block"
+V1426_WPR_FALLING_TRAP_SHORT_SCALP_TAG = "v1426_wpr_falling_trap_short_scalp_exec"
+V1426_STUPS_WEAK_CHOP_SHORT_BLOCK_TAG = "v1426_stups_weak_chop_short_block"
+V1426_STUPS_MIXED_SHORT_BLOCK_TAG = "v1426_stups_mixed_short_block"
+V1423_PROJECTED_50_NET_USDC = 1.4849
+V1423_TARGET_50_NET_USDC = 1.4
+V1423_TARGET_WR = 0.75
+V1423_MAX_TP_BP = 20.0
+V1423_LIVE_LANE_CODES = V1421_LIVE_LANE_CODES
+V1423_REQUIRED_FEATURES = V1421_REQUIRED_FEATURES
+V1427_DECISION_TREE_SOURCE = V1427_FIVE_WINDOW_TREE_SOURCE
+V1427_POLICY_TAG = "v1427_five_window_tp14_adaptive_exec"
+V1427_BASE_PASSTHROUGH_TAG = "v1427_base_passthrough"
+V1427_TREE_BLOCK_TAG = "v1427_five_window_tree_block"
+V1427_W1D_BLOCK_TAG = "v1427_w1d_unvalidated_block"
+V1427_FDT_RNG90_BLOCK_TAG = "v1427_fdt_rng90_block"
+V1427_MISSING_FEATURE_BLOCK_TAG = "v1427_missing_features_block"
+V1428_LEGACY_STUPS_REOPEN_TAG = "v1428_legacy_stups_reopen_for_tree_profile"
+V1429_STUPS_STALE_SIDE_OVERRIDE_BLOCK_TAG = "v1429_stups_stale_side_override_block"
+V1429_STUPS_STALE_SIDE_OVERRIDE_STATES = frozenset({"STUP-S:mixed", "STUP-S:counter_recoil"})
+V1429_STUPS_STALE_SIDE_OVERRIDE_WAIT_S = 300.0
+V1433_STUPS_CLEAN_HIGH_OVERRIDE_BLOCK_TAG = "v1433_stups_clean_high_override_block"
+V1433_STUPS_CLEAN_HIGH_OVERRIDE_RANGE_POS_MIN = 0.95
+V1433_STUPS_CLEAN_HIGH_OVERRIDE_VWAP_MIN_BP = 50.0
+V1428_LEGACY_STUPS_REOPEN_REASONS = frozenset(
+    {
+        "v1420_stups_clean_extension_gate_block",
+        "v1420_stups_mixed_bad_block",
+        "v1420_stups_mixed_weakzone_block",
+        "v1420_stups_weak_chop_extreme_block",
+        "v143_stups_counter_recoil_shadow_only",
+        "v143_stups_hot_continuation_shadow_only",
+        "v143_stups_near_vwap_flat_shadow_only",
+    }
+)
+V1427_LIVE_LANE_CODES = V1421_LIVE_LANE_CODES
+V1427_REQUIRED_FEATURES = V1421_REQUIRED_FEATURES
+V1427_TARGET_50_NET_USDC = 1.0
+V1427_TARGET_WR = 0.82
+V1427_MAX_TP_BP = 14.0
+V1427_MIN_PROJECTED_50_NET_USDC = min(
+    float(row["projected_50_net"])
+    for row in V1427_FDT_RNG90_BLOCK_BY_WINDOW.values()
+)
+V1430_POLICY_TAG = "v1430_loss_prune_exec"
+V1430_BLOCK_TAG = "v1430_loss_prune_block"
+V1430_MISSING_FEATURE_BLOCK_TAG = "v1430_missing_features_block"
+V1436_FAST_RECLAIM_DOWNSLOPE_BLOCK_TAG = "v1436_fast_reclaim_downslope_block"
+V1449_CNL_WPR_FALLING_TRAP_QUALITY_BLOCK_TAG = "v1449_cnl_wpr_falling_trap_quality_block"
+V1449_CNL_WPR_FAST_RECLAIM_QUALITY_BLOCK_TAG = "v1449_cnl_wpr_fast_reclaim_quality_block"
+V1450_CNL_WPR_DEEP_LATE_CHASE_BLOCK_TAG = "v1450_cnl_wpr_deep_late_chase_block"
+V1451_STUPS_CLEAN_EXTENSION_SHADOW_REVIEW_BLOCK_TAG = "v1451_stups_clean_extension_shadow_review_block"
+V1452_STUPS_LATE_ADVERSE_REOPEN_BLOCK_TAG = "v1452_stups_late_adverse_reopen_block"
+V1453_STUPS_CLEAN_EXTENSION_REOPEN_REVIEW_BLOCK_TAG = "v1453_stups_clean_extension_reopen_review_block"
+V1455_STUPS_CLEAN_EXTENSION_TP14_BLOCK_TAG = "v1455_stups_clean_extension_tp14_block"
+V1455_ADAPTIVE_ROUTE_TAG = "v1455_adaptive_route"
+V1455_THIN_SCALP_ROUTE_TP_MAX_BP = 10.0
+V1455_BLOCKED_TP_MIN_BP = 14.0
+V1430_SOURCE = "reports/v1430_selective_hybrid_loss_prune_outcomefee.json"
+V1430_TARGETED_SPLIT_SOURCE = "reports/v1430_selective_hybrid_targeted_split_outcomefee.json"
+V1430_TOTAL_METRICS = {
+    "attempts": 268,
+    "filled": 130,
+    "fee_wr": 0.8846153846153846,
+    "fee_adjusted_net": 4.95528107,
+    "fee_adjusted_p50": 0.92449274,
+    "fee_losses": 15,
+}
+V1430_ACTION_PROFILES: dict[str, dict[str, Any]] = {
+    "pnlfirst__p__nf_e0_t180__trail_arm11_gb6_fl5_sl10": {
+        "entry_bp": 0.0,
+        "tp1_bp": 11.0,
+        "full_tp_bp": 11.0,
+        "sl_bp": 10.0,
+        "be_bp": 0.0,
+        "partial_exit_pct": 1.0,
+        "ttl_s": 180,
+        "hold_s": 30,
+        "trail_arm_bp": 11.0,
+        "trail_giveback_bp": 6.0,
+        "trail_floor_bp": 5.0,
+        "profile_anchor": "v1430_trail_arm11_gb6_fl5_sl10",
+    },
+    "g__nf_e0_t120__trail_arm11_gb5_fl4_sl8": {
+        "entry_bp": 0.0,
+        "tp1_bp": 11.0,
+        "full_tp_bp": 11.0,
+        "sl_bp": 8.0,
+        "be_bp": 0.0,
+        "partial_exit_pct": 1.0,
+        "ttl_s": 120,
+        "hold_s": 30,
+        "trail_arm_bp": 11.0,
+        "trail_giveback_bp": 5.0,
+        "trail_floor_bp": 4.0,
+        "profile_anchor": "v1430_trail_arm11_gb5_fl4_sl8",
+    },
+    "p__nf_e0_t120__trail_arm11_gb6_fl5_sl10": {
+        "entry_bp": 0.0,
+        "tp1_bp": 6.0,
+        "full_tp_bp": 11.0,
+        "sl_bp": 10.0,
+        "be_bp": 0.0,
+        "partial_exit_pct": 0.70,
+        "ttl_s": 120,
+        "hold_s": 30,
+        "trail_arm_bp": 6.0,
+        "trail_giveback_bp": 3.0,
+        "trail_floor_bp": 5.0,
+        "tp_execution_note": "TP1_70_RUNNER_TRAIL_ONLY",
+        "profile_anchor": "v1435_tp1_70_runner_trail_only_tp1_floor",
+    },
+    "p__nf_e1_t120__trail_arm8_gb4_fl3_sl6": {
+        "entry_bp": 1.0,
+        "tp1_bp": 8.0,
+        "full_tp_bp": 8.0,
+        "sl_bp": 6.0,
+        "be_bp": 0.0,
+        "partial_exit_pct": 1.0,
+        "ttl_s": 120,
+        "hold_s": 30,
+        "trail_arm_bp": 8.0,
+        "trail_giveback_bp": 4.0,
+        "trail_floor_bp": 3.0,
+        "profile_anchor": "v1430_trail_arm8_gb4_fl3_sl6",
+    },
+}
+V1430_RULES: dict[str, dict[str, Any]] = {
+    "CNL-WPR-L|CNL-WPR-L:discount_mixed|LONG": {
+        "action_id": "v1432_live_block_discount_mixed_long",
+        "baseline_action": "pnlfirst__p__nf_e0_t180__trail_arm11_gb6_fl5_sl10",
+        "block_all": True,
+        "live_hotfix": "v1432_block_after_2x_live_max_hold_loss",
+        "counts": {"BLOCK": 40},
+        "summary": {"attempts": 40, "filled": 0, "fee_wr": None, "fee_adjusted_net": 0.0},
+    },
+    "CNL-WPR-L|CNL-WPR-L:falling_discount_trap|LONG": {
+        "action_id": "loss_prune__vwaplem23p818283__keep_match",
+        "baseline_action": "split__rsile37p129257__Lpnl__Rwr",
+        "loss_condition": {"feature": "vwap", "op": "<=", "threshold": -23.818283},
+        "keep_when": "match",
+        "split": {
+            "condition": {"feature": "rsi", "op": "<=", "threshold": 37.129257},
+            "match_action": "g__nf_e0_t120__trail_arm11_gb5_fl4_sl8",
+            "not_match_action": "block_all",
+        },
+        "counts": {"BLOCK": 42, "SL": 1, "TRAIL": 10},
+        "summary": {"attempts": 53, "filled": 11, "fee_wr": 0.9090909090909091, "fee_adjusted_net": 0.61608026},
+    },
+    "CNL-WPR-L|CNL-WPR-L:deep_discount_stable|SHORT": {
+        "action_id": "v1433_block_live_deep_discount_short",
+        "baseline_action": "v1427_base_passthrough",
+        "block_all": True,
+        "live_hotfix": "v1433_block_after_live_short_sl_in_deep_discount_stable",
+        "counts": {"BLOCK": 1},
+        "summary": {"attempts": 1, "filled": 0, "fee_wr": None, "fee_adjusted_net": 0.0},
+    },
+    "STUP-S|STUP-S:mixed|LONG": {
+        "action_id": "block_all",
+        "baseline_action": "fixed_pnlfirst__p__nf_none__fixed_tp10_sl6_h20",
+        "block_all": True,
+        "counts": {"BLOCK": 3},
+        "summary": {"attempts": 3, "filled": 0, "fee_wr": None, "fee_adjusted_net": 0.0},
+    },
+    "STUP-S|STUP-S:mixed|SHORT": {
+        "action_id": "loss_prune__pullbackle14p572457__block_match",
+        "baseline_action": "split__adv3le7p877217__Lpnl__Rwr",
+        "loss_condition": {"feature": "pullback", "op": "<=", "threshold": 14.572457},
+        "keep_when": "not_match",
+        "split": {
+            "condition": {"feature": "adv3", "op": "<=", "threshold": 7.877217},
+            "match_action": "p__nf_e0_t120__trail_arm11_gb6_fl5_sl10",
+            "not_match_action": "block_all",
+        },
+        "counts": {"BLOCK": 21, "NO_FILL": 1, "SL": 2, "TRAIL": 9},
+        "summary": {"attempts": 33, "filled": 11, "fee_wr": 0.8181818181818182, "fee_adjusted_net": 0.58772948},
+    },
+    "STUP-S|STUP-S:weak_chop|SHORT": {
+        "action_id": "v1433_live_block_weak_chop_short",
+        "baseline_action": "split__adv3ge5p575973__Lwr__Rpnl",
+        "block_all": True,
+        "live_hotfix": "v1433_block_after_live_max_hold_loss_and_low_fill",
+        "counts": {"BLOCK": 21},
+        "summary": {"attempts": 21, "filled": 0, "fee_wr": None, "fee_adjusted_net": 0.0},
+    },
+    "W1D|W1D:mixed|LONG": {
+        "action_id": "block_all",
+        "baseline_action": "fixed_pnlfirst__p__nf_none__runner_tp6_q50_run11_fl5_sl8",
+        "block_all": True,
+        "counts": {"BLOCK": 4},
+        "summary": {"attempts": 4, "filled": 0, "fee_wr": None, "fee_adjusted_net": 0.0},
+    },
+}
+V1423_CONSERVATIVE_TREE: tuple[Any, Any, Any] = (
+    ("state_eq", "CNL-WPR-L:deep_discount_stable"),
+    (
+        ("adv3", -2.5958),
+        (
+            ("slope60", -4.6678),
+            "L_E2_TP4_SL4_T45",
+            (
+                ("rng15", 26.0143),
+                (
+                    ("slope120", 2.2255),
+                    "S_E4_TP10_SL10_T45",
+                    (("slope30", 2.2357), "L_E0_TP4_SL4_T60", "S_E4_TP20_SL8_T45"),
+                ),
+                (
+                    ("rsi", 53.3715),
+                    (("slope30", -0.2515), "L_E0_TP8_SL6_T45", "L_E0_TP15_SL8_T120"),
+                    "S_E4_TP5_SL6_T45",
+                ),
+            ),
+        ),
+        (
+            ("slope60", 1.8632),
+            (
+                ("slope120", -1.665),
+                (("rsi", 46.2201), "L_E0_TP20_SL4_T45", "L_E4_TP20_SL6_T120"),
+                "BASE",
+            ),
+            (("slope120", 2.2255), "L_E2_TP4_SL4_T60", "L_E4_TP20_SL6_T90"),
+        ),
+    ),
+    (
+        ("d30", 24.7563),
+        (
+            ("pullback", 16.2208),
+            (
+                ("adv3", -8.6025),
+                "BASE",
+                (
+                    ("slope30", -1.3823),
+                    (("slope60", 0.8231), "S_E2_TP20_SL4_T45", "L_E2_TP12_SL8_T45"),
+                    (("vwap", -35.1889), "S_E0_TP20_SL4_T45", "L_E0_TP8_SL8_T120"),
+                ),
+            ),
+            (
+                ("adv3", 0.5118),
+                (
+                    ("d30", -54.4452),
+                    (("range_pos", 0.2815), "L_E2_TP20_SL10_T90", "S_E4_TP20_SL6_T45"),
+                    (("vwap", -21.4824), "L_E4_TP20_SL10_T60", "L_E0_TP12_SL10_T45"),
+                ),
+                (
+                    ("vwap", -21.4824),
+                    (("vwap", -35.1889), "L_E2_TP6_SL10_T90", "S_E4_TP4_SL4_T45"),
+                    (("rng15", 59.7921), "BASE", "S_E0_TP20_SL6_T45"),
+                ),
+            ),
+        ),
+        (
+            ("range_pos", 0.5566),
+            (
+                ("slope30", 3.5636),
+                (("state_eq", "STUP-S:mixed"), "S_E0_TP20_SL4_T45", "S_E0_TP15_SL4_T45"),
+                "BASE",
+            ),
+            (
+                ("state_eq", "STUP-S:clean_extension"),
+                (("rng15", 26.0143), "S_E0_TP20_SL4_T45", "L_E4_TP6_SL10_T90"),
+                (("state_eq", "STUP-S:mixed"), "L_E4_TP20_SL4_T60", "L_E0_TP20_SL4_T45"),
+            ),
+        ),
+    ),
+)
+V1423_ACTION_RE = re.compile(
+    r"^(?P<side>[LS])_E(?P<entry>\d+(?:\.\d+)?)_TP(?P<tp>\d+(?:\.\d+)?)_SL(?P<sl>\d+(?:\.\d+)?)_T(?P<ttl>\d+)$"
+)
+V1427_ACTION_RE = re.compile(
+    r"^(?P<side>[LS])_E(?P<entry>\d+(?:\.\d+)?)_TP(?P<tp>\d+(?:\.\d+)?)_SL(?P<sl>\d+(?:\.\d+)?)_T(?P<ttl>\d+)"
+    r"(?:_LOCK(?P<lock_s>\d+)_(?P<lock_min>\d+(?:\.\d+)?)_(?P<lock_slope>-?\d+(?:\.\d+)?))?$"
+)
 STALE_UPMOVE_CANARY_LANE = "codex_v1_stale_upmove_short_rng20_canary"
 STALE_UPMOVE_CANARY_LANE_CODE = "STUP-S"
 STALE_UPMOVE_CANARY_POLICY_TAG = "v1312_stale_upmove_guarded_canary"
@@ -30,9 +414,164 @@ STALE_UPMOVE_CANARY_D30_MAX_BP = 80.0
 STALE_UPMOVE_CANARY_NOTIONAL_USDC = 50.0
 STALE_UPMOVE_SL19_SHADOW_TAG = "v1315_stups_sl19_shadow_only"
 STALE_UPMOVE_SL19_SHADOW_BP = 19.0
-STALE_UPMOVE_LOW_RNG_WEAK_ADV_SHADOW_TAG = "v1315_stups_low_rng_weak_adv_shadow_only"
+STALE_UPMOVE_LOW_RNG_WEAK_ADV_LIVE_TAG = "v1417_stups_low_rng_weak_adv_cautious_live"
 STALE_UPMOVE_LOW_RNG_MAX_BP = 30.0
 STALE_UPMOVE_WEAK_ADV3_MAX_BP = 3.0
+STALE_UPMOVE_LOW_RNG_WEAK_ADV_ENTRY_BP = 2.0
+STALE_UPMOVE_HOT_CLEAN_ENTRY_TAG = "v1418_stups_clean_extension_hot_entry_band"
+STALE_UPMOVE_HOT_CLEAN_ENTRY_BP = 6.0
+STALE_UPMOVE_HOT_CLEAN_TTL_S = 75
+STALE_UPMOVE_HOT_CLEAN_RSI_MIN = 62.0
+STALE_UPMOVE_HOT_CLEAN_VWAP_MIN_BP = 8.0
+STALE_UPMOVE_HOT_CLEAN_PULLBACK_MIN_BP = 30.0
+STALE_UPMOVE_HOT_CLEAN_RANGE_POS_MIN = 0.90
+STALE_UPMOVE_HOT_CLEAN_ADV3_MIN_BP = 10.0
+STALE_UPMOVE_HOT_CLEAN_D30_MIN_BP = 30.0
+STRONG_FALL_FOLLOW_LANE = "codex_v1_strong_fall_follow_short_canary"
+STRONG_FALL_FOLLOW_LANE_CODE = "SFD-S"
+STRONG_FALL_FOLLOW_POLICY_TAG = "v1414_strong_fall_follow_exec"
+STRONG_FALL_FOLLOW_NOTIONAL_USDC = 50.0
+STRONG_FALL_FOLLOW_PROFILE: dict[str, Any] = {
+    "entry_bp": 2.0,
+    "tp1_bp": 6.0,
+    "full_tp_bp": 8.0,
+    "sl_bp": 10.0,
+    "be_bp": 2.0,
+    "partial_exit_pct": 0.40,
+    "ttl_s": 90,
+    "profit_lock_mfe_bp": 6.0,
+    "profit_lock_floor_bp": 6.0,
+    "profit_lock_giveback_bp": 2.0,
+    "small_n_forward_watch": True,
+}
+V143_PROFILE_SOURCE = "reports/v1420_profile_explorer_2026-06-28_29.md"
+STUPS_V143_PROFILE_POLICY_TAG = "v1420_stups_fixed_regime_exec"
+STUPS_V1420_CLEAN_GATE_BLOCK_REASON = "v1420_stups_clean_extension_gate_block"
+STUPS_V1420_MIXED_BAD_BLOCK_REASON = "v1420_stups_mixed_bad_block"
+STUPS_V1420_MIXED_WEAKZONE_BLOCK_REASON = "v1420_stups_mixed_weakzone_block"
+STUPS_V1420_WEAK_CHOP_EXTREME_BLOCK_REASON = "v1420_stups_weak_chop_extreme_block"
+STUPS_V143_PROFILES: dict[str, dict[str, Any]] = {
+    "STUP-S:clean_extension": {
+        "entry_bp": 2.0,
+        "tp1_bp": 6.0,
+        "full_tp_bp": 80.0,
+        "sl_bp": 8.0,
+        "be_bp": 2.0,
+        "partial_exit_pct": 0.70,
+        "ttl_s": 60,
+        "replay_n": 2,
+        "replay_wr": 1.0,
+        "replay_net_usdc": 0.159,
+        "adaptive_tp_engine": "v1420_stups_runner_after_clean_gate",
+        "live_observation": "v1420_clean_gate_runner_cross_day",
+        "no_fill_recovery_tp": 0,
+        "no_fill_recovery_loss": 0,
+        "no_fill_recovery_still_no_fill": 1,
+    },
+    "STUP-S:mixed": {
+        "entry_bp": 2.0,
+        "tp1_bp": 6.0,
+        "full_tp_bp": 80.0,
+        "sl_bp": 8.0,
+        "be_bp": 2.0,
+        "partial_exit_pct": 0.70,
+        "ttl_s": 60,
+        "replay_n": 7,
+        "replay_wr": 1.0,
+        "replay_net_usdc": 0.32756,
+        "adaptive_tp_engine": "v1420_stups_runner_after_bad_weakzone_block",
+        "live_observation": "v1420_mixed_bad_weakzone_block_runner",
+        "no_fill_recovery_tp": 4,
+        "no_fill_recovery_loss": 1,
+        "no_fill_recovery_still_no_fill": 3,
+    },
+    "STUP-S:weak_chop": {
+        "entry_bp": 0.0,
+        "tp1_bp": 5.0,
+        "full_tp_bp": 12.0,
+        "sl_bp": 10.0,
+        "be_bp": 4.0,
+        "partial_exit_pct": 0.60,
+        "ttl_s": 90,
+        "replay_n": 7,
+        "replay_wr": 1.0,
+        "replay_net_usdc": 0.30000000,
+        "adaptive_tp_engine": "v1416_stups_tp1_runner",
+        "live_observation": "weak_chop_mfe5p5_missed_tp12",
+        "no_fill_recovery_tp": 0,
+        "no_fill_recovery_loss": 0,
+        "no_fill_recovery_still_no_fill": 2,
+    },
+    "STUP-S:no_momentum_edge": {
+        "entry_bp": 1.0,
+        "tp1_bp": 8.0,
+        "sl_bp": 15.0,
+        "be_bp": 0.0,
+        "partial_exit_pct": 1.0,
+        "ttl_s": 90,
+        "replay_n": 2,
+        "replay_wr": 1.0,
+        "replay_net_usdc": 0.08000000,
+        "small_n_forward_watch": True,
+        "no_fill_recovery_tp": 0,
+        "no_fill_recovery_loss": 0,
+        "no_fill_recovery_still_no_fill": 0,
+    },
+    "STUP-S:hot_continuation": {
+        "entry_bp": 0.0,
+        "tp1_bp": 4.0,
+        "sl_bp": 4.0,
+        "be_bp": 0.0,
+        "partial_exit_pct": 0.40,
+        "ttl_s": 45,
+        "replay_n": 0,
+        "replay_wr": None,
+        "replay_net_usdc": 0.0,
+        "shadow_only": True,
+        "small_n_forward_watch": True,
+        "no_fill_recovery_tp": 0,
+        "no_fill_recovery_loss": 0,
+        "no_fill_recovery_still_no_fill": 0,
+    },
+    "STUP-S:stale_squeeze_top": {
+        "entry_bp": 0.0,
+        "tp1_bp": 4.0,
+        "sl_bp": 4.0,
+        "be_bp": 0.0,
+        "partial_exit_pct": 0.40,
+        "ttl_s": 45,
+        "replay_n": 2,
+        "replay_wr": None,
+        "replay_net_usdc": 0.0,
+        "shadow_only": True,
+        "no_fill_recovery_tp": 0,
+        "no_fill_recovery_loss": 0,
+        "no_fill_recovery_still_no_fill": 2,
+    },
+}
+STUPS_V143_SHADOW_STATES = {
+    "STUP-S:counter_recoil",
+    "STUP-S:hot_continuation",
+    "STUP-S:near_vwap_flat",
+    "STUP-S:stale_squeeze_top",
+    "STUP-S:missing_features",
+}
+S1P_L_V149_PROFILE_POLICY_TAG = "v149_s1pl_tiny_profile_fix"
+S1P_L_V149_NOTIONAL_USDC = 25.0
+S1P_L_V149_MARKET_STATE = "S1P-L:ordinary_pullback_pre_vwap"
+S1P_L_V149_PROFILE_SOURCE = "reports/v141_aggtick_optimization_2026-06-27.md"
+S1P_L_V149_PROFILE: dict[str, Any] = {
+    "entry_bp": 0.0,
+    "tp1_bp": 6.0,
+    "partial_exit_pct": 1.0,
+    "sl_bp": 15.0,
+    "be_bp": 0.0,
+    "ttl_s": 180,
+    "replay_n": 3,
+    "replay_wr": 1.0,
+    "replay_net_usdc": 0.072,
+    "small_n_forward_watch": True,
+}
 SUPPORTED_SYMBOLS = ("ETHUSDC",)
 
 
@@ -63,9 +602,17 @@ _FEATURE_ALIASES: dict[str, tuple[str, ...]] = {
     "range_pos_5": ("range_pos_5", "range_pos5"),
     "range_pos_15": ("range_pos_15", "range_pos15"),
     "range_pos_30": ("range_pos_30", "range_pos30"),
+    "slope30": ("slope30", "slope30_bp", "price_slope30_bp", "slope_30_bp"),
+    "slope60": ("slope60", "slope60_bp", "price_slope60_bp", "slope_60_bp"),
+    "slope120": ("slope120", "slope120_bp", "price_slope120_bp", "slope_120_bp"),
     "close_pos": ("close_pos", "close_pos_bar"),
     "reprice_favorable_bp": ("reprice_favorable_bp", "favorable_bp"),
     "reprice_adverse_bp": ("reprice_adverse_bp", "adverse_bp"),
+    "reprice_wait_elapsed_seconds": (
+        "reprice_wait_elapsed_seconds",
+        "setup_age_sec",
+        "reprice_wait_s",
+    ),
     "gap1bp": ("gap1bp", "gap1bp_bp", "one_bp_gap"),
 }
 
@@ -114,6 +661,18 @@ class LaneSpec:
     @property
     def lane_code(self) -> str:
         return lane_code_from_name(self.name, side=self.side) or self.name
+
+
+@dataclass(frozen=True)
+class CodexV1LaneMatch:
+    """A predicate-only base-lane match with no paid-routing authority."""
+
+    lane: str
+    lane_code: str
+    side: str
+    strategy: str
+    regime: str | None = None
+    annotations: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -547,6 +1106,14 @@ def select_codex_v1_lane(features: Mapping[str, Any]) -> CodexV1Decision:
             regime="mid_up_extension",
             risk_tags=get_short_risk_tags(features),
         )
+
+    strong_fall_follow = build_strong_fall_follow_short_decision(
+        features,
+        strategy=strategy,
+        side=side,
+    )
+    if strong_fall_follow is not None:
+        return strong_fall_follow
 
     s1p_l_lane = _s1p_l_lane()
     for lane in LANES:
@@ -1032,6 +1599,118 @@ def _lane_matches(lane: LaneSpec, features: Mapping[str, Any]) -> tuple[bool, se
     return True, missing
 
 
+def match_all_codex_v1_lanes(
+    features: Mapping[str, Any],
+    *,
+    lanes: Sequence[LaneSpec] | None = None,
+) -> tuple[CodexV1LaneMatch, ...]:
+    """Return every independently discoverable lane without paid authority.
+
+    The supplied registry controls output order only.  Each lane predicate is
+    evaluated independently, so reordering the registry cannot change the
+    returned match set.  Selector-local positive STUP-S and SFD-S builders are
+    also evaluated, but stale/mid-extension vetoes alone are never lane matches.
+
+    CNL-WPR-L is intentionally not inferred here: its current positive routing
+    is stateful in ``one_run`` and cannot be established from this feature
+    mapping alone without guessing.
+    """
+
+    symbol = _string_feature(features, "symbol")
+    if symbol and symbol not in SUPPORTED_SYMBOLS:
+        return ()
+
+    strategy = _string_feature(features, "strategy")
+    if strategy is None:
+        return ()
+
+    registry = LANES if lanes is None else tuple(lanes)
+    matches: list[CodexV1LaneMatch] = []
+    seen: set[tuple[str, str]] = set()
+    for lane in registry:
+        matched, _missing = _lane_matches(lane, features)
+        if not matched:
+            continue
+
+        identity = (lane.lane_code, lane.side)
+        if identity in seen:
+            continue
+        seen.add(identity)
+
+        regime: str | None = None
+        annotations = [f"deny_rule_passed:{rule.name}" for rule in lane.deny_rules]
+        if lane.name == "codex_v1_hot_up_extension_pullback_long":
+            regime = "hot_up_extension"
+            annotations.append("paid_selector_special_branch:hot_up_extension")
+        elif lane.name == "codex_v1_s1_bbrsi_ordinary_pullback_long_pre_vwap":
+            regime = "S1P-L:ordinary_pullback_pre_vwap"
+            annotations.append("paid_selector_special_branch:s1p_l")
+
+        matches.append(
+            CodexV1LaneMatch(
+                lane=lane.name,
+                lane_code=lane.lane_code,
+                side=lane.side,
+                strategy=strategy,
+                regime=regime,
+                annotations=tuple(annotations),
+            )
+        )
+
+    def append_special(
+        decision: CodexV1Decision | None,
+        *,
+        builder_name: str,
+    ) -> None:
+        if (
+            decision is None
+            or not decision.lane
+            or not decision.lane_code
+            or not decision.side
+            or not decision.strategy
+        ):
+            return
+        identity = (decision.lane_code, decision.side)
+        if identity in seen:
+            return
+        seen.add(identity)
+        matches.append(
+            CodexV1LaneMatch(
+                lane=decision.lane,
+                lane_code=decision.lane_code,
+                side=decision.side,
+                strategy=decision.strategy,
+                regime=decision.regime,
+                annotations=(
+                    f"positive_special_builder:{builder_name}",
+                    f"special_builder_outcome:{'accepted' if decision.accepted else 'shadow'}",
+                ),
+            )
+        )
+
+    # The stale predicate is only a branch guard.  It becomes a discovery match
+    # only when the pure positive builder assigns the STUP-S family.
+    if is_stale_short_after_upmove(features):
+        append_special(
+            build_stale_upmove_canary_decision(
+                features,
+                strategy=strategy,
+                side=_string_feature(features, "side"),
+            ),
+            builder_name="build_stale_upmove_canary_decision",
+        )
+
+    append_special(
+        build_strong_fall_follow_short_decision(
+            features,
+            strategy=strategy,
+            side=_string_feature(features, "side"),
+        ),
+        builder_name="build_strong_fall_follow_short_decision",
+    )
+    return tuple(matches)
+
+
 def _candidate_lanes_for_features(features: Mapping[str, Any]) -> tuple[LaneSpec, ...]:
     strategy = _string_feature(features, "strategy")
     side = _string_feature(features, "side")
@@ -1127,6 +1806,1799 @@ def _feature_value(features: Mapping[str, Any], feature: str) -> float | None:
                 return value
     return None
 
+
+def _v1421_feature_value(features: Mapping[str, Any], feature: str) -> float | None:
+    if feature == "vwap":
+        return _feature_value(features, "vwap_dist_bp")
+    if feature == "range_pos":
+        return _feature_value(features, "range_pos_15")
+    if feature == "pullback":
+        return _feature_value(features, "pullback_from_recent_high_bp")
+    return _feature_value(features, feature)
+
+
+def _v1421_market_state(features: Mapping[str, Any], decision: CodexV1Decision) -> str:
+    metrics = decision.metrics if isinstance(decision.metrics, Mapping) else {}
+    state = (
+        metrics.get("market_state")
+        or metrics.get("v143_market_state")
+        or metrics.get("wpr_profile")
+        or decision.regime
+    )
+    if state:
+        return str(state)
+    lane_code = str(decision.lane_code or "").upper()
+    if lane_code == STALE_UPMOVE_CANARY_LANE_CODE:
+        return _stups_v143_market_state(features)
+    return lane_code or "UNKNOWN"
+
+
+def _v1421_feature_row(features: Mapping[str, Any], decision: CodexV1Decision) -> dict[str, Any]:
+    row = {key: _v1421_feature_value(features, key) for key in V1421_REQUIRED_FEATURES}
+    row["state"] = _v1421_market_state(features, decision)
+    return row
+
+
+def _v1421_le(row: Mapping[str, Any], key: str, threshold: float) -> bool:
+    value = row.get(key)
+    return value is not None and float(value) <= threshold
+
+
+def _v1421_predict_action(row: Mapping[str, Any]) -> str:
+    state = str(row.get("state") or "")
+    if _v1421_le(row, "slope60", 3.1212):
+        if _v1421_le(row, "slope30", -4.0823):
+            if _v1421_le(row, "vwap", -13.2579):
+                if _v1421_le(row, "d30", 14.8377):
+                    if _v1421_le(row, "pullback", 9.4382):
+                        return "SHORT_RUNNER_E2"
+                    if _v1421_le(row, "adv3", 10.7038):
+                        return "SHORT_FAST30_E2"
+                    return "LONG_FALL_TP8_SL6"
+                return "LONG_DEEP_TP4_SL6"
+            if _v1421_le(row, "range_pos", 0.5605):
+                if _v1421_le(row, "slope120", -0.8691):
+                    if _v1421_le(row, "slope120", -10.5179):
+                        return "LONG_OVERSOLD_E8_TP8"
+                    return "SHORT_FAST30_E2"
+                return "BASE"
+            if state == "STUP-S:mixed":
+                return "BASE"
+            return "LONG_DEEP_TP4_SL6"
+        if _v1421_le(row, "range_pos", 0.6489):
+            if _v1421_le(row, "rng15", 29.9224):
+                if _v1421_le(row, "slope120", -3.6124):
+                    return "BASE"
+                if _v1421_le(row, "slope30", 2.2292):
+                    return "SHORT_RUNNER_E6"
+                return "BASE"
+            if _v1421_le(row, "range_pos", 0.4924):
+                return "BASE"
+            if _v1421_le(row, "slope120", 2.3419):
+                return "SHORT_FAST30_E2"
+            return "SHORT_WIDE_E8"
+        if state == "STUP-S:mixed":
+            return "SHORT_RUNNER_E2"
+        if _v1421_le(row, "d30", -28.3865):
+            return "SHORT_FAST30_E2"
+        if _v1421_le(row, "rng15", 26.6487):
+            return "SHORT_WIDE_E8"
+        return "BASE"
+
+    if _v1421_le(row, "rng15", 33.5211):
+        if _v1421_le(row, "range_pos", 0.5605):
+            if state == "STUP-S:mixed":
+                return "SHORT_RUNNER_E6"
+            if _v1421_le(row, "slope120", 4.1008):
+                return "SHORT_RUNNER_E6"
+            return "BASE"
+        if _v1421_le(row, "pullback", 24.1866):
+            if state == "CNL-WPR-L:deep_discount_stable":
+                if _v1421_le(row, "vwap", -36.4502):
+                    return "LONG_DEEP_TP4_SL6"
+                return "SHORT_RUNNER_E2"
+            if _v1421_le(row, "slope30", -1.3714):
+                return "BASE"
+            return "SHORT_RUNNER_E2"
+        if _v1421_le(row, "slope30", -1.3714):
+            return "LONG_DEEP_TP4_SL6"
+        return "SHORT_WIDE_E8"
+
+    if state == "STUP-S:weak_chop":
+        if _v1421_le(row, "range_pos", 0.5605):
+            return "BASE"
+        return "SHORT_RUNNER_E6"
+    if state == "CNL-WPR-L:deep_discount_stable":
+        return "BASE"
+    if _v1421_le(row, "d30", -28.3865):
+        if _v1421_le(row, "slope30", 2.2292):
+            return "BASE"
+        return "LONG_FALL_TP8_SL6"
+    if _v1421_le(row, "rsi", 49.1795):
+        return "BASE"
+    return "SHORT_WIDE_E8"
+
+
+def apply_v1421_adaptive_decision(
+    features: Mapping[str, Any],
+    decision: CodexV1Decision,
+) -> CodexV1Decision:
+    if not decision.accepted:
+        return decision
+    lane_code = str(decision.lane_code or "").upper()
+    lane = str(decision.lane or "")
+    if lane_code not in V1421_LIVE_LANE_CODES:
+        return decision
+    if lane_code == "W6A" or lane == "w6_lane_s1long_rng38_86_range9_15_e0":
+        return decision
+    metrics = decision.metrics if isinstance(decision.metrics, Mapping) else {}
+    if metrics.get("v1421_action"):
+        return decision
+
+    row = _v1421_feature_row(features, decision)
+    missing = tuple(key for key in V1421_REQUIRED_FEATURES if row.get(key) is None)
+    if missing:
+        return decision
+
+    action = _v1421_predict_action(row)
+    base_metrics = dict(metrics)
+    previous_policy_tag = decision.policy_tag or base_metrics.get("policy_tag") or base_metrics.get("policy_note")
+    feature_snapshot = {
+        key: round(float(row[key]), 4)
+        for key in V1421_REQUIRED_FEATURES
+        if row.get(key) is not None
+    }
+    base_metrics.update(
+        {
+            "v1421_action": action,
+            "v1421_state": row.get("state"),
+            "v1421_policy_tag": V1421_POLICY_TAG,
+            "v1421_policy_source": V1421_DECISION_TREE_SOURCE,
+            "v1421_previous_policy_tag": previous_policy_tag,
+            "v1421_previous_side": decision.side,
+            "v1421_features": feature_snapshot,
+            "v1421_slope_source": features.get("v1421_slope_source") or features.get("slope_source"),
+        }
+    )
+    if action == "BASE":
+        return replace(decision, metrics=base_metrics)
+    if action == "BLOCK":
+        return replace(
+            decision,
+            accepted=False,
+            reason="v1421_decision_tree_block",
+            size_mult=0.0,
+            notional_mult=0.0,
+            requested_notional_usdc=0.0,
+            risk_tags=tuple(dict.fromkeys((*decision.risk_tags, "v1421_decision_tree_block"))),
+            metrics={**base_metrics, "policy_note": "v1421_decision_tree_block", "policy_tag": "v1421_decision_tree_block"},
+            policy_tag="v1421_decision_tree_block",
+            shadow_lane="SH_V1421_TREE_BLOCK",
+        )
+
+    profile = V1421_ACTION_PROFILES.get(action)
+    if profile is None:
+        return replace(decision, metrics=base_metrics)
+
+    target_side = str(profile["side"]).upper()
+    action_tag = f"v1421_action_{action.lower()}"
+    side_override_tag = f"v1421_side_override_{target_side.lower()}" if target_side != str(decision.side or "").upper() else None
+    profile_metrics = {
+        **base_metrics,
+        "policy_note": V1421_POLICY_TAG,
+        "policy_tag": V1421_POLICY_TAG,
+        "live_action": "live_decision_tree_adaptive_profile",
+        "source": "v1421_decision_tree_three_window_search",
+        "profile_source": V1421_DECISION_TREE_SOURCE,
+        "market_state": row.get("state"),
+        "v143_market_state": row.get("state"),
+        "adaptive_tp_engine": "v1421_decision_tree_adaptive_runner",
+        "entry_bp": float(profile["entry_bp"]),
+        "tp1_bp": float(profile["tp1_bp"]),
+        "full_tp_bp": float(profile["full_tp_bp"]),
+        "sl_bp": float(profile["sl_bp"]),
+        "be_bp": float(profile["be_bp"]),
+        "partial_exit_pct": float(profile["partial_exit_pct"]),
+        "ttl_s": int(profile["ttl_s"]),
+        "hold_s": int(profile.get("hold_s", 0) or 0) or None,
+        "profile_anchor": profile.get("profile_anchor"),
+        "profile_patch": V1421_POLICY_TAG,
+        "target_side": target_side,
+        "applied_notional_cap_usdc": decision.requested_notional_usdc,
+    }
+    risk_tags = tuple(
+        dict.fromkeys(
+            tag
+            for tag in (
+                *decision.risk_tags,
+                "v1421_decision_tree_adaptive",
+                action_tag,
+                side_override_tag,
+                f"entry{float(profile['entry_bp']):g}",
+                f"tp{float(profile['tp1_bp']):g}",
+                f"fulltp{float(profile['full_tp_bp']):g}",
+                f"sl{float(profile['sl_bp']):g}",
+                f"be{float(profile['be_bp']):g}",
+                f"ttl{int(profile['ttl_s'])}s",
+            )
+            if tag
+        )
+    )
+    return replace(
+        decision,
+        side=target_side,
+        entry_offset_bp=float(profile["entry_bp"]),
+        reason=V1421_POLICY_TAG,
+        regime=str(row.get("state") or decision.regime or ""),
+        risk_tags=risk_tags,
+        metrics=profile_metrics,
+        policy_tag=V1421_POLICY_TAG,
+    )
+
+def _v1423_split_left(row: Mapping[str, Any], split: Sequence[Any]) -> bool:
+    key = str(split[0])
+    threshold = split[1]
+    if key == "state_eq":
+        return str(row.get("state") or "") == str(threshold)
+    value = row.get(key)
+    if value is None:
+        return False
+    try:
+        return float(value) <= float(threshold)
+    except (TypeError, ValueError):
+        return False
+
+
+def _v1423_predict_action(row: Mapping[str, Any], node: Any = V1423_CONSERVATIVE_TREE) -> str:
+    current = node
+    while not isinstance(current, str):
+        split, left, right = current
+        current = left if _v1423_split_left(row, split) else right
+    return current
+
+
+def _v1423_profile_from_action(action: str) -> dict[str, Any] | None:
+    match = V1423_ACTION_RE.match(action)
+    if not match:
+        return None
+    side = "LONG" if match.group("side") == "L" else "SHORT"
+    entry_bp = float(match.group("entry"))
+    tp_bp = min(float(match.group("tp")), V1423_MAX_TP_BP)
+    sl_bp = float(match.group("sl"))
+    ttl_s = int(match.group("ttl"))
+    return {
+        "side": side,
+        "entry_bp": entry_bp,
+        "tp1_bp": tp_bp,
+        "full_tp_bp": tp_bp,
+        "sl_bp": sl_bp,
+        "be_bp": 0.0,
+        "partial_exit_pct": 1.0,
+        "ttl_s": ttl_s,
+        "profile_anchor": f"v1423_{action.lower()}",
+    }
+
+
+def _v1427_predict_action(row: Mapping[str, Any], node: Mapping[str, Any] = V1427_FIVE_WINDOW_TREE) -> str:
+    current: Any = node
+    while isinstance(current, Mapping) and "action" not in current:
+        split = current.get("split")
+        if not isinstance(split, Sequence):
+            return "BASE"
+        current = current["left"] if _v1423_split_left(row, split) else current["right"]
+    if isinstance(current, Mapping):
+        return str(current.get("action") or "BASE")
+    return str(current or "BASE")
+
+
+def _v1427_profile_from_action(action: str) -> dict[str, Any] | None:
+    match = V1427_ACTION_RE.match(action)
+    if not match:
+        return None
+    side = "LONG" if match.group("side") == "L" else "SHORT"
+    entry_bp = float(match.group("entry"))
+    tp_bp = min(float(match.group("tp")), V1427_MAX_TP_BP)
+    sl_bp = float(match.group("sl"))
+    ttl_s = int(match.group("ttl"))
+    profile: dict[str, Any] = {
+        "side": side,
+        "entry_bp": entry_bp,
+        "tp1_bp": tp_bp,
+        "full_tp_bp": tp_bp,
+        "sl_bp": sl_bp,
+        "be_bp": 0.0,
+        "partial_exit_pct": 1.0,
+        "ttl_s": ttl_s,
+        "hold_s": 900,
+        "profile_anchor": f"v1427_{action.lower()}",
+    }
+    if match.group("lock_s") is not None:
+        lock_s = int(match.group("lock_s"))
+        lock_min = float(match.group("lock_min"))
+        lock_slope = float(match.group("lock_slope"))
+        profile.update(
+            {
+                "time_profit_lock_enabled": True,
+                "time_lock_enabled": True,
+                "time_lock_s": lock_s,
+                "time_lock_min_bp": lock_min,
+                "time_lock_slope_max_bp": lock_slope,
+                "time_lock_lookback_s": 30,
+                "time_lock_reason": "CODEX_V1427_TIME_LOCK",
+            }
+        )
+    return profile
+
+
+def _v1427_projected_50_net_by_window() -> dict[str, float]:
+    return {
+        window: round(float(row["projected_50_net"]), 6)
+        for window, row in V1427_FDT_RNG90_BLOCK_BY_WINDOW.items()
+    }
+
+
+def _v1427_feature_snapshot(row: Mapping[str, Any]) -> dict[str, float]:
+    return {
+        key: round(float(row[key]), 4)
+        for key in V1427_REQUIRED_FEATURES
+        if row.get(key) is not None
+    }
+
+
+def _v1427_base_metrics(
+    features: Mapping[str, Any],
+    decision: CodexV1Decision,
+    row: Mapping[str, Any],
+    action: str,
+) -> dict[str, Any]:
+    metrics = decision.metrics if isinstance(decision.metrics, Mapping) else {}
+    previous_policy_tag = decision.policy_tag or metrics.get("policy_tag") or metrics.get("policy_note")
+    return {
+        **metrics,
+        "v1427_action": action,
+        "v1427_state": row.get("state"),
+        "v1427_policy_tag": V1427_POLICY_TAG,
+        "v1427_policy_source": V1427_DECISION_TREE_SOURCE,
+        "v1427_overlay_source": V1427_OVERLAY_SOURCE,
+        "v1427_previous_policy_tag": previous_policy_tag,
+        "v1427_previous_side": decision.side,
+        "v1427_features": _v1427_feature_snapshot(row),
+        "v1427_slope_source": features.get("v1423_slope_source") or features.get("v1421_slope_source") or features.get("slope_source"),
+        "v1427_target_50_net_usdc": V1427_TARGET_50_NET_USDC,
+        "v1427_target_wr": V1427_TARGET_WR,
+        "v1427_max_tp_bp": V1427_MAX_TP_BP,
+        "v1427_min_projected_50_net_usdc": round(V1427_MIN_PROJECTED_50_NET_USDC, 6),
+        "v1427_projected_50_net_by_window": _v1427_projected_50_net_by_window(),
+    }
+
+
+def _v1427_block_decision(
+    decision: CodexV1Decision,
+    *,
+    reason: str,
+    metrics: Mapping[str, Any],
+    shadow_lane: str,
+    extra_tags: Sequence[str] = (),
+) -> CodexV1Decision:
+    blocked_metrics = {
+        **dict(metrics),
+        "policy_note": reason,
+        "policy_tag": reason,
+        "live_action": "blocked_no_submit",
+    }
+    return replace(
+        decision,
+        accepted=False,
+        reason=reason,
+        size_mult=0.0,
+        notional_mult=0.0,
+        requested_notional_usdc=0.0,
+        risk_tags=tuple(dict.fromkeys((*decision.risk_tags, reason, *extra_tags))),
+        metrics=blocked_metrics,
+        policy_tag=reason,
+        shadow_lane=shadow_lane,
+    )
+
+
+def _v1429_stale_side_override_details(
+    features: Mapping[str, Any],
+    *,
+    lane_code: str,
+    state: str,
+    target_side: str,
+    previous_side: str | None,
+) -> dict[str, Any] | None:
+    if lane_code != "STUP-S" or state not in V1429_STUPS_STALE_SIDE_OVERRIDE_STATES:
+        return None
+    raw_side = str(previous_side or features.get("side") or "").upper()
+    target = str(target_side or "").upper()
+    if target not in {"LONG", "SHORT"} or raw_side not in {"LONG", "SHORT"}:
+        return None
+    if target == raw_side:
+        return None
+    wait_s = _feature_value(features, "reprice_wait_elapsed_seconds")
+    if wait_s is None or wait_s < V1429_STUPS_STALE_SIDE_OVERRIDE_WAIT_S:
+        return None
+    return {
+        "v1429_block_reason": V1429_STUPS_STALE_SIDE_OVERRIDE_BLOCK_TAG,
+        "v1429_stale_side_override_blocked": True,
+        "v1429_previous_side": raw_side,
+        "v1429_target_side": target,
+        "v1429_wait_s": round(float(wait_s), 4),
+        "v1429_wait_threshold_s": V1429_STUPS_STALE_SIDE_OVERRIDE_WAIT_S,
+        "v1429_state": state,
+    }
+
+def _v1433_stups_clean_high_override_details(
+    features: Mapping[str, Any],
+    *,
+    lane_code: str,
+    state: str,
+    target_side: str,
+    previous_side: str | None,
+) -> dict[str, Any] | None:
+    if lane_code != "STUP-S" or state != "STUP-S:clean_extension":
+        return None
+    raw_side = str(previous_side or features.get("side") or "").upper()
+    target = str(target_side or "").upper()
+    if raw_side != "SHORT" or target != "LONG":
+        return None
+    range_pos = _feature_value(features, "range_pos_15")
+    if range_pos is None:
+        range_pos = _feature_value(features, "range_pos")
+    vwap_dist_bp = _feature_value(features, "vwap_dist_bp")
+
+    if range_pos is None or vwap_dist_bp is None:
+        return None
+    if (
+        float(range_pos) < V1433_STUPS_CLEAN_HIGH_OVERRIDE_RANGE_POS_MIN
+        or float(vwap_dist_bp) < V1433_STUPS_CLEAN_HIGH_OVERRIDE_VWAP_MIN_BP
+    ):
+        return None
+    return {
+        "v1433_block_reason": V1433_STUPS_CLEAN_HIGH_OVERRIDE_BLOCK_TAG,
+        "v1433_clean_high_override_blocked": True,
+        "v1433_previous_side": raw_side,
+        "v1433_target_side": target,
+        "v1433_range_pos_15": round(float(range_pos), 4),
+        "v1433_range_pos_min": V1433_STUPS_CLEAN_HIGH_OVERRIDE_RANGE_POS_MIN,
+        "v1433_vwap_dist_bp": round(float(vwap_dist_bp), 4),
+        "v1433_vwap_min_bp": V1433_STUPS_CLEAN_HIGH_OVERRIDE_VWAP_MIN_BP,
+        "v1433_state": state,
+    }
+
+
+def _v1452_stups_late_adverse_reopen_details(
+    features: Mapping[str, Any],
+    *,
+    lane_code: str,
+    state: str,
+    target_side: str,
+    previous_side: str | None,
+    legacy_reason: str,
+) -> dict[str, Any] | None:
+    if lane_code != "STUP-S" or state != "STUP-S:clean_extension":
+        return None
+    target = str(target_side or "").upper()
+    raw_side = str(previous_side or features.get("side") or "").upper()
+    if target not in {"LONG", "SHORT"} or raw_side not in {"LONG", "SHORT"}:
+        return None
+    wait_s = _feature_value(features, "reprice_wait_elapsed_seconds")
+    adverse_bp = _feature_value(features, "reprice_adverse_bp")
+    favorable_bp = _feature_value(features, "reprice_favorable_bp")
+    if wait_s is None or adverse_bp is None or favorable_bp is None:
+        return None
+    if float(wait_s) <= 180.0 or float(adverse_bp) < 5.0 or float(favorable_bp) > 1.0:
+        return None
+    return {
+        "v1452_block_reason": V1452_STUPS_LATE_ADVERSE_REOPEN_BLOCK_TAG,
+        "v1452_late_adverse_reopen_blocked": True,
+        "v1452_previous_side": raw_side,
+        "v1452_target_side": target,
+        "v1452_legacy_reason": legacy_reason,
+        "v1452_state": state,
+        "v1452_wait_s": round(float(wait_s), 4),
+        "v1452_wait_threshold_s": 180.0,
+        "v1452_adverse_bp": round(float(adverse_bp), 4),
+        "v1452_adverse_threshold_bp": 5.0,
+        "v1452_favorable_bp": round(float(favorable_bp), 4),
+        "v1452_favorable_max_bp": 1.0,
+    }
+
+
+
+def _v1453_stups_clean_extension_reopen_review_details(
+    features: Mapping[str, Any],
+    *,
+    lane_code: str,
+    state: str,
+    target_side: str,
+    previous_side: str | None,
+    legacy_reason: str,
+    action: str,
+) -> dict[str, Any] | None:
+    if lane_code != "STUP-S" or state != "STUP-S:clean_extension":
+        return None
+    target = str(target_side or "").upper()
+    raw_side = str(previous_side or features.get("side") or "").upper()
+    if target != "SHORT" or raw_side not in {"LONG", "SHORT"}:
+        return None
+    rng15 = _feature_value(features, "rng15")
+    rsi = _feature_value(features, "rsi")
+    vwap_dist_bp = _feature_value(features, "vwap_dist_bp")
+    wait_s = _feature_value(features, "reprice_wait_elapsed_seconds")
+
+    high_rng_shadow_block = rng15 is not None and float(rng15) >= 28.91
+    high_rsi_vwap_late_review = (
+        rsi is not None
+        and vwap_dist_bp is not None
+        and wait_s is not None
+        and float(rsi) >= 65.0
+        and float(vwap_dist_bp) >= 20.0
+        and float(wait_s) > 180.0
+    )
+    if high_rng_shadow_block:
+        block_shape = "rng15_shadow_block_candidate"
+    elif high_rsi_vwap_late_review:
+        block_shape = "high_rsi_vwap_late_review"
+    else:
+        return None
+
+    return {
+        "v1453_block_reason": block_shape,
+        "v1453_clean_extension_reopen_review_blocked": True,
+        "v1453_previous_side": raw_side,
+        "v1453_target_side": target,
+        "v1453_legacy_reason": legacy_reason,
+        "v1453_state": state,
+        "v1453_action": action,
+        "v1453_rng15": round(float(rng15), 4) if rng15 is not None else None,
+        "v1453_rng15_shadow_block_min": 28.91,
+        "v1453_rsi": round(float(rsi), 4) if rsi is not None else None,
+        "v1453_rsi_min": 65.0,
+        "v1453_vwap_dist_bp": round(float(vwap_dist_bp), 4) if vwap_dist_bp is not None else None,
+        "v1453_vwap_dist_min_bp": 20.0,
+        "v1453_wait_s": round(float(wait_s), 4) if wait_s is not None else None,
+        "v1453_wait_min_s": 180.0,
+    }
+
+def _v1455_action_tp_bp(action: str | None) -> float | None:
+    if not action:
+        return None
+    profile = _v1427_profile_from_action(str(action))
+    if profile is None:
+        profile = _v1423_profile_from_action(str(action))
+    if profile is None:
+        return None
+    try:
+        value = float(profile.get("tp1_bp") or profile.get("full_tp_bp") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    return value if isfinite(value) and value > 0 else None
+
+
+def _v1455_route_for_action(
+    row: Mapping[str, Any],
+    decision: CodexV1Decision,
+    action: str | None,
+) -> tuple[str, str, float | None]:
+    lane_code = str(decision.lane_code or "").upper()
+    state = str(row.get("state") or decision.regime or "")
+    tp_bp = _v1455_action_tp_bp(action)
+    if lane_code == "STUP-S" and state == "STUP-S:clean_extension":
+        if tp_bp is not None and tp_bp >= V1455_BLOCKED_TP_MIN_BP:
+            return "BLOCK", "stups_clean_extension_tp14_loss_guard", tp_bp
+        if tp_bp is not None and tp_bp <= V1455_THIN_SCALP_ROUTE_TP_MAX_BP:
+            return "THIN_SCALP", "stups_clean_extension_tp8_tp10_gate_pass", tp_bp
+        return "NORMAL", "stups_clean_extension_non_tp14_profile", tp_bp
+    if lane_code == "CNL-WPR-L":
+        return "RECOVERY_CANARY", "codex_recovery_lane_whitelist_canary", tp_bp
+    if not decision.accepted:
+        return "OBSERVE_ONLY", "not_live_accepted", tp_bp
+    return "NORMAL", "default_live_profile", tp_bp
+
+
+def _v1455_route_metrics(route: str, route_reason: str, action: str | None, tp_bp: float | None) -> dict[str, Any]:
+    return {
+        "v1455_route": route,
+        "v1455_route_reason": route_reason,
+        "v1455_action": action,
+        "v1455_action_tp_bp": round(float(tp_bp), 4) if tp_bp is not None else None,
+        "v1455_policy_tag": V1455_ADAPTIVE_ROUTE_TAG,
+    }
+
+def apply_v1427_five_window_decision(
+    features: Mapping[str, Any],
+    decision: CodexV1Decision,
+) -> CodexV1Decision:
+    lane_code = str(decision.lane_code or "").upper()
+    lane = str(decision.lane or "")
+    row = _v1421_feature_row(features, decision)
+
+    metrics = decision.metrics if isinstance(decision.metrics, Mapping) else {}
+    if not decision.accepted:
+        legacy_reason = str(decision.reason or "")
+        missing = tuple(key for key in V1427_REQUIRED_FEATURES if row.get(key) is None)
+        action = _v1427_predict_action(row) if not missing else "BLOCK"
+        profile = _v1427_profile_from_action(action)
+        if (
+            lane_code != "STUP-S"
+            or legacy_reason not in V1428_LEGACY_STUPS_REOPEN_REASONS
+            or action in {"BASE", "BLOCK"}
+            or profile is None
+        ):
+            return decision
+        target_side = str(profile["side"]).upper()
+        state = str(row.get("state") or "")
+        stale_override_details = _v1429_stale_side_override_details(
+            features,
+            lane_code=lane_code,
+            state=state,
+            target_side=target_side,
+            previous_side=decision.side,
+        )
+        if stale_override_details:
+            block_metrics = _v1427_base_metrics(features, decision, row, action)
+            block_metrics.update(stale_override_details)
+            return _v1427_block_decision(
+                decision,
+                reason=V1429_STUPS_STALE_SIDE_OVERRIDE_BLOCK_TAG,
+                metrics=block_metrics,
+                shadow_lane="SH_V1429_STUPS_STALE_SIDE_OVERRIDE",
+                extra_tags=("v1429_stale_side_override_block", f"v1429_blocked_{action.lower()}"),
+            )
+        clean_high_details = _v1433_stups_clean_high_override_details(
+            features,
+            lane_code=lane_code,
+            state=state,
+            target_side=target_side,
+            previous_side=decision.side,
+        )
+        if clean_high_details:
+            block_metrics = _v1427_base_metrics(features, decision, row, action)
+            block_metrics.update(clean_high_details)
+            return _v1427_block_decision(
+                decision,
+                reason=V1433_STUPS_CLEAN_HIGH_OVERRIDE_BLOCK_TAG,
+                metrics=block_metrics,
+                shadow_lane="SH_V1433_STUPS_CLEAN_HIGH_OVERRIDE",
+                extra_tags=("v1433_clean_high_override_block", f"v1433_blocked_{action.lower()}"),
+            )
+        late_adverse_details = _v1452_stups_late_adverse_reopen_details(
+            features,
+            lane_code=lane_code,
+            state=state,
+            target_side=target_side,
+            previous_side=decision.side,
+            legacy_reason=legacy_reason,
+        )
+        if late_adverse_details:
+            block_metrics = _v1427_base_metrics(features, decision, row, action)
+            block_metrics.update(late_adverse_details)
+            return _v1427_block_decision(
+                decision,
+                reason=V1452_STUPS_LATE_ADVERSE_REOPEN_BLOCK_TAG,
+                metrics=block_metrics,
+                shadow_lane="SH_V1452_STUPS_LATE_ADVERSE_REOPEN",
+                extra_tags=("v1452_stups_late_adverse_reopen_block", f"v1452_blocked_{action.lower()}"),
+            )
+        reopen_review_details = _v1453_stups_clean_extension_reopen_review_details(
+            features,
+            lane_code=lane_code,
+            state=state,
+            target_side=target_side,
+            previous_side=decision.side,
+            legacy_reason=legacy_reason,
+            action=action,
+        )
+        if reopen_review_details:
+            block_metrics = _v1427_base_metrics(features, decision, row, action)
+            block_metrics.update(reopen_review_details)
+            return _v1427_block_decision(
+                decision,
+                reason=V1453_STUPS_CLEAN_EXTENSION_REOPEN_REVIEW_BLOCK_TAG,
+                metrics=block_metrics,
+                shadow_lane="SH_V1453_STUPS_CLEAN_EXTENSION_REOPEN_REVIEW",
+                extra_tags=("v1453_stups_clean_extension_reopen_review_block", f"v1453_blocked_{action.lower()}"),
+            )
+        v1455_route, v1455_route_reason, v1455_tp_bp = _v1455_route_for_action(row, decision, action)
+        if v1455_route == "BLOCK":
+            block_metrics = _v1427_base_metrics(features, decision, row, action)
+            block_metrics.update(_v1455_route_metrics(v1455_route, v1455_route_reason, action, v1455_tp_bp))
+            return _v1427_block_decision(
+                decision,
+                reason=V1455_STUPS_CLEAN_EXTENSION_TP14_BLOCK_TAG,
+                metrics=block_metrics,
+                shadow_lane="SH_V1455_STUPS_CLEAN_EXTENSION_TP14_BLOCK",
+                extra_tags=("v1455_stups_clean_extension_tp14_block", f"v1455_blocked_{action.lower()}"),
+            )
+        reopened_metrics = {
+            **dict(metrics),
+            "v1428_legacy_reopen": True,
+            "v1428_legacy_reopen_reason": legacy_reason,
+            "v1428_legacy_reopen_action": action,
+        }
+        decision = replace(
+            decision,
+            accepted=True,
+            reason=f"{V1427_POLICY_TAG}_legacy_reopen",
+            size_mult=max(float(decision.size_mult or 0.0), 1.0),
+            notional_mult=max(float(decision.notional_mult or 0.0), 1.0),
+            requested_notional_usdc=max(float(decision.requested_notional_usdc or 0.0), BASE_NOTIONAL_USDC),
+            risk_tags=tuple(
+                dict.fromkeys(
+                    (
+                        *decision.risk_tags,
+                        V1428_LEGACY_STUPS_REOPEN_TAG,
+                        f"v1428_reopened_{legacy_reason}",
+                    )
+                )
+            ),
+            metrics=reopened_metrics,
+            policy_tag=V1427_POLICY_TAG,
+        )
+        metrics = reopened_metrics
+
+    if lane_code == "W1D":
+        metrics = _v1427_base_metrics(features, decision, row, "BLOCK")
+        metrics.update({"v1427_block_reason": V1427_W1D_BLOCK_TAG, "v1427_w1d_blocked": True})
+        return _v1427_block_decision(
+            decision,
+            reason=V1427_W1D_BLOCK_TAG,
+            metrics=metrics,
+            shadow_lane="SH_V1427_W1D_BLOCK",
+            extra_tags=("v1427_unvalidated_lane_block",),
+        )
+
+    if lane_code not in V1427_LIVE_LANE_CODES:
+        return decision
+    if lane_code == "W6A" or lane == "w6_lane_s1long_rng38_86_range9_15_e0":
+        return decision
+    if metrics.get("v1427_action"):
+        return decision
+
+    missing = tuple(key for key in V1427_REQUIRED_FEATURES if row.get(key) is None)
+    if missing:
+        missing_metrics = dict(metrics)
+        missing_metrics.update(
+            {
+                "v1427_action": "BLOCK",
+                "v1427_state": row.get("state"),
+                "v1427_missing_features": missing,
+                "v1427_policy_tag": V1427_POLICY_TAG,
+                "v1427_policy_source": V1427_DECISION_TREE_SOURCE,
+            }
+        )
+        wpr_state = str(
+            metrics.get("wpr_profile")
+            or metrics.get("market_state")
+            or row.get("state")
+            or decision.regime
+            or ""
+        )
+        wpr_shadow_lane = str(decision.shadow_lane or metrics.get("shadow_lane") or "").upper()
+        wpr_policy_tag = str(
+            metrics.get("profile_patch")
+            or metrics.get("policy_tag")
+            or metrics.get("policy_note")
+            or decision.policy_tag
+            or ""
+        )
+        has_wpr_execution_profile = any(
+            key in metrics
+            for key in (
+                "entry_bp",
+                "tp1_bp",
+                "full_tp_bp",
+                "sl_bp",
+                "partial_exit_pct",
+                "ttl_s",
+            )
+        )
+        if (
+            lane_code == "CNL-WPR-L"
+            and wpr_state.startswith("CNL-WPR-L:")
+            and (
+                wpr_shadow_lane == "SH_WPR_L_S1"
+                or has_wpr_execution_profile
+                or wpr_policy_tag.startswith(("v139", "v141", "v142", "v145"))
+            )
+        ):
+            passthrough_metrics = {
+                **missing_metrics,
+                "v1427_action": "MISSING_FEATURES_PROFILE_PASSTHROUGH",
+                "v1427_missing_features_passthrough": True,
+                "v1427_missing_features_policy": "keep_existing_wpr_profile",
+            }
+            return replace(
+                decision,
+                risk_tags=tuple(
+                    dict.fromkeys(
+                        (
+                            *decision.risk_tags,
+                            "v1427_missing_features_profile_passthrough",
+                        )
+                    )
+                ),
+                metrics=passthrough_metrics,
+            )
+        return _v1427_block_decision(
+            decision,
+            reason=V1427_MISSING_FEATURE_BLOCK_TAG,
+            metrics=missing_metrics,
+            shadow_lane="SH_V1427_MISSING_FEATURES",
+            extra_tags=("v1427_missing_features",),
+        )
+
+    action = _v1427_predict_action(row)
+    base_metrics = _v1427_base_metrics(features, decision, row, action)
+    state = str(row.get("state") or "")
+    rng15 = row.get("rng15")
+    if state == "CNL-WPR-L:falling_discount_trap" and rng15 is not None and float(rng15) >= 90.0:
+        base_metrics.update(
+            {
+                "v1427_overlay": "fdt_rng90_block",
+                "v1427_overlay_action": "BLOCK",
+                "v1427_overlay_old_action": action,
+                "v1427_overlay_rng15_threshold_bp": 90.0,
+            }
+        )
+        return _v1427_block_decision(
+            decision,
+            reason=V1427_FDT_RNG90_BLOCK_TAG,
+            metrics=base_metrics,
+            shadow_lane="SH_V1427_FDT_RNG90_BLOCK",
+            extra_tags=("v1427_overlay_fdt_rng90_block", f"v1427_old_action_{action.lower()}"),
+        )
+
+    if action == "BASE":
+        passthrough_metrics = {
+            **base_metrics,
+            "policy_note": V1427_BASE_PASSTHROUGH_TAG,
+            "policy_tag": V1427_BASE_PASSTHROUGH_TAG,
+            "live_action": "live_v1427_base_passthrough",
+            "source": "v1427_five_window_compact_tree_base_passthrough",
+            "profile_source": V1427_DECISION_TREE_SOURCE,
+            "market_state": row.get("state"),
+            "v143_market_state": row.get("state"),
+        }
+        return replace(
+            decision,
+            reason=V1427_BASE_PASSTHROUGH_TAG,
+            regime=str(row.get("state") or decision.regime or ""),
+            risk_tags=tuple(dict.fromkeys((*decision.risk_tags, "v1427_five_window_compact_tree", "v1427_base_passthrough"))),
+            metrics=passthrough_metrics,
+            policy_tag=V1427_BASE_PASSTHROUGH_TAG,
+        )
+
+    if action == "BLOCK":
+        return _v1427_block_decision(
+            decision,
+            reason=V1427_TREE_BLOCK_TAG,
+            metrics=base_metrics,
+            shadow_lane="SH_V1427_TREE_BLOCK",
+            extra_tags=("v1427_tree_block",),
+        )
+
+    profile = _v1427_profile_from_action(action)
+    if profile is None:
+        return replace(decision, metrics=base_metrics)
+
+    target_side = str(profile["side"]).upper()
+    stale_override_details = _v1429_stale_side_override_details(
+        features,
+        lane_code=lane_code,
+        state=state,
+        target_side=target_side,
+        previous_side=decision.side,
+    )
+    if stale_override_details:
+        base_metrics.update(stale_override_details)
+        return _v1427_block_decision(
+            decision,
+            reason=V1429_STUPS_STALE_SIDE_OVERRIDE_BLOCK_TAG,
+            metrics=base_metrics,
+            shadow_lane="SH_V1429_STUPS_STALE_SIDE_OVERRIDE",
+            extra_tags=("v1429_stale_side_override_block", f"v1429_blocked_{action.lower()}"),
+        )
+    clean_high_details = _v1433_stups_clean_high_override_details(
+        features,
+        lane_code=lane_code,
+        state=state,
+        target_side=target_side,
+        previous_side=decision.side,
+    )
+    if clean_high_details:
+        base_metrics.update(clean_high_details)
+        return _v1427_block_decision(
+            decision,
+            reason=V1433_STUPS_CLEAN_HIGH_OVERRIDE_BLOCK_TAG,
+            metrics=base_metrics,
+            shadow_lane="SH_V1433_STUPS_CLEAN_HIGH_OVERRIDE",
+            extra_tags=("v1433_clean_high_override_block", f"v1433_blocked_{action.lower()}"),
+        )
+    v1455_route, v1455_route_reason, v1455_tp_bp = _v1455_route_for_action(row, decision, action)
+    if v1455_route == "BLOCK":
+        base_metrics.update(_v1455_route_metrics(v1455_route, v1455_route_reason, action, v1455_tp_bp))
+        return _v1427_block_decision(
+            decision,
+            reason=V1455_STUPS_CLEAN_EXTENSION_TP14_BLOCK_TAG,
+            metrics=base_metrics,
+            shadow_lane="SH_V1455_STUPS_CLEAN_EXTENSION_TP14_BLOCK",
+            extra_tags=("v1455_stups_clean_extension_tp14_block", f"v1455_blocked_{action.lower()}"),
+        )
+    action_tag = f"v1427_action_{action.lower()}"
+    side_override_tag = f"v1427_side_override_{target_side.lower()}" if target_side != str(decision.side or "").upper() else None
+    profile_metrics = {
+        **base_metrics,
+        "policy_note": V1427_POLICY_TAG,
+        "policy_tag": V1427_POLICY_TAG,
+        "live_action": "live_v1427_five_window_adaptive_profile",
+        "source": "v1427_five_window_compact_tree_leaf2_tp14",
+        "profile_source": V1427_DECISION_TREE_SOURCE,
+        "overlay_source": V1427_OVERLAY_SOURCE,
+        "market_state": row.get("state"),
+        "v143_market_state": row.get("state"),
+        "adaptive_tp_engine": "v1427_five_window_tp14_time_lock" if profile.get("time_lock_enabled") else "v1427_five_window_tp14_full_exit",
+        "entry_bp": float(profile["entry_bp"]),
+        "tp1_bp": float(profile["tp1_bp"]),
+        "full_tp_bp": float(profile["full_tp_bp"]),
+        "sl_bp": float(profile["sl_bp"]),
+        "be_bp": float(profile["be_bp"]),
+        "partial_exit_pct": float(profile["partial_exit_pct"]),
+        "ttl_s": int(profile["ttl_s"]),
+        "hold_s": int(profile["hold_s"]),
+        "profile_anchor": profile.get("profile_anchor"),
+        "profile_patch": V1427_POLICY_TAG,
+        "target_side": target_side,
+        "applied_notional_cap_usdc": decision.requested_notional_usdc,
+    }
+    profile_metrics.update(_v1455_route_metrics(v1455_route, v1455_route_reason, action, v1455_tp_bp))
+    for optional_key in (
+        "time_profit_lock_enabled",
+        "time_lock_enabled",
+        "time_lock_s",
+        "time_lock_min_bp",
+        "time_lock_slope_max_bp",
+        "time_lock_lookback_s",
+        "time_lock_reason",
+    ):
+        if optional_key in profile:
+            profile_metrics[optional_key] = profile[optional_key]
+    risk_tags = tuple(
+        dict.fromkeys(
+            tag
+            for tag in (
+                *decision.risk_tags,
+                "v1427_five_window_compact_tree",
+                V1427_POLICY_TAG,
+                action_tag,
+                side_override_tag,
+                f"entry{float(profile['entry_bp']):g}",
+                f"tp{float(profile['tp1_bp']):g}",
+                f"fulltp{float(profile['full_tp_bp']):g}",
+                f"sl{float(profile['sl_bp']):g}",
+                "be0",
+                f"ttl{int(profile['ttl_s'])}s",
+                (
+                    f"lock{int(profile['time_lock_s'])}_{float(profile['time_lock_min_bp']):g}_{float(profile['time_lock_slope_max_bp']):g}"
+                    if profile.get("time_lock_enabled")
+                    else None
+                ),
+            )
+            if tag
+        )
+    )
+    return replace(
+        decision,
+        side=target_side,
+        entry_offset_bp=float(profile["entry_bp"]),
+        reason=V1427_POLICY_TAG,
+        regime=str(row.get("state") or decision.regime or ""),
+        risk_tags=risk_tags,
+        metrics=profile_metrics,
+        policy_tag=V1427_POLICY_TAG,
+    )
+
+
+def _v1430_state_key(row: Mapping[str, Any], decision: CodexV1Decision) -> str:
+    lane_code = str(decision.lane_code or "").upper()
+    state = str(row.get("state") or decision.regime or lane_code or "UNKNOWN")
+    if lane_code == "W1D" and state == "W1D":
+        state = "W1D:mixed"
+    metrics = decision.metrics if isinstance(decision.metrics, Mapping) else {}
+    previous_side = str(metrics.get("v1427_previous_side") or "").upper()
+    current_side = str(decision.side or "").upper()
+    if lane_code == "CNL-WPR-L" and state == "CNL-WPR-L:deep_discount_stable" and current_side in {"LONG", "SHORT"}:
+        side = current_side
+    else:
+        side = previous_side if previous_side in {"LONG", "SHORT"} else current_side
+    return f"{lane_code}|{state}|{side}"
+
+
+def _v1430_condition_matches(row: Mapping[str, Any], condition: Mapping[str, Any]) -> tuple[bool | None, str | None]:
+    feature = str(condition.get("feature") or "")
+    op = str(condition.get("op") or "")
+    value = row.get(feature)
+    if value is None:
+        return None, feature or None
+    try:
+        parsed = float(value)
+        threshold = float(condition.get("threshold"))
+    except (TypeError, ValueError):
+        return None, feature or None
+    if not isfinite(parsed) or not isfinite(threshold):
+        return None, feature or None
+    if op == "<=":
+        return parsed <= threshold, None
+    if op == ">=":
+        return parsed >= threshold, None
+    if op == "<":
+        return parsed < threshold, None
+    if op == ">":
+        return parsed > threshold, None
+    return None, feature or None
+
+
+def _v1430_profile_from_action(action: str | None) -> dict[str, Any] | None:
+    if not action or action == "block_all":
+        return None
+    profile = V1430_ACTION_PROFILES.get(str(action))
+    return dict(profile) if profile is not None else None
+
+
+def _v1430_resolve_action(row: Mapping[str, Any], rule: Mapping[str, Any]) -> tuple[str, str | None, str | None]:
+    if bool(rule.get("block_all")):
+        return "BLOCK", None, "block_all"
+
+    loss_condition = rule.get("loss_condition")
+    if isinstance(loss_condition, Mapping):
+        matched, missing = _v1430_condition_matches(row, loss_condition)
+        if missing:
+            return "MISSING", missing, "missing_loss_prune_feature"
+        keep_when = str(rule.get("keep_when") or "match")
+        keep = bool(matched) if keep_when == "match" else not bool(matched)
+        if not keep:
+            return "BLOCK", None, "loss_prune_rejected"
+
+    split = rule.get("split")
+    if isinstance(split, Mapping):
+        condition = split.get("condition")
+        if not isinstance(condition, Mapping):
+            return "BLOCK", None, "malformed_split"
+        matched, missing = _v1430_condition_matches(row, condition)
+        if missing:
+            return "MISSING", missing, "missing_split_feature"
+        action = str(split.get("match_action") if matched else split.get("not_match_action") or "block_all")
+        if action == "block_all":
+            return "BLOCK", None, "targeted_split_block"
+        if _v1430_profile_from_action(action) is None:
+            return "BLOCK", None, "unknown_profile_action"
+        return "PROFILE", action, "targeted_split_profile"
+
+    action = str(rule.get("baseline_action") or "")
+    if _v1430_profile_from_action(action) is None:
+        return "BLOCK", None, "unknown_baseline_action"
+    return "PROFILE", action, "baseline_profile"
+
+
+def _v1430_base_metrics(
+    features: Mapping[str, Any],
+    decision: CodexV1Decision,
+    row: Mapping[str, Any],
+    *,
+    state_key: str,
+    rule: Mapping[str, Any],
+    final_action: str | None,
+    resolution: str,
+) -> dict[str, Any]:
+    metrics = decision.metrics if isinstance(decision.metrics, Mapping) else {}
+    previous_policy_tag = decision.policy_tag or metrics.get("policy_tag") or metrics.get("policy_note")
+    return {
+        **dict(metrics),
+        "v1430_policy_tag": V1430_POLICY_TAG,
+        "v1430_policy_source": V1430_SOURCE,
+        "v1430_targeted_split_source": V1430_TARGETED_SPLIT_SOURCE,
+        "v1430_previous_policy_tag": previous_policy_tag,
+        "v1430_state_key": state_key,
+        "v1430_state": row.get("state"),
+        "v1430_action_id": rule.get("action_id"),
+        "v1430_baseline_action": rule.get("baseline_action"),
+        "v1430_final_action": final_action,
+        "v1430_resolution": resolution,
+        "v1430_counts": rule.get("counts"),
+        "v1430_summary": rule.get("summary"),
+        "v1430_total": V1430_TOTAL_METRICS,
+        "v1430_features": _v1427_feature_snapshot(row),
+        "v1430_slope_source": features.get("v1423_slope_source") or features.get("v1421_slope_source") or features.get("slope_source"),
+    }
+
+
+def _v1430_block_decision(
+    decision: CodexV1Decision,
+    *,
+    reason: str,
+    metrics: Mapping[str, Any],
+    shadow_lane: str,
+    missing_features: Sequence[str] = (),
+    extra_tags: Sequence[str] = (),
+) -> CodexV1Decision:
+    blocked = _v1427_block_decision(
+        decision,
+        reason=reason,
+        metrics=metrics,
+        shadow_lane=shadow_lane,
+        extra_tags=extra_tags,
+    )
+    if missing_features:
+        return replace(blocked, missing_features=tuple(missing_features))
+    return blocked
+
+
+def apply_v1430_loss_prune_decision(
+    features: Mapping[str, Any],
+    decision: CodexV1Decision,
+) -> CodexV1Decision:
+    row = _v1421_feature_row(features, decision)
+    state_key = _v1430_state_key(row, decision)
+    rule = V1430_RULES.get(state_key)
+    if rule is None:
+        return decision
+
+    action_kind, action, resolution = _v1430_resolve_action(row, rule)
+    base_metrics = _v1430_base_metrics(
+        features,
+        decision,
+        row,
+        state_key=state_key,
+        rule=rule,
+        final_action=action,
+        resolution=resolution or action_kind.lower(),
+    )
+
+    if not decision.accepted:
+        return decision
+
+    if action_kind == "MISSING":
+        missing = (str(action),) if action else ()
+        missing_metrics = {
+            **base_metrics,
+            "v1430_block_reason": V1430_MISSING_FEATURE_BLOCK_TAG,
+            "v1430_missing_features": missing,
+            "policy_note": V1430_MISSING_FEATURE_BLOCK_TAG,
+            "policy_tag": V1430_MISSING_FEATURE_BLOCK_TAG,
+        }
+        return _v1430_block_decision(
+            decision,
+            reason=V1430_MISSING_FEATURE_BLOCK_TAG,
+            metrics=missing_metrics,
+            shadow_lane="SH_V1430_MISSING_FEATURES",
+            missing_features=missing,
+            extra_tags=("v1430_missing_features",),
+        )
+
+    if action_kind == "BLOCK":
+        block_metrics = {
+            **base_metrics,
+            "v1430_block_reason": resolution,
+            "policy_note": V1430_BLOCK_TAG,
+            "policy_tag": V1430_BLOCK_TAG,
+        }
+        return _v1430_block_decision(
+            decision,
+            reason=V1430_BLOCK_TAG,
+            metrics=block_metrics,
+            shadow_lane="SH_V1430_LOSS_PRUNE_BLOCK",
+            extra_tags=("v1430_loss_prune_block", f"v1430_{state_key.lower().replace('|', '_').replace(':', '_')}"),
+        )
+
+    profile = _v1430_profile_from_action(action)
+    if profile is None:
+        return decision
+
+    target_side = state_key.rsplit("|", 1)[-1]
+    profile_metrics = {
+        **base_metrics,
+        "policy_note": V1430_POLICY_TAG,
+        "policy_tag": V1430_POLICY_TAG,
+        "live_action": "live_v1430_loss_prune_profile",
+        "source": "v1430_selective_hybrid_loss_prune_median_exit",
+        "profile_source": V1430_SOURCE,
+        "targeted_split_source": V1430_TARGETED_SPLIT_SOURCE,
+        "market_state": row.get("state"),
+        "v143_market_state": row.get("state"),
+        "adaptive_tp_engine": "v1430_loss_prune_trail",
+        "entry_bp": float(profile["entry_bp"]),
+        "tp1_bp": float(profile["tp1_bp"]),
+        "full_tp_bp": float(profile["full_tp_bp"]),
+        "sl_bp": float(profile["sl_bp"]),
+        "be_bp": float(profile["be_bp"]),
+        "partial_exit_pct": float(profile["partial_exit_pct"]),
+        "ttl_s": int(profile["ttl_s"]),
+        "hold_s": int(profile["hold_s"]),
+        "trail_arm_bp": float(profile["trail_arm_bp"]),
+        "trail_giveback_bp": float(profile["trail_giveback_bp"]),
+        "trail_floor_bp": float(profile["trail_floor_bp"]),
+        "profile_anchor": profile.get("profile_anchor"),
+        "tp_execution_note": profile.get("tp_execution_note"),
+        "profile_patch": V1430_POLICY_TAG,
+        "target_side": target_side,
+        "applied_notional_cap_usdc": decision.requested_notional_usdc,
+    }
+    action_tag = f"v1430_action_{str(action).lower()}"
+    side_override_tag = f"v1430_side_override_{target_side.lower()}" if target_side != str(decision.side or "").upper() else None
+    risk_tags = tuple(
+        dict.fromkeys(
+            tag
+            for tag in (
+                *decision.risk_tags,
+                "v1430_loss_prune",
+                V1430_POLICY_TAG,
+                action_tag,
+                side_override_tag,
+                f"entry{float(profile['entry_bp']):g}",
+                f"tp{float(profile['tp1_bp']):g}",
+                f"fulltp{float(profile['full_tp_bp']):g}",
+                f"sl{float(profile['sl_bp']):g}",
+                f"trailarm{float(profile['trail_arm_bp']):g}",
+                f"trailgb{float(profile['trail_giveback_bp']):g}",
+                f"trailfloor{float(profile['trail_floor_bp']):g}",
+                f"ttl{int(profile['ttl_s'])}s",
+            )
+            if tag
+        )
+    )
+    return replace(
+        decision,
+        side=target_side,
+        entry_offset_bp=float(profile["entry_bp"]),
+        reason=V1430_POLICY_TAG,
+        regime=str(row.get("state") or decision.regime or ""),
+        risk_tags=risk_tags,
+        metrics=profile_metrics,
+        policy_tag=V1430_POLICY_TAG,
+    )
+
+
+
+def apply_v1436_live_hotfix_decision(
+    features: Mapping[str, Any],
+    decision: CodexV1Decision,
+) -> CodexV1Decision:
+    if not decision.accepted:
+        return decision
+    row = _v1421_feature_row(features, decision)
+    lane_code = str(decision.lane_code or "").upper()
+    state = str(row.get("state") or decision.regime or "")
+    side = str(decision.side or "").upper()
+    if lane_code == "CNL-WPR-L" and state == "CNL-WPR-L:fast_reclaim" and side == "LONG":
+        try:
+            slope60 = float(row.get("slope60"))
+            slope120 = float(row.get("slope120"))
+            vwap = float(row.get("vwap"))
+        except (TypeError, ValueError):
+            return decision
+        if isfinite(slope60) and isfinite(slope120) and isfinite(vwap):
+            if slope60 <= -2.0 and slope120 <= -4.0 and vwap <= -8.0:
+                metrics = dict(decision.metrics or {})
+                metrics.update(
+                    {
+                        "policy_note": V1436_FAST_RECLAIM_DOWNSLOPE_BLOCK_TAG,
+                        "policy_tag": V1436_FAST_RECLAIM_DOWNSLOPE_BLOCK_TAG,
+                        "v1436_block_reason": "fast_reclaim_long_downslope_not_reclaimed",
+                        "v1436_features": {
+                            "slope60": round(slope60, 4),
+                            "slope120": round(slope120, 4),
+                            "vwap": round(vwap, 4),
+                        },
+                        "v1436_thresholds": {
+                            "slope60_max": -2.0,
+                            "slope120_max": -4.0,
+                            "vwap_max": -8.0,
+                        },
+                    }
+                )
+                return replace(
+                    decision,
+                    accepted=False,
+                    reason=V1436_FAST_RECLAIM_DOWNSLOPE_BLOCK_TAG,
+                    size_mult=0.0,
+                    notional_mult=0.0,
+                    requested_notional_usdc=0.0,
+                    risk_tags=tuple(dict.fromkeys((*decision.risk_tags, V1436_FAST_RECLAIM_DOWNSLOPE_BLOCK_TAG))),
+                    metrics=metrics,
+                    policy_tag=V1436_FAST_RECLAIM_DOWNSLOPE_BLOCK_TAG,
+                    shadow_lane="SH_V1436_FAST_RECLAIM_DOWNSLOPE",
+                )
+    if lane_code == "STUP-S" and state == "STUP-S:clean_extension" and side in {"LONG", "SHORT"}:
+        selector_action = str((decision.metrics or {}).get("v1441_research_selector_action") or "")
+        try:
+            d30 = float(row.get("d30"))
+            adv3 = float(row.get("adv3"))
+            rsi = float(row.get("rsi"))
+            vwap_dist_bp = float(row.get("vwap_dist_bp", row.get("vwap")))
+            range_pos_15 = float(row.get("range_pos_15", row.get("range_pos")))
+            pullback = float(row.get("pullback_from_recent_high_bp", row.get("pullback")))
+            slope120 = float(row.get("slope120"))
+        except (TypeError, ValueError):
+            return decision
+        values = (d30, adv3, rsi, vwap_dist_bp, range_pos_15, pullback, slope120)
+        if selector_action == "SHADOW_REVIEW" and all(isfinite(value) for value in values):
+            hot_extension_short_trap = (
+                side == "SHORT"
+                and d30 >= 40.0
+                and adv3 >= 8.0
+                and slope120 >= 8.0
+                and rsi >= 67.0
+                and vwap_dist_bp >= 8.0
+                and range_pos_15 >= 0.95
+            )
+            weak_extension_long_chase = (
+                side == "LONG"
+                and d30 >= 30.0
+                and adv3 <= 3.0
+                and rsi >= 63.0
+                and vwap_dist_bp >= 15.0
+                and pullback >= 20.0
+            )
+            if hot_extension_short_trap or weak_extension_long_chase:
+                block_shape = "hot_extension_short_trap" if hot_extension_short_trap else "weak_extension_long_chase"
+                metrics = dict(decision.metrics or {})
+                metrics.update(
+                    {
+                        "policy_note": V1451_STUPS_CLEAN_EXTENSION_SHADOW_REVIEW_BLOCK_TAG,
+                        "policy_tag": V1451_STUPS_CLEAN_EXTENSION_SHADOW_REVIEW_BLOCK_TAG,
+                        "v1451_block_reason": block_shape,
+                        "v1451_live_sample_runs": [
+                            "cry3mn_1783225643617",
+                            "cry3mn_1783226163122",
+                        ],
+                        "v1451_features": {
+                            "d30": round(d30, 4),
+                            "adv3": round(adv3, 4),
+                            "rsi": round(rsi, 4),
+                            "vwap_dist_bp": round(vwap_dist_bp, 4),
+                            "range_pos_15": round(range_pos_15, 4),
+                            "pullback_from_recent_high_bp": round(pullback, 4),
+                            "slope120": round(slope120, 4),
+                            "selector_action": selector_action,
+                            "state": state,
+                            "side": side,
+                        },
+                        "v1451_thresholds": {
+                            "hot_short_d30_min": 40.0,
+                            "hot_short_adv3_min": 8.0,
+                            "hot_short_slope120_min": 8.0,
+                            "hot_short_rsi_min": 67.0,
+                            "hot_short_vwap_min": 8.0,
+                            "hot_short_range_pos_min": 0.95,
+                            "weak_long_d30_min": 30.0,
+                            "weak_long_adv3_max": 3.0,
+                            "weak_long_rsi_min": 63.0,
+                            "weak_long_vwap_min": 15.0,
+                            "weak_long_pullback_min": 20.0,
+                        },
+                    }
+                )
+                return replace(
+                    decision,
+                    accepted=False,
+                    reason=V1451_STUPS_CLEAN_EXTENSION_SHADOW_REVIEW_BLOCK_TAG,
+                    size_mult=0.0,
+                    notional_mult=0.0,
+                    requested_notional_usdc=0.0,
+                    risk_tags=tuple(dict.fromkeys((*decision.risk_tags, V1451_STUPS_CLEAN_EXTENSION_SHADOW_REVIEW_BLOCK_TAG, f"v1451_{block_shape}"))),
+                    metrics=metrics,
+                    policy_tag=V1451_STUPS_CLEAN_EXTENSION_SHADOW_REVIEW_BLOCK_TAG,
+                    shadow_lane="SH_V1451_STUPS_CLEAN_EXTENSION_SHADOW_REVIEW",
+                )
+    if lane_code == "CNL-WPR-L" and state == "CNL-WPR-L:falling_discount_trap" and side == "LONG":
+        try:
+            rng15 = float(row.get("rng15"))
+            d30 = float(row.get("d30"))
+            adv3 = float(row.get("adv3"))
+        except (TypeError, ValueError):
+            return decision
+        if isfinite(rng15) and isfinite(d30) and isfinite(adv3):
+            false_bounce = rng15 <= 20.0 and d30 <= -25.0 and adv3 >= 20.0
+            no_reclaim = d30 <= -35.0 and adv3 <= 0.0
+            if false_bounce or no_reclaim:
+                block_shape = "low_rng_false_bounce" if false_bounce else "deep_fall_no_reclaim"
+                metrics = dict(decision.metrics or {})
+                metrics.update(
+                    {
+                        "policy_note": V1449_CNL_WPR_FALLING_TRAP_QUALITY_BLOCK_TAG,
+                        "policy_tag": V1449_CNL_WPR_FALLING_TRAP_QUALITY_BLOCK_TAG,
+                        "v1449_block_reason": block_shape,
+                        "v1449_live_sample_runs": [
+                            "cry3mn_1783195853863",
+                            "cry3mn_1783196733860",
+                        ],
+                        "v1449_features": {
+                            "rng15": round(rng15, 4),
+                            "d30": round(d30, 4),
+                            "adv3": round(adv3, 4),
+                            "state": state,
+                            "side": side,
+                        },
+                        "v1449_thresholds": {
+                            "false_bounce_rng15_max": 20.0,
+                            "false_bounce_d30_max": -25.0,
+                            "false_bounce_adv3_min": 20.0,
+                            "no_reclaim_d30_max": -35.0,
+                            "no_reclaim_adv3_max": 0.0,
+                        },
+                    }
+                )
+                return replace(
+                    decision,
+                    accepted=False,
+                    reason=V1449_CNL_WPR_FALLING_TRAP_QUALITY_BLOCK_TAG,
+                    size_mult=0.0,
+                    notional_mult=0.0,
+                    requested_notional_usdc=0.0,
+                    risk_tags=tuple(dict.fromkeys((*decision.risk_tags, V1449_CNL_WPR_FALLING_TRAP_QUALITY_BLOCK_TAG, f"v1449_{block_shape}"))),
+                    metrics=metrics,
+                    policy_tag=V1449_CNL_WPR_FALLING_TRAP_QUALITY_BLOCK_TAG,
+                    shadow_lane="SH_V1449_CNL_WPR_FALLING_TRAP_QUALITY",
+                )
+
+    if lane_code == "CNL-WPR-L" and state == "CNL-WPR-L:deep_discount_stable" and side == "LONG":
+        try:
+            rng15 = float(row.get("rng15"))
+            d30 = float(row.get("d30"))
+            adv3 = float(row.get("adv3"))
+            rsi = float(row.get("rsi"))
+            vwap_dist_bp = float(row.get("vwap_dist_bp", row.get("vwap")))
+            range_pos_15 = float(row.get("range_pos_15", row.get("range_pos")))
+            pullback = float(row.get("pullback_from_recent_high_bp", row.get("pullback")))
+            close_pos_raw = row.get("close_pos", features.get("close_pos"))
+            close_pos = float(close_pos_raw) if close_pos_raw is not None else float("nan")
+        except (TypeError, ValueError):
+            return decision
+        values = (rng15, d30, adv3, rsi, vwap_dist_bp, range_pos_15, pullback)
+        if all(isfinite(value) for value in values):
+            weak_rebound_late_chase = (
+                d30 >= 10.0
+                and adv3 <= 1.0
+                and range_pos_15 >= 0.60
+                and (not isfinite(close_pos) or close_pos >= 0.80)
+                and vwap_dist_bp <= -25.0
+                and pullback <= 10.0
+            )
+            upper_window_exhaustion = (
+                range_pos_15 >= 0.85
+                and pullback <= 3.5
+                and rsi >= 58.0
+                and vwap_dist_bp <= -25.0
+                and adv3 <= 0.0
+            )
+            if weak_rebound_late_chase or upper_window_exhaustion:
+                block_shape = "weak_rebound_late_chase" if weak_rebound_late_chase else "upper_window_exhaustion"
+                metrics = dict(decision.metrics or {})
+                metrics.update(
+                    {
+                        "policy_note": V1450_CNL_WPR_DEEP_LATE_CHASE_BLOCK_TAG,
+                        "policy_tag": V1450_CNL_WPR_DEEP_LATE_CHASE_BLOCK_TAG,
+                        "v1450_block_reason": block_shape,
+                        "v1450_live_sample_runs": [
+                            "cry3mn_1783221548047",
+                            "cry3mn_1783222767945",
+                            "cry3mn_1783223348090",
+                        ],
+                        "v1450_features": {
+                            "rng15": round(rng15, 4),
+                            "d30": round(d30, 4),
+                            "adv3": round(adv3, 4),
+                            "rsi": round(rsi, 4),
+                            "vwap_dist_bp": round(vwap_dist_bp, 4),
+                            "range_pos_15": round(range_pos_15, 4),
+                            "close_pos": round(close_pos, 4) if isfinite(close_pos) else None,
+                            "pullback_from_recent_high_bp": round(pullback, 4),
+                            "state": state,
+                            "side": side,
+                        },
+                        "v1450_thresholds": {
+                            "weak_rebound_d30_min": 10.0,
+                            "weak_rebound_adv3_max": 1.0,
+                            "weak_rebound_range_pos_min": 0.60,
+                            "weak_rebound_close_pos_min": 0.80,
+                            "weak_rebound_vwap_max": -25.0,
+                            "weak_rebound_pullback_max": 10.0,
+                            "upper_window_range_pos_min": 0.85,
+                            "upper_window_pullback_max": 3.5,
+                            "upper_window_rsi_min": 58.0,
+                            "upper_window_vwap_max": -25.0,
+                            "upper_window_adv3_max": 0.0,
+                        },
+                    }
+                )
+                return replace(
+                    decision,
+                    accepted=False,
+                    reason=V1450_CNL_WPR_DEEP_LATE_CHASE_BLOCK_TAG,
+                    size_mult=0.0,
+                    notional_mult=0.0,
+                    requested_notional_usdc=0.0,
+                    risk_tags=tuple(dict.fromkeys((*decision.risk_tags, V1450_CNL_WPR_DEEP_LATE_CHASE_BLOCK_TAG, f"v1450_{block_shape}"))),
+                    metrics=metrics,
+                    policy_tag=V1450_CNL_WPR_DEEP_LATE_CHASE_BLOCK_TAG,
+                    shadow_lane="SH_V1450_CNL_WPR_DEEP_LATE_CHASE",
+                )
+    if lane_code == "CNL-WPR-L" and state == "CNL-WPR-L:fast_reclaim" and side == "SHORT":
+        try:
+            rng15 = float(row.get("rng15"))
+            adv3 = float(row.get("adv3"))
+            d30 = float(row.get("d30"))
+        except (TypeError, ValueError):
+            return decision
+        if isfinite(rng15) and isfinite(adv3) and isfinite(d30):
+            weak_reclaim = rng15 <= 35.0 and abs(adv3) <= 2.0
+            if weak_reclaim:
+                metrics = dict(decision.metrics or {})
+                metrics.update(
+                    {
+                        "policy_note": V1449_CNL_WPR_FAST_RECLAIM_QUALITY_BLOCK_TAG,
+                        "policy_tag": V1449_CNL_WPR_FAST_RECLAIM_QUALITY_BLOCK_TAG,
+                        "v1449_block_reason": "fast_reclaim_short_weak_adv3",
+                        "v1449_live_sample_runs": ["cry3mn_1783197093854"],
+                        "v1449_features": {
+                            "rng15": round(rng15, 4),
+                            "d30": round(d30, 4),
+                            "adv3": round(adv3, 4),
+                            "state": state,
+                            "side": side,
+                        },
+                        "v1449_thresholds": {
+                            "rng15_max": 35.0,
+                            "abs_adv3_max": 2.0,
+                        },
+                    }
+                )
+                return replace(
+                    decision,
+                    accepted=False,
+                    reason=V1449_CNL_WPR_FAST_RECLAIM_QUALITY_BLOCK_TAG,
+                    size_mult=0.0,
+                    notional_mult=0.0,
+                    requested_notional_usdc=0.0,
+                    risk_tags=tuple(dict.fromkeys((*decision.risk_tags, V1449_CNL_WPR_FAST_RECLAIM_QUALITY_BLOCK_TAG, "v1449_fast_reclaim_short_weak_adv3"))),
+                    metrics=metrics,
+                    policy_tag=V1449_CNL_WPR_FAST_RECLAIM_QUALITY_BLOCK_TAG,
+                    shadow_lane="SH_V1449_CNL_WPR_FAST_RECLAIM_QUALITY",
+                )
+
+    return decision
+
+def apply_v1423_conservative_decision(
+    features: Mapping[str, Any],
+    decision: CodexV1Decision,
+) -> CodexV1Decision:
+    if not decision.accepted:
+        return decision
+    lane_code = str(decision.lane_code or "").upper()
+    lane = str(decision.lane or "")
+    if lane_code not in V1423_LIVE_LANE_CODES:
+        return decision
+    if lane_code == "W6A" or lane == "w6_lane_s1long_rng38_86_range9_15_e0":
+        return decision
+    metrics = decision.metrics if isinstance(decision.metrics, Mapping) else {}
+    if metrics.get("v1423_action"):
+        return decision
+
+    row = _v1421_feature_row(features, decision)
+    missing = tuple(key for key in V1423_REQUIRED_FEATURES if row.get(key) is None)
+    if missing:
+        return decision
+
+    action = _v1423_predict_action(row)
+    base_metrics = dict(metrics)
+    previous_policy_tag = decision.policy_tag or base_metrics.get("policy_tag") or base_metrics.get("policy_note")
+    feature_snapshot = {
+        key: round(float(row[key]), 4)
+        for key in V1423_REQUIRED_FEATURES
+        if row.get(key) is not None
+    }
+    base_metrics.update(
+        {
+            "v1423_action": action,
+            "v1423_state": row.get("state"),
+            "v1423_policy_tag": V1423_POLICY_TAG,
+            "v1423_policy_source": V1423_DECISION_TREE_SOURCE,
+            "v1423_previous_policy_tag": previous_policy_tag,
+            "v1423_previous_side": decision.side,
+            "v1423_features": feature_snapshot,
+            "v1423_slope_source": features.get("v1423_slope_source") or features.get("v1421_slope_source") or features.get("slope_source"),
+            "v1423_projected_50_net_usdc": V1423_PROJECTED_50_NET_USDC,
+            "v1423_target_50_net_usdc": V1423_TARGET_50_NET_USDC,
+            "v1423_target_wr": V1423_TARGET_WR,
+            "v1423_max_tp_bp": V1423_MAX_TP_BP,
+        }
+    )
+    if action == "BASE":
+        state = str(row.get("state") or "")
+        if lane_code == "STUP-S" or state.startswith("STUP-S:"):
+            return replace(
+                decision,
+                accepted=False,
+                reason=V1424_STUPS_BASE_BLOCK_TAG,
+                size_mult=0.0,
+                notional_mult=0.0,
+                requested_notional_usdc=0.0,
+                risk_tags=tuple(dict.fromkeys((*decision.risk_tags, V1424_STUPS_BASE_BLOCK_TAG))),
+                metrics={
+                    **base_metrics,
+                    "policy_note": V1424_STUPS_BASE_BLOCK_TAG,
+                    "policy_tag": V1424_STUPS_BASE_BLOCK_TAG,
+                    "blocked_base_fallback": True,
+                },
+                policy_tag=V1424_STUPS_BASE_BLOCK_TAG,
+                shadow_lane="SH_V1424_STUPS_BASE_BLOCK",
+            )
+        if lane_code == "CNL-WPR-L" or state.startswith("CNL-WPR-L:"):
+            return replace(
+                decision,
+                accepted=False,
+                reason=V1426_WPR_BASE_FALLBACK_BLOCK_TAG,
+                size_mult=0.0,
+                notional_mult=0.0,
+                requested_notional_usdc=0.0,
+                risk_tags=tuple(dict.fromkeys((*decision.risk_tags, V1426_WPR_BASE_FALLBACK_BLOCK_TAG))),
+                metrics={
+                    **base_metrics,
+                    "policy_note": V1426_WPR_BASE_FALLBACK_BLOCK_TAG,
+                    "policy_tag": V1426_WPR_BASE_FALLBACK_BLOCK_TAG,
+                    "blocked_base_fallback": True,
+                    "blocked_v1426_state": state,
+                },
+                policy_tag=V1426_WPR_BASE_FALLBACK_BLOCK_TAG,
+                shadow_lane="SH_V1426_WPR_BASE_BLOCK",
+            )
+        return replace(decision, metrics=base_metrics)
+    if action == "BLOCK":
+        return replace(
+            decision,
+            accepted=False,
+            reason="v1423_conservative_tree_block",
+            size_mult=0.0,
+            notional_mult=0.0,
+            requested_notional_usdc=0.0,
+            risk_tags=tuple(dict.fromkeys((*decision.risk_tags, "v1423_conservative_tree_block"))),
+            metrics={**base_metrics, "policy_note": "v1423_conservative_tree_block", "policy_tag": "v1423_conservative_tree_block"},
+            policy_tag="v1423_conservative_tree_block",
+            shadow_lane="SH_V1423_TREE_BLOCK",
+        )
+
+    profile = _v1423_profile_from_action(action)
+    if profile is None:
+        return replace(decision, metrics=base_metrics)
+
+    state = str(row.get("state") or "")
+    action_block_reason: str | None = None
+    action_block_shadow_lane = "SH_V1425_ACTION_BLOCK"
+    action_block_tag_prefix = "v1425"
+    if lane_code == "STUP-S" and state == "STUP-S:weak_chop" and action.startswith("L_E0_"):
+        action_block_reason = V1425_STUPS_WEAK_CHOP_DIRECT_LONG_BLOCK_TAG
+    elif lane_code == "CNL-WPR-L" and state == "CNL-WPR-L:falling_discount_trap" and action.startswith("L_E0_"):
+        action_block_reason = V1425_WPR_FALLING_TRAP_DIRECT_LONG_BLOCK_TAG
+    elif lane_code == "STUP-S" and state == "STUP-S:weak_chop" and action.startswith("S_E"):
+        action_block_reason = V1426_STUPS_WEAK_CHOP_SHORT_BLOCK_TAG
+        action_block_shadow_lane = "SH_V1426_STUPS_SHORT_BLOCK"
+        action_block_tag_prefix = "v1426"
+    elif lane_code == "STUP-S" and state == "STUP-S:mixed" and action.startswith("S_E"):
+        action_block_reason = V1426_STUPS_MIXED_SHORT_BLOCK_TAG
+        action_block_shadow_lane = "SH_V1426_STUPS_SHORT_BLOCK"
+        action_block_tag_prefix = "v1426"
+    if action_block_reason:
+        return replace(
+            decision,
+            accepted=False,
+            reason=action_block_reason,
+            size_mult=0.0,
+            notional_mult=0.0,
+            requested_notional_usdc=0.0,
+            risk_tags=tuple(dict.fromkeys((*decision.risk_tags, action_block_reason, f"{action_block_tag_prefix}_blocked_action_{action.lower()}"))),
+            metrics={
+                **base_metrics,
+                "policy_note": action_block_reason,
+                "policy_tag": action_block_reason,
+                "blocked_v1425_action": action,
+                "blocked_v1425_state": state,
+                "blocked_v1426_action": action,
+                "blocked_v1426_state": state,
+            },
+            policy_tag=action_block_reason,
+            shadow_lane=action_block_shadow_lane,
+        )
+
+    if lane_code == "CNL-WPR-L" and state == "CNL-WPR-L:falling_discount_trap" and action.startswith(("S_E0_", "S_E2_")):
+        profile = {
+            **profile,
+            "entry_bp": 2.0,
+            "tp1_bp": 6.0,
+            "full_tp_bp": 6.0,
+            "sl_bp": 6.0,
+            "be_bp": 0.0,
+            "partial_exit_pct": 1.0,
+            "ttl_s": max(int(profile.get("ttl_s") or 45), 60),
+            "profit_lock_mfe_bp": 6.0,
+            "profit_lock_floor_bp": 4.0,
+            "profit_lock_giveback_bp": 2.0,
+            "profile_patch": V1426_WPR_FALLING_TRAP_SHORT_SCALP_TAG,
+            "profile_anchor": f"v1426_wpr_falling_trap_short_scalp_from_{action.lower()}",
+            "v1425_original_action": action,
+            "v1426_original_action": action,
+        }
+
+    target_side = str(profile["side"]).upper()
+    action_tag = f"v1423_action_{action.lower()}"
+    profile_policy_tag = str(profile.get("profile_patch") or V1423_POLICY_TAG)
+    side_override_tag = f"v1423_side_override_{target_side.lower()}" if target_side != str(decision.side or "").upper() else None
+    profile_metrics = {
+        **base_metrics,
+        "policy_note": profile_policy_tag,
+        "policy_tag": profile_policy_tag,
+        "live_action": "live_conservative_tree_adaptive_profile",
+        "source": "v1423_four_window_conservative_tree_search",
+        "profile_source": V1423_DECISION_TREE_SOURCE,
+        "market_state": row.get("state"),
+        "v143_market_state": row.get("state"),
+        "adaptive_tp_engine": "v1423_four_window_conservative_tree",
+        "entry_bp": float(profile["entry_bp"]),
+        "tp1_bp": float(profile["tp1_bp"]),
+        "full_tp_bp": float(profile["full_tp_bp"]),
+        "sl_bp": float(profile["sl_bp"]),
+        "be_bp": float(profile["be_bp"]),
+        "partial_exit_pct": float(profile["partial_exit_pct"]),
+        "ttl_s": int(profile["ttl_s"]),
+        "hold_s": None,
+        "profile_anchor": profile.get("profile_anchor"),
+        "profile_patch": profile_policy_tag,
+        "target_side": target_side,
+        "applied_notional_cap_usdc": decision.requested_notional_usdc,
+    }
+    for optional_key in (
+        "profit_lock_mfe_bp",
+        "profit_lock_floor_bp",
+        "profit_lock_giveback_bp",
+        "pre_tp_profit_lock_enabled",
+        "pre_tp_profit_lock_mfe_bp",
+        "pre_tp_profit_lock_floor_bp",
+        "pre_tp_profit_lock_method",
+        "v1425_original_action",
+        "v1426_original_action",
+    ):
+        if optional_key in profile:
+            profile_metrics[optional_key] = profile[optional_key]
+    risk_tags = tuple(
+        dict.fromkeys(
+            tag
+            for tag in (
+                *decision.risk_tags,
+                "v1423_four_window_conservative_tree",
+                profile_policy_tag,
+                action_tag,
+                side_override_tag,
+                f"entry{float(profile['entry_bp']):g}",
+                f"tp{float(profile['tp1_bp']):g}",
+                f"fulltp{float(profile['full_tp_bp']):g}",
+                f"sl{float(profile['sl_bp']):g}",
+                "be0",
+                f"ttl{int(profile['ttl_s'])}s",
+            )
+            if tag
+        )
+    )
+    return replace(
+        decision,
+        side=target_side,
+        entry_offset_bp=float(profile["entry_bp"]),
+        reason=profile_policy_tag,
+        regime=str(row.get("state") or decision.regime or ""),
+        risk_tags=risk_tags,
+        metrics=profile_metrics,
+        policy_tag=profile_policy_tag,
+    )
 
 def is_hot_up_extension(features: Mapping[str, Any]) -> bool:
     d30 = _feature_value(features, "d30")
@@ -1229,6 +3701,269 @@ def evaluate_stups_loss_breaker(
         "loss_run_ids": [x["run_id"] for x in loss_rows],
         "loss_reasons": [x["exit_reason"] for x in loss_rows],
     }
+def _stups_v143_market_state(features: Mapping[str, Any]) -> str:
+    rng15 = _feature_value(features, "rng15")
+    d30 = _feature_value(features, "d30")
+    adv3 = _feature_value(features, "adv3")
+    rsi = _feature_value(features, "rsi")
+    vwap = _feature_value(features, "vwap_dist_bp")
+    range_bp = _feature_value(features, "range_bp")
+    range_pos = _feature_value(features, "range_pos_15")
+    pull = _feature_value(features, "pullback_from_recent_high_bp")
+    wait = _feature_value(features, "reprice_wait_elapsed_seconds") or 0.0
+    if any(value is None for value in (rng15, d30, adv3, rsi, vwap, range_bp, range_pos)):
+        return "STUP-S:missing_features"
+
+    pull = pull if pull is not None else 0.0
+    if wait >= 300.0 and range_bp < 3.0 and range_pos >= 0.95:
+        return "STUP-S:stale_squeeze_top"
+    if range_bp <= 2.0 and range_pos >= 0.90 and vwap >= 8.0:
+        return "STUP-S:stale_squeeze_top"
+    if d30 < -15.0 and range_pos < 0.45:
+        return "STUP-S:counter_recoil"
+    if vwap < 5.0 and range_bp < 2.0:
+        return "STUP-S:near_vwap_flat"
+    if adv3 < 1.0 and range_pos < 0.35 and pull < 8.0:
+        return "STUP-S:no_momentum_edge"
+    if rng15 >= 65.0 and d30 >= 30.0 and adv3 >= 20.0 and rsi >= 64.0 and vwap >= 15.0 and range_pos >= 0.55:
+        return "STUP-S:hot_continuation"
+    if rsi >= 58.0 and vwap >= 8.0 and range_pos >= 0.55 and adv3 >= 1.0:
+        return "STUP-S:clean_extension"
+    if d30 >= -5.0 and vwap >= 5.0 and adv3 >= 2.0 and 0.35 <= range_pos <= 0.95:
+        return "STUP-S:weak_chop"
+    return "STUP-S:mixed"
+
+
+def _stups_v1420_clean_extension_good(features: Mapping[str, Any]) -> bool:
+    rng15 = _feature_value(features, "rng15")
+    d30 = _feature_value(features, "d30")
+    vwap = _feature_value(features, "vwap_dist_bp")
+    pullback = _feature_value(features, "pullback_from_recent_high_bp")
+    range_pos = _feature_value(features, "range_pos_15")
+    if any(value is None for value in (rng15, d30, vwap, pullback, range_pos)):
+        return False
+    return bool(rng15 <= 36.0 and 8.0 <= vwap <= 13.5 and d30 >= 10.0 and (pullback >= 27.0 or range_pos <= 0.80))
+
+
+def _stups_v1420_mixed_bad(features: Mapping[str, Any]) -> bool:
+    d30 = _feature_value(features, "d30")
+    adv3 = _feature_value(features, "adv3")
+    pullback = _feature_value(features, "pullback_from_recent_high_bp")
+    range_pos = _feature_value(features, "range_pos_15")
+    if any(value is None for value in (d30, adv3, pullback, range_pos)):
+        return False
+    return bool(d30 <= -7.0 and adv3 >= 7.0 and pullback <= 23.0 and 0.35 <= range_pos <= 0.65)
+
+
+def _stups_v1420_mixed_weakzone(features: Mapping[str, Any]) -> bool:
+    rng15 = _feature_value(features, "rng15")
+    range_pos = _feature_value(features, "range_pos_15")
+    range_bp = _feature_value(features, "range_bp")
+    if any(value is None for value in (rng15, range_pos, range_bp)):
+        return False
+    return bool(rng15 <= 50.0 and range_pos >= 0.35 and range_bp <= 10.0)
+
+
+def _stups_v1420_weak_chop_extreme(features: Mapping[str, Any]) -> bool:
+    range_pos = _feature_value(features, "range_pos_15")
+    range_bp = _feature_value(features, "range_bp")
+    return bool((range_pos is not None and range_pos >= 0.90) or (range_bp is not None and range_bp <= 1.5))
+
+
+def build_strong_fall_follow_short_decision(
+    features: Mapping[str, Any],
+    *,
+    strategy: str | None = None,
+    side: str | None = None,
+) -> CodexV1Decision | None:
+    strategy_value = strategy if strategy is not None else _string_feature(features, "strategy")
+    side_value = side if side is not None else _string_feature(features, "side")
+    if strategy_value != "S1_BB_RSI" or side_value != "SHORT":
+        return None
+
+    rng15 = _feature_value(features, "rng15")
+    d30 = _feature_value(features, "d30")
+    rsi = _feature_value(features, "rsi")
+    vwap_dist_bp = _feature_value(features, "vwap_dist_bp")
+    range_pos_15 = _feature_value(features, "range_pos_15")
+    close_pos = _feature_value(features, "close_pos")
+    adv3 = _feature_value(features, "adv3")
+    range_pos = range_pos_15 if range_pos_15 is not None else close_pos
+    if any(value is None for value in (rng15, d30, rsi, vwap_dist_bp, range_pos)):
+        return None
+    if not (
+        rng15 >= 70.0
+        and d30 <= -35.0
+        and vwap_dist_bp <= -8.0
+        and rsi <= 55.0
+        and range_pos <= 0.45
+    ):
+        return None
+    if adv3 is not None and adv3 > 12.0:
+        return None
+
+    entry_bp = float(STRONG_FALL_FOLLOW_PROFILE["entry_bp"])
+    tp1_bp = float(STRONG_FALL_FOLLOW_PROFILE["tp1_bp"])
+    full_tp_bp = float(STRONG_FALL_FOLLOW_PROFILE["full_tp_bp"])
+    sl_bp = float(STRONG_FALL_FOLLOW_PROFILE["sl_bp"])
+    be_bp = float(STRONG_FALL_FOLLOW_PROFILE["be_bp"])
+    partial_exit_pct = float(STRONG_FALL_FOLLOW_PROFILE["partial_exit_pct"])
+    ttl_s = int(STRONG_FALL_FOLLOW_PROFILE["ttl_s"])
+    notional_mult = STRONG_FALL_FOLLOW_NOTIONAL_USDC / BASE_NOTIONAL_USDC
+    market_state = "SFD-S:strong_down_continuation"
+    state_tag = market_state.split(":", 1)[-1]
+    risk_tags = tuple(
+        dict.fromkeys(
+            (
+                "post_only_entry",
+                "dca_disabled",
+                "strong_fall_follow_canary",
+                "rng15_ge70",
+                "d30_le_minus35",
+                "vwap_dist_le_minus8",
+                "rsi_le55",
+                f"sfd_state_{state_tag}",
+                STRONG_FALL_FOLLOW_POLICY_TAG,
+                "fixed_50_usdc",
+                "small_n_forward_watch",
+            )
+        )
+    )
+    metrics = {
+        "policy_note": STRONG_FALL_FOLLOW_POLICY_TAG,
+        "policy_tag": STRONG_FALL_FOLLOW_POLICY_TAG,
+        "market_state": market_state,
+        "v143_market_state": market_state,
+        "live_action": "live_canary_strong_down_follow",
+        "source": "v1414_live_market_state_hotfix",
+        "profile_source": "reports/CODEX_V1_4_14_MARKET_STATE_EXIT_HOTFIX_2026-06-29.md",
+        "rng15": round(float(rng15), 4),
+        "d30": round(float(d30), 4),
+        "rsi": round(float(rsi), 4),
+        "vwap_dist_bp": round(float(vwap_dist_bp), 4),
+        "range_pos_15": round(float(range_pos_15), 4) if range_pos_15 is not None else None,
+        "close_pos": round(float(close_pos), 4) if close_pos is not None else None,
+        "adv3": round(float(adv3), 4) if adv3 is not None else None,
+        "admission_guard": "s1_short_rng15_ge70_d30_le_minus35_vwap_le_minus8_rsi_le55_pos_le045",
+        "applied_notional_cap_usdc": STRONG_FALL_FOLLOW_NOTIONAL_USDC,
+        "fixed_notional_usdc": STRONG_FALL_FOLLOW_NOTIONAL_USDC,
+        "entry_bp": entry_bp,
+        "tp1_bp": tp1_bp,
+        "full_tp_bp": full_tp_bp,
+        "partial_exit_pct": partial_exit_pct,
+        "sl_bp": sl_bp,
+        "be_bp": be_bp,
+        "ttl_s": ttl_s,
+        "profit_lock_mfe_bp": STRONG_FALL_FOLLOW_PROFILE["profit_lock_mfe_bp"],
+        "profit_lock_floor_bp": STRONG_FALL_FOLLOW_PROFILE["profit_lock_floor_bp"],
+        "profit_lock_giveback_bp": STRONG_FALL_FOLLOW_PROFILE["profit_lock_giveback_bp"],
+        "small_n_forward_watch": True,
+    }
+    return CodexV1Decision(
+        accepted=True,
+        version=CODEX_V1_VERSION,
+        baseline=CODEX_V1_BASELINE,
+        lane=STRONG_FALL_FOLLOW_LANE,
+        lane_code=STRONG_FALL_FOLLOW_LANE_CODE,
+        strategy=strategy_value,
+        side=side_value,
+        entry_offset_bp=entry_bp,
+        size_mult=notional_mult,
+        notional_mult=notional_mult,
+        requested_notional_usdc=STRONG_FALL_FOLLOW_NOTIONAL_USDC,
+        reason=STRONG_FALL_FOLLOW_POLICY_TAG,
+        regime=market_state,
+        risk_tags=risk_tags,
+        metrics=metrics,
+        policy_tag=STRONG_FALL_FOLLOW_POLICY_TAG,
+    )
+def _stups_v143_shadow_block_decision(
+    features: Mapping[str, Any],
+    *,
+    strategy: str,
+    side: str,
+    reason: str,
+    condition: str,
+    trigger_metrics: Mapping[str, Any],
+    market_state: str,
+    profile: Mapping[str, Any] | None = None,
+) -> CodexV1Decision:
+    profile = profile or {}
+    metrics: dict[str, Any] = {
+        "policy_note": reason,
+        "policy_tag": reason,
+        "shadow_lane": "SH_SHORT_STALE_UPMOVE_S1",
+        "admitted_from_shadow_lane": "SH_SHORT_STALE_UPMOVE_S1",
+        "condition": condition,
+        "market_state": market_state,
+        "v143_market_state": market_state,
+        "live_action": "shadow_only",
+        "source": "v143_strategy_market_profile_sweep",
+        "profile_source": V143_PROFILE_SOURCE,
+        "fixed_notional_usdc": STALE_UPMOVE_CANARY_NOTIONAL_USDC,
+        "applied_notional_cap_usdc": 0.0,
+        "would_live_notional_usdc": STALE_UPMOVE_CANARY_NOTIONAL_USDC,
+    }
+    for key in ("entry_bp", "tp1_bp", "full_tp_bp", "partial_exit_pct", "sl_bp", "be_bp", "ttl_s"):
+        if key in profile:
+            metrics[key] = profile[key]
+    for key in (
+        "replay_n",
+        "replay_wr",
+        "replay_net_usdc",
+        "small_n_forward_watch",
+        "no_fill_recovery_tp",
+        "no_fill_recovery_loss",
+        "no_fill_recovery_still_no_fill",
+        "adaptive_tp_engine",
+        "live_observation",
+    ):
+        if key in profile:
+            metrics[key] = profile[key]
+    for key, value in trigger_metrics.items():
+        if value is None:
+            continue
+        try:
+            metrics[key] = round(float(value), 4)
+        except (TypeError, ValueError):
+            metrics[key] = value
+
+    state_tag = market_state.split(":", 1)[-1].replace("-", "_")
+    risk_tags = tuple(
+        dict.fromkeys(
+            (
+                "post_only_entry",
+                "dca_disabled",
+                *get_short_risk_tags(features),
+                "stale_upmove_canary",
+                "v143_stups_shadow_only",
+                f"stups_state_{state_tag}",
+                reason,
+                "fixed_50_usdc",
+            )
+        )
+    )
+    return CodexV1Decision(
+        accepted=False,
+        version=CODEX_V1_VERSION,
+        baseline=CODEX_V1_BASELINE,
+        lane=STALE_UPMOVE_CANARY_LANE,
+        lane_code=STALE_UPMOVE_CANARY_LANE_CODE,
+        strategy=strategy,
+        side=side,
+        entry_offset_bp=None,
+        size_mult=0.0,
+        notional_mult=0.0,
+        requested_notional_usdc=0.0,
+        reason=reason,
+        regime=market_state,
+        risk_tags=risk_tags,
+        metrics=metrics,
+        policy_tag=reason,
+        shadow_lane="SH_SHORT_STALE_UPMOVE_S1",
+    )
+
+
 def build_stale_upmove_canary_decision(
     features: Mapping[str, Any],
     *,
@@ -1254,16 +3989,134 @@ def build_stale_upmove_canary_decision(
     if d30 is None or d30 > STALE_UPMOVE_CANARY_D30_MAX_BP:
         return None
 
-    notional_mult = STALE_UPMOVE_CANARY_NOTIONAL_USDC / BASE_NOTIONAL_USDC
-    low_rng_weak_adv_shadow = (
-        rng15 <= STALE_UPMOVE_LOW_RNG_MAX_BP
+    range_pos_15 = _feature_value(features, "range_pos_15")
+    range_pos_30 = _feature_value(features, "range_pos_30")
+    rsi = _feature_value(features, "rsi")
+    wait_s = _feature_value(features, "reprice_wait_elapsed_seconds")
+    pullback = _feature_value(features, "pullback_from_recent_high_bp")
+    range_bp = _feature_value(features, "range_bp")
+    vwap_dist_bp = _feature_value(features, "vwap_dist_bp")
+
+    market_state = _stups_v143_market_state(features)
+    profile = STUPS_V143_PROFILES.get(market_state)
+    trigger_metrics = {
+        "rng15": rng15,
+        "adv3": adv3,
+        "d30": d30,
+        "range_pos_15": range_pos_15,
+        "range_pos_30": range_pos_30,
+        "rsi": rsi,
+        "vwap_dist_bp": vwap_dist_bp,
+        "reprice_wait_elapsed_seconds": wait_s,
+        "pullback_from_recent_high_bp": pullback,
+        "range_bp": range_bp,
+    }
+    if market_state in STUPS_V143_SHADOW_STATES or profile is None or bool(profile.get("shadow_only")):
+        state_suffix = market_state.split(":", 1)[-1]
+        return _stups_v143_shadow_block_decision(
+            features,
+            strategy=strategy_value,
+            side=side_value,
+            reason=f"v143_stups_{state_suffix}_shadow_only",
+            condition=state_suffix,
+            trigger_metrics=trigger_metrics,
+            market_state=market_state,
+            profile=profile,
+        )
+
+
+    if market_state == "STUP-S:clean_extension" and not _stups_v1420_clean_extension_good(features):
+        return _stups_v143_shadow_block_decision(
+            features,
+            strategy=strategy_value,
+            side=side_value,
+            reason=STUPS_V1420_CLEAN_GATE_BLOCK_REASON,
+            condition="clean_extension_rng15_le36_vwap_8_13p5_d30_ge10_pullback_ge27_or_rangepos_le0p80",
+            trigger_metrics=trigger_metrics,
+            market_state=market_state,
+            profile=profile,
+        )
+
+    if market_state == "STUP-S:mixed" and _stups_v1420_mixed_bad(features):
+        return _stups_v143_shadow_block_decision(
+            features,
+            strategy=strategy_value,
+            side=side_value,
+            reason=STUPS_V1420_MIXED_BAD_BLOCK_REASON,
+            condition="mixed_d30_le_minus7_adv3_ge7_pullback_le23_rangepos_0p35_0p65",
+            trigger_metrics=trigger_metrics,
+            market_state=market_state,
+            profile=profile,
+        )
+
+    if market_state == "STUP-S:mixed" and _stups_v1420_mixed_weakzone(features):
+        return _stups_v143_shadow_block_decision(
+            features,
+            strategy=strategy_value,
+            side=side_value,
+            reason=STUPS_V1420_MIXED_WEAKZONE_BLOCK_REASON,
+            condition="mixed_rng15_le50_rangepos_ge0p35_rangebp_le10",
+            trigger_metrics=trigger_metrics,
+            market_state=market_state,
+            profile=profile,
+        )
+
+    if market_state == "STUP-S:weak_chop" and _stups_v1420_weak_chop_extreme(features):
+        return _stups_v143_shadow_block_decision(
+            features,
+            strategy=strategy_value,
+            side=side_value,
+            reason=STUPS_V1420_WEAK_CHOP_EXTREME_BLOCK_REASON,
+            condition="weak_chop_rangepos_ge0p90_or_rangebp_le1p5",
+            trigger_metrics=trigger_metrics,
+            market_state=market_state,
+            profile=profile,
+        )
+
+
+    profile_entry_bp = float(profile["entry_bp"])
+    low_rng_weak_adv_cautious_live = (
+        market_state == "STUP-S:weak_chop"
+        and rng15 <= STALE_UPMOVE_LOW_RNG_MAX_BP
         and adv3 < STALE_UPMOVE_WEAK_ADV3_MAX_BP
     )
+    hot_clean_extension_entry_band = (
+        str(profile.get("adaptive_tp_engine") or "") not in {"v1419_stups_runner", "v1420_stups_runner_after_clean_gate"}
+        and market_state == "STUP-S:clean_extension"
+        and rsi is not None
+        and vwap_dist_bp is not None
+        and pullback is not None
+        and range_pos_15 is not None
+        and adv3 is not None
+        and d30 is not None
+        and rsi >= STALE_UPMOVE_HOT_CLEAN_RSI_MIN
+        and vwap_dist_bp >= STALE_UPMOVE_HOT_CLEAN_VWAP_MIN_BP
+        and pullback >= STALE_UPMOVE_HOT_CLEAN_PULLBACK_MIN_BP
+        and (
+            range_pos_15 >= STALE_UPMOVE_HOT_CLEAN_RANGE_POS_MIN
+            or adv3 >= STALE_UPMOVE_HOT_CLEAN_ADV3_MIN_BP
+            or d30 >= STALE_UPMOVE_HOT_CLEAN_D30_MIN_BP
+        )
+    )
+    entry_bp = profile_entry_bp
+    if low_rng_weak_adv_cautious_live:
+        entry_bp = max(entry_bp, STALE_UPMOVE_LOW_RNG_WEAK_ADV_ENTRY_BP)
+    if hot_clean_extension_entry_band:
+        entry_bp = max(entry_bp, STALE_UPMOVE_HOT_CLEAN_ENTRY_BP)
+    tp1_bp = float(profile["tp1_bp"])
+    full_tp_bp = float(profile.get("full_tp_bp", tp1_bp) or tp1_bp)
+    sl_bp = float(profile["sl_bp"])
+    be_bp = float(profile["be_bp"])
+    partial_exit_pct = float(profile["partial_exit_pct"])
+    ttl_s = int(profile["ttl_s"])
+    if hot_clean_extension_entry_band:
+        ttl_s = min(ttl_s, STALE_UPMOVE_HOT_CLEAN_TTL_S)
+    notional_mult = STALE_UPMOVE_CANARY_NOTIONAL_USDC / BASE_NOTIONAL_USDC
     shadow_guards = [STALE_UPMOVE_SL19_SHADOW_TAG]
+    state_tag = market_state.split(":", 1)[-1].replace("-", "_")
     base_tags = (
         "post_only_entry",
         "dca_disabled",
-        "trail_required",
         *get_short_risk_tags(features),
         "stale_upmove_canary",
         "rng15_gt20",
@@ -1271,19 +4124,31 @@ def build_stale_upmove_canary_decision(
         "adv3_gt0",
         "d30_le80",
         "canary_notional_50",
-        "tp_no_runner",
-        "original_sl_kept",
-        STALE_UPMOVE_SL19_SHADOW_TAG,
+        STUPS_V143_PROFILE_POLICY_TAG,
+        f"stups_state_{state_tag}",
+        f"tp{tp1_bp:g}",
+        f"fulltp{full_tp_bp:g}",
+        f"sl{sl_bp:g}",
+        f"be{be_bp:g}",
+        f"ttl{ttl_s}s",
     )
-    if low_rng_weak_adv_shadow:
-        base_tags = (*base_tags, STALE_UPMOVE_LOW_RNG_WEAK_ADV_SHADOW_TAG)
-        shadow_guards.append(STALE_UPMOVE_LOW_RNG_WEAK_ADV_SHADOW_TAG)
+    if profile.get("small_n_forward_watch"):
+        base_tags = (*base_tags, "small_n_forward_watch")
+    if low_rng_weak_adv_cautious_live:
+        base_tags = (*base_tags, STALE_UPMOVE_LOW_RNG_WEAK_ADV_LIVE_TAG, f"entry{entry_bp:g}")
+    if hot_clean_extension_entry_band:
+        base_tags = (*base_tags, STALE_UPMOVE_HOT_CLEAN_ENTRY_TAG, f"entry{entry_bp:g}", f"ttl{ttl_s}s")
     risk_tags = tuple(dict.fromkeys(base_tags))
     metrics = {
-        "policy_note": STALE_UPMOVE_CANARY_POLICY_TAG,
-        "policy_tag": STALE_UPMOVE_CANARY_POLICY_TAG,
+        "policy_note": STUPS_V143_PROFILE_POLICY_TAG,
+        "policy_tag": STUPS_V143_PROFILE_POLICY_TAG,
         "shadow_lane": "SH_SHORT_STALE_UPMOVE_S1",
         "admitted_from_shadow_lane": "SH_SHORT_STALE_UPMOVE_S1",
+        "market_state": market_state,
+        "v143_market_state": market_state,
+        "live_action": "live_canary_adaptive_profile",
+        "source": "v143_strategy_market_profile_sweep",
+        "profile_source": V143_PROFILE_SOURCE,
         "rng15": round(float(rng15), 4),
         "rng15_min_bp": STALE_UPMOVE_CANARY_RNG15_MIN_BP,
         "rng15_max_bp": STALE_UPMOVE_CANARY_RNG15_MAX_BP,
@@ -1291,27 +4156,77 @@ def build_stale_upmove_canary_decision(
         "adv3_min_bp": STALE_UPMOVE_CANARY_ADV3_MIN_BP,
         "d30": round(float(d30), 4),
         "d30_max_bp": STALE_UPMOVE_CANARY_D30_MAX_BP,
+        "range_pos_15": round(float(range_pos_15), 4) if range_pos_15 is not None else None,
+        "rsi": round(float(rsi), 4) if rsi is not None else None,
+        "vwap_dist_bp": round(float(vwap_dist_bp), 4) if vwap_dist_bp is not None else None,
+        "range_bp": round(float(range_bp), 4) if range_bp is not None else None,
+        "pullback_from_recent_high_bp": round(float(pullback), 4) if pullback is not None else None,
+        "reprice_wait_elapsed_seconds": round(float(wait_s), 4) if wait_s is not None else None,
         "admission_guard": "rng15_gt20_adv3_gt0_rng15_le100_d30_le80",
         "applied_notional_cap_usdc": STALE_UPMOVE_CANARY_NOTIONAL_USDC,
-        "tp_policy_override": "tp1_40_then_trail_runner",
-        "sl_policy": "hard_sl_25bp",
-        "sl_policy_shadow": STALE_UPMOVE_SL19_SHADOW_TAG,
-        "sl_policy_shadow_bp": STALE_UPMOVE_SL19_SHADOW_BP,
-        "sl_policy_shadow_action": "observe_only",
-        "sl_policy_shadow_replay_note": (
-            "rng15_gt20 subset: 19bp +11.4064bp vs 17.1bp; not live"
-        ),
+        "fixed_notional_usdc": STALE_UPMOVE_CANARY_NOTIONAL_USDC,
+        "entry_bp": entry_bp,
+        "tp1_bp": tp1_bp,
+        "full_tp_bp": full_tp_bp,
+        "partial_exit_pct": partial_exit_pct,
+        "sl_bp": sl_bp,
+        "be_bp": be_bp,
+        "ttl_s": ttl_s,
+        "tp_policy_override": f"tp{tp1_bp:g}_profile",
+        "sl_policy": f"hard_sl_{sl_bp:g}bp_profile",
+        "be_policy": f"post_tp_be_{be_bp:g}bp" if be_bp > 0 else "be_disabled_for_state",
+        "ttl_policy": f"entry_ttl_{ttl_s}s_profile",
         "shadow_guards": shadow_guards,
-        "replay_report": "reports/SH_SHORT_STALE_UPMOVE_S1_FULL_TP_SL_REPLAY_2026-06-24.md",
+        "replay_report": V143_PROFILE_SOURCE,
     }
-    if low_rng_weak_adv_shadow:
+    for key in (
+        "replay_n",
+        "replay_wr",
+        "replay_net_usdc",
+        "small_n_forward_watch",
+        "no_fill_recovery_tp",
+        "no_fill_recovery_loss",
+        "no_fill_recovery_still_no_fill",
+        "adaptive_tp_engine",
+        "live_observation",
+    ):
+        if key in profile:
+            metrics[key] = profile[key]
+    if low_rng_weak_adv_cautious_live:
         metrics.update(
             {
-                STALE_UPMOVE_LOW_RNG_WEAK_ADV_SHADOW_TAG: True,
-                "low_rng_weak_adv_shadow_action": "observe_only",
-                "low_rng_weak_adv_shadow_condition": "rng15_le30_adv3_lt3",
+                STALE_UPMOVE_LOW_RNG_WEAK_ADV_LIVE_TAG: True,
+                "profile_patch": STALE_UPMOVE_LOW_RNG_WEAK_ADV_LIVE_TAG,
+                "low_rng_weak_adv_action": "live_cautious_maker",
+                "low_rng_weak_adv_condition": "weak_chop_rng15_le30_adv3_lt3",
+                "low_rng_weak_adv_profile_entry_bp": profile_entry_bp,
+                "low_rng_weak_adv_entry_bp": entry_bp,
                 "low_rng_weak_adv_rng15_max_bp": STALE_UPMOVE_LOW_RNG_MAX_BP,
                 "low_rng_weak_adv_adv3_max_bp": STALE_UPMOVE_WEAK_ADV3_MAX_BP,
+            }
+        )
+    if hot_clean_extension_entry_band:
+        metrics.update(
+            {
+                STALE_UPMOVE_HOT_CLEAN_ENTRY_TAG: True,
+                "profile_patch": STALE_UPMOVE_HOT_CLEAN_ENTRY_TAG,
+                "hot_clean_entry_action": "bounded_deep_maker",
+                "hot_clean_entry_condition": "clean_extension_rsi_ge62_vwap_ge8_pullback_ge30_and_rangepos_ge0p9_or_adv3_ge10_or_d30_ge30",
+                "hot_clean_profile_entry_bp": profile_entry_bp,
+                "hot_clean_entry_bp": entry_bp,
+                "hot_clean_ttl_s": ttl_s,
+                "hot_clean_rsi_min": STALE_UPMOVE_HOT_CLEAN_RSI_MIN,
+                "hot_clean_vwap_min_bp": STALE_UPMOVE_HOT_CLEAN_VWAP_MIN_BP,
+                "hot_clean_pullback_min_bp": STALE_UPMOVE_HOT_CLEAN_PULLBACK_MIN_BP,
+                "hot_clean_range_pos_min": STALE_UPMOVE_HOT_CLEAN_RANGE_POS_MIN,
+                "hot_clean_adv3_min_bp": STALE_UPMOVE_HOT_CLEAN_ADV3_MIN_BP,
+                "hot_clean_d30_min_bp": STALE_UPMOVE_HOT_CLEAN_D30_MIN_BP,
+                "hot_clean_observed_rsi": rsi,
+                "hot_clean_observed_vwap_dist_bp": vwap_dist_bp,
+                "hot_clean_observed_pullback_from_recent_high_bp": pullback,
+                "hot_clean_observed_range_pos_15": range_pos_15,
+                "hot_clean_observed_adv3": adv3,
+                "hot_clean_observed_d30": d30,
             }
         )
     return CodexV1Decision(
@@ -1322,17 +4237,19 @@ def build_stale_upmove_canary_decision(
         lane_code=STALE_UPMOVE_CANARY_LANE_CODE,
         strategy=strategy_value,
         side=side_value,
-        entry_offset_bp=1.0,
+        entry_offset_bp=entry_bp,
         size_mult=notional_mult,
         notional_mult=notional_mult,
         requested_notional_usdc=STALE_UPMOVE_CANARY_NOTIONAL_USDC,
-        reason="stale_upmove_guarded_canary",
-        regime="stale_short_after_upmove",
+        reason=STUPS_V143_PROFILE_POLICY_TAG,
+        regime=market_state,
         risk_tags=risk_tags,
         metrics=metrics,
-        policy_tag=STALE_UPMOVE_CANARY_POLICY_TAG,
+        policy_tag=STUPS_V143_PROFILE_POLICY_TAG,
         shadow_lane="SH_SHORT_STALE_UPMOVE_S1",
     )
+
+
 def is_mid_up_extension_short_risk(features: Mapping[str, Any]) -> bool:
     side = _string_feature(features, "side")
     rsi = _feature_value(features, "rsi")
@@ -1401,11 +4318,63 @@ def match_s1_bbrsi_ordinary_pullback_long_pre_vwap(features: Mapping[str, Any]) 
     return wait_s is None or wait_s <= 180.0
 
 
+def _s1p_l_v149_metrics(features: Mapping[str, Any], notional_mult: float) -> dict[str, Any]:
+    metrics: dict[str, Any] = {
+        "policy_note": S1P_L_V149_PROFILE_POLICY_TAG,
+        "policy_tag": S1P_L_V149_PROFILE_POLICY_TAG,
+        "market_state": S1P_L_V149_MARKET_STATE,
+        "v143_market_state": S1P_L_V149_MARKET_STATE,
+        "live_action": "live_tiny_profile",
+        "source": "v149_s1pl_hotfix",
+        "profile_source": S1P_L_V149_PROFILE_SOURCE,
+        "fixed_notional_usdc": S1P_L_V149_NOTIONAL_USDC,
+        "applied_notional_cap_usdc": S1P_L_V149_NOTIONAL_USDC,
+        "would_live_notional_usdc": S1P_L_V149_NOTIONAL_USDC,
+        "entry_model": "post_only_maker_0bp",
+        "base_notional_mult": round(float(notional_mult), 4),
+    }
+    metrics.update(S1P_L_V149_PROFILE)
+    for key in (
+        "score",
+        "rng15",
+        "d30",
+        "adv3",
+        "d3",
+        "d5",
+        "rsi",
+        "bb_lower_dist_bp",
+        "vwap_dist_bp",
+        "pullback_from_recent_high_bp",
+        "price_above_or_reclaimed_vwap",
+        "reprice_wait_elapsed_seconds",
+    ):
+        value = _feature_value(features, key)
+        if value is not None:
+            metrics[key] = round(float(value), 4)
+    return metrics
+
+
 def build_s1p_l_enter_decision(features: Mapping[str, Any]) -> CodexV1Decision:
     lane = _s1p_l_lane()
     _matched, missing = _lane_matches(lane, features)
     size_mult = _size_mult(lane, features)
     notional_mult = _notional_mult(lane, features, size_mult)
+    metrics = _s1p_l_v149_metrics(features, notional_mult)
+    risk_tags = tuple(
+        dict.fromkeys(
+            (
+                *_risk_tags(lane, size_mult),
+                S1P_L_V149_PROFILE_POLICY_TAG,
+                "s1p_l_tiny_notional_25",
+                "tp6",
+                "sl15",
+                "be0",
+                "full_tp1",
+                "ttl180s",
+                "small_n_forward_watch",
+            )
+        )
+    )
     return CodexV1Decision(
         accepted=True,
         version=CODEX_V1_VERSION,
@@ -1414,14 +4383,16 @@ def build_s1p_l_enter_decision(features: Mapping[str, Any]) -> CodexV1Decision:
         lane_code=lane.lane_code,
         strategy=_string_feature(features, "strategy"),
         side=_string_feature(features, "side"),
-        entry_offset_bp=lane.entry_offset_bp,
+        entry_offset_bp=float(S1P_L_V149_PROFILE["entry_bp"]),
         size_mult=size_mult,
         notional_mult=notional_mult,
-        requested_notional_usdc=BASE_NOTIONAL_USDC * notional_mult,
+        requested_notional_usdc=S1P_L_V149_NOTIONAL_USDC,
         reason="s1p_l_match",
         regime="ordinary_pullback_long_pre_vwap",
         missing_features=tuple(sorted(missing)),
-        risk_tags=_risk_tags(lane, size_mult),
+        risk_tags=risk_tags,
+        metrics=metrics,
+        policy_tag=S1P_L_V149_PROFILE_POLICY_TAG,
     )
 
 
@@ -1577,6 +4548,9 @@ def _telegram_feature_snapshot(features: Mapping[str, Any]) -> str:
         "adv3",
         "d3",
         "d5",
+        "slope30",
+        "slope60",
+        "slope120",
         "range_bp",
         "rsi",
         "bb_lower_dist_bp",
@@ -1628,6 +4602,20 @@ def _populate_candle_derived_features(
         features["d3"] = _ret_bp(candles, i, 3)
     if "d5" not in features:
         features["d5"] = _ret_bp(candles, i, 5)
+    slope_proxy_applied = False
+    if i >= 1:
+        slope60 = _ret_bp(candles, i, 1)
+        if "slope60" not in features and "slope60_bp" not in features:
+            features["slope60"] = slope60
+            slope_proxy_applied = True
+        if "slope30" not in features and "slope30_bp" not in features:
+            features["slope30"] = slope60 * 0.5
+            slope_proxy_applied = True
+    if i >= 2 and "slope120" not in features and "slope120_bp" not in features:
+        features["slope120"] = _ret_bp(candles, i, 2)
+        slope_proxy_applied = True
+    if slope_proxy_applied:
+        features.setdefault("v1421_slope_source", "candle_close_proxy")
     if "rng15" not in features and i >= 15:
         window = candles[i - 15 : i]
         hi = max((_candle_value(c, "high") or close) for c in window)
@@ -1813,4 +4801,3 @@ def lane_code_from_name(name: str | None, side: str | None = None) -> str | None
     if name.startswith("anchor_"):
         return "ANCHOR"
     return name.split("_", 1)[0].upper()
-

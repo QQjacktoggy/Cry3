@@ -14,7 +14,18 @@ from src.gridbot.core.scheduler import Scheduler
 from src.gridbot.grid.analyzer import compute_metrics
 from src.gridbot.grid.models import GridMetrics
 from src.gridbot.mainnet.one_run import MainnetOneRunManager
+from src.gridbot.mainnet.v1459_app_runtime_v3 import build_v1459_app_runtime_v3
+from src.gridbot.mainnet.v1459_readonly_identity_client import V1459ReadOnlyIdentityClient
 from src.gridbot.storage.database import Database
+from src.gridbot.storage.v1464_promotion_repository import (
+    V1464PromotionRepository,
+)
+from src.gridbot.storage.v1465_w6a_profile_repository import (
+    V1465W6AProfileRepository,
+)
+from src.gridbot.storage.v1469_arm_observation_repository import (
+    V1469ArmObservationRepository,
+)
 from src.gridbot.storage.repositories import (
     AuditLogRepository,
     ConfigRepository,
@@ -26,7 +37,7 @@ from src.gridbot.storage.repositories import (
     PerformanceRepository,
     RecommendationRepository,
 )
-from src.gridbot.telegram.bot import build_telegram_app
+from src.gridbot.telegram.bot import build_telegram_app, sync_command_menu
 from src.gridbot.telegram.formatters import (
     format_full_report,
     format_recommendation,
@@ -44,6 +55,10 @@ class App:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.db = Database(settings.db_path)
+        # Telegram Lane Monitor reads large immutable evidence envelopes.  A
+        # dedicated connection keeps those reads out of the latency-critical
+        # mainnet run-cycle queue.
+        self.lane_monitor_db = Database(settings.db_path)
         self.binance = BinanceFuturesClient(settings)
         self.mainnet_settings = settings.model_copy(
             update={
@@ -66,6 +81,10 @@ class App:
         self.audit_repo = AuditLogRepository(self.db)
         self.mainnet_run_repo = MainnetRunRepository(self.db)
         self.config_repo = ConfigRepository(self.db)
+        self.v1464_promotion_repo = V1464PromotionRepository(self.db)
+        self.v1465_w6a_profile_repo = V1465W6AProfileRepository(self.db)
+        self.v1469_arm_observation_repo = V1469ArmObservationRepository(self.db)
+        self.v1469_arm_observation_ready = False
 
         # Fetcher
         self.fetcher = BinanceFetcher(
@@ -80,10 +99,80 @@ class App:
         self.telegram_app = None
         self.testnet_auto_trader = None
         self.mainnet_one_run_manager = None
+        self.adaptive_evidence_repo = None
+        self.adaptive_result_repo = None
+        self.v1459_observation_runtime = None
 
     async def initialize(self) -> None:
         """Initialize all components."""
+        # v1.4.64: validate the paid Codex boundary before opening the database
+        # or making any exchange connection.  A missing/mistyped live flag must
+        # stop startup instead of silently falling back to a legacy paid path.
+        self.settings.assert_mainnet_v1463_runtime_safety()
         await self.db.initialize()
+        if (
+            self.settings.telegram_bot_token
+            and getattr(self, "lane_monitor_db", None) is not None
+        ):
+            await self.lane_monitor_db.initialize()
+        if bool(self.settings.mainnet_codex_v1464_auto_promotion_enabled):
+            try:
+                fingerprint = (
+                    await self.v1464_promotion_repo.assert_schema_ready()
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "unsafe v1.4.64 promotion database schema: "
+                    f"{type(exc).__name__}:{str(exc)[:500]}"
+                ) from exc
+            logger.info(
+                "v1464_promotion_schema_ready",
+                fingerprint=fingerprint,
+            )
+        if bool(
+            self.settings.mainnet_codex_v1465_w6a_profile_shadow_enabled
+            or self.settings.mainnet_codex_v1465_w6a_profile_selector_enabled
+            or self.settings.mainnet_codex_v1465_w6a_profile_enforcement_enabled
+        ):
+            try:
+                fingerprint = (
+                    await self.v1465_w6a_profile_repo.assert_schema_ready()
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "unsafe v1.4.65 W6A profile database schema: "
+                    f"{type(exc).__name__}:{str(exc)[:500]}"
+                ) from exc
+            logger.info(
+                "v1465_w6a_profile_schema_ready",
+                fingerprint=fingerprint,
+            )
+        if bool(self.settings.mainnet_codex_v1469_observation_enabled):
+            try:
+                bucket_seconds = int(
+                    self.settings.mainnet_codex_v1469_observation_bucket_seconds
+                )
+                if not 30 <= bucket_seconds <= 15 * 60:
+                    raise ValueError(
+                        "observation bucket must be between 30 and 900 seconds"
+                    )
+                fingerprint = (
+                    await self.v1469_arm_observation_repo.assert_schema_ready()
+                )
+            except Exception as exc:  # passive telemetry must not stop paid bot
+                self.v1469_arm_observation_ready = False
+                logger.error(
+                    "v1469_observation_degraded",
+                    error=f"{type(exc).__name__}:{str(exc)[:500]}",
+                    paid_path_affected=False,
+                )
+            else:
+                self.v1469_arm_observation_ready = True
+                logger.info(
+                    "v1469_observation_schema_ready",
+                    fingerprint=fingerprint,
+                    bucket_seconds=bucket_seconds,
+                )
         await self.binance.connect()
         if self.settings.mainnet_one_run_enabled and self.settings.mainnet_api_key:
             await self.mainnet_binance.connect()
@@ -92,8 +181,20 @@ class App:
     async def shutdown(self) -> None:
         """Graceful shutdown."""
         self.scheduler.shutdown()
+        manager = getattr(self, "mainnet_one_run_manager", None)
+        if manager is not None:
+            try:
+                await manager.shutdown_v1469_observation_writer()
+            except Exception as exc:  # observation must not block shutdown
+                logger.warning(
+                    "v1469_observation_shutdown_failed",
+                    error=str(exc)[:300],
+                )
         await self.binance.close()
         await self.mainnet_binance.close()
+        lane_monitor_db = getattr(self, "lane_monitor_db", None)
+        if lane_monitor_db is not None:
+            await lane_monitor_db.close()
         await self.db.close()
         logger.info("app_shutdown")
 
@@ -402,6 +503,9 @@ class App:
 
     async def send_testnet_daily_report(self) -> None:
         """Send scheduled daily testnet P&L report via Telegram."""
+        if not self.settings.testnet_legacy_enabled:
+            logger.info("testnet_daily_report_skipped", reason="legacy_testnet_disabled")
+            return
         if not self.telegram_app or not self.settings.telegram_chat_id_int:
             logger.info("testnet_daily_report_skipped", reason="telegram_not_configured")
             return
@@ -462,6 +566,9 @@ class App:
                     gemini_analyzer=self.gemini,
                     db=self.db,
                 )
+                self.telegram_app.bot_data["lane_monitor_db"] = (
+                    self.lane_monitor_db
+                )
                 self.telegram_app.bot_data["scheduler"] = self.scheduler
             else:
                 logger.warning("telegram_disabled", msg="TELEGRAM_BOT_TOKEN not configured")
@@ -474,6 +581,23 @@ class App:
             if self.telegram_app:
                 self.telegram_app.bot_data["trader"] = self.testnet_auto_trader
 
+            v1459 = await build_v1459_app_runtime_v3(
+                settings=self.settings,
+                db=self.db,
+                read_only_identity_client=V1459ReadOnlyIdentityClient(self.mainnet_binance),
+                code_version="v1.4.59-continuation-observation-v2",
+            )
+            self.adaptive_evidence_repo = v1459.composition.evidence_repository
+            self.adaptive_result_repo = v1459.composition.result_repository
+            self.v1459_observation_runtime = v1459.runtime
+
+            from src.gridbot.mainnet.v1459_cohort_tracking import V1459CohortTracker
+
+            self.v1459_cohort_tracker = V1459CohortTracker(
+                db=self.db,
+                config_repo=self.config_repo,
+            )
+
             self.mainnet_one_run_manager = MainnetOneRunManager(
                 settings=self.settings,
                 client=self.mainnet_binance,
@@ -481,6 +605,15 @@ class App:
                 trade_repo=self.trade_repo,
                 telegram_app=self.telegram_app,
                 config_repo=self.config_repo,
+                observation_runtime=self.v1459_observation_runtime,
+                cohort_tracker=self.v1459_cohort_tracker,
+                promotion_repo=self.v1464_promotion_repo,
+                w6a_profile_repo=self.v1465_w6a_profile_repo,
+                arm_observation_repo=(
+                    self.v1469_arm_observation_repo
+                    if self.v1469_arm_observation_ready
+                    else None
+                ),
             )
             if self.telegram_app:
                 self.telegram_app.bot_data["mainnet_one_run_manager"] = self.mainnet_one_run_manager
@@ -496,7 +629,7 @@ class App:
                     self.run_analysis_cycle,
                     interval_minutes=30,  # monitor every 30 min
                 )
-            if self.settings.trading_mode == "testnet_live":
+            if self.settings.testnet_legacy_enabled and self.settings.trading_mode == "testnet_live":
                 self.scheduler.add_testnet_trade_job(
                     self.testnet_auto_trader.run_entry_cycle,
                     interval_minutes=self.settings.testnet_auto_trade_interval_minutes,
@@ -530,12 +663,14 @@ class App:
             if self.telegram_app:
                 logger.info("starting_telegram_bot")
                 await self.telegram_app.initialize()
+                # Manual startup does not invoke PTB post_init.
+                await sync_command_menu(self.telegram_app)
                 await self.telegram_app.start()
                 await self.telegram_app.updater.start_polling(drop_pending_updates=True)
             else:
                 logger.info("telegram_bot_skipped")
 
-            if self.settings.trading_mode == "testnet_live":
+            if self.settings.testnet_legacy_enabled and self.settings.trading_mode == "testnet_live":
                 logger.info("running_initial_testnet_trade_cycle")
                 await self.testnet_auto_trader.run_cycle()
 

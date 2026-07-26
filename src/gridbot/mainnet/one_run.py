@@ -6,8 +6,12 @@ import asyncio
 import hashlib
 import json
 import math
+import os
 import re
+import shutil
+import socket
 import time
+import uuid
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -23,7 +27,112 @@ from config.settings import Settings
 from scripts.backtest_wildcat_s1s5 import build_features
 from src.gridbot.binance.client import BinanceFuturesClient
 from src.gridbot.binance.models import PositionInfo
+from src.gridbot.mainnet.adaptive_fill_shadow_runtime import (
+    AdaptiveStupFillShadowTracker,
+)
+from src.gridbot.mainnet.v1459_live_reconciliation import (
+    build_reconciliation_payloads,
+)
+from src.gridbot.mainnet.v1459_manager_guard import V1459ManagerObservationGuard
+from src.gridbot.mainnet.v1459_cohort_tracking import V1459CohortTracker
+from src.gridbot.mainnet.v1459_reconciliation_hook import (
+    V1459TerminalReconciliationHook,
+)
+from src.gridbot.mainnet.v1459_adaptive_profiles import (
+    EntryPolicyDecision,
+    EntryPolicyInput,
+    EntryProfile,
+    ExitPolicyDecision,
+    ExitPolicyInput,
+    ExitProfile,
+    select_entry_profile,
+    select_exit_profile,
+)
+from src.gridbot.mainnet.v1459_profile_runtime import (
+    build_profile_config,
+    evaluate_enforcement_readiness,
+)
+from src.gridbot.mainnet.v1459_regime_runtime import (
+    INCUMBENT_FALLBACK,
+    RANGE_SCALP,
+    SHOCK_RISK_OFF,
+    TREND_RUNNER,
+    V1459ActionProfile,
+    V1459RegimeConfig,
+    V1459RegimeRuntime,
+    apply_v1459_regime_overlay,
+)
+from src.gridbot.mainnet.v1460_canary_contract import (
+    CanaryContractError,
+    CanaryKpiSnapshot,
+    evaluate_canary,
+)
+from src.gridbot.mainnet.v1460_lane_adaptive import (
+    AdaptiveActionMode,
+    LaneAdaptiveConfig,
+    LaneAdaptiveRiskInput,
+    WeakStateShadowEvidence,
+    apply_lane_adaptive_decision,
+    select_lane_adaptive_decision,
+)
+from src.gridbot.mainnet.v1460_weak_shadow_runtime import (
+    V1460WeakStupShadowTracker,
+    WeakShadowLabel,
+)
+from src.gridbot.mainnet.v1461_adaptive_gate import (
+    AdaptiveActionMode as V1461ActionMode,
+    AdaptiveGateConfig,
+    AdaptiveGateRiskInput,
+    GateEvidence as V1461GateEvidence,
+    RegimeCompatibility,
+    apply_adaptive_gate_decision,
+    promotion_key as v1461_promotion_key,
+    select_adaptive_gate_decision,
+)
+from src.gridbot.mainnet.v1461_shadow_evidence import (
+    ShadowCostModel as V1461ShadowCostModel,
+    evaluate_v1461_shadow_evidence,
+)
+from src.gridbot.mainnet.v1462_admission import (
+    PreRejectCandidateTicket,
+    V1462_POLICY_HASH,
+    build_pre_reject_candidate_ticket,
+    evaluate_strict_admission,
+)
+from src.gridbot.mainnet.v1462_lane_registry import (
+    CNL_SAFE_LINEAGE_KIND,
+    REGISTRY_HASH as V1462_REGISTRY_HASH,
+    REGISTRY_VERSION as V1462_REGISTRY_VERSION,
+    lane_definition_hash as v1462_lane_definition_hash,
+    lane_for as v1462_lane_for,
+)
+from src.gridbot.mainnet.v1464_adaptive_promotion import (
+    PromotionRiskInput,
+    stable_profile_hash,
+)
+from src.gridbot.mainnet.v1464_promotion_runtime import (
+    PromotionRegimeSnapshot,
+    V1464PromotionRuntime,
+    promotion_cohort_from_identity,
+    validate_exact_registry_identity,
+)
+from src.gridbot.mainnet.v1465_w6a_profile_selector import (
+    DEFAULT_W6A_WINDOW_CONFIG,
+    W6A_PROFILES,
+    classify_w6a_market_state,
+    parse_w6a_profile_evidence,
+    select_w6a_winner,
+)
+from src.gridbot.mainnet.fill_telemetry import emit_fill_v1_events
 from src.gridbot.storage.repositories import FuturesTradeRepository, MainnetRunRepository
+from src.gridbot.storage.v1465_w6a_profile_repository import (
+    V1465W6AProfileRepository,
+    W6ASelectionConflictError,
+    W6ASelector,
+)
+from src.gridbot.storage.v1469_arm_observation_repository import (
+    V1469ArmObservationRepository,
+)
 from src.gridbot.mainnet.tp_policy_shadow import (
     CODEX_TP_POLICY_VERSION,
     TP_POLICY_PATH_TTL_S,
@@ -34,6 +143,9 @@ from src.gridbot.mainnet.tp_policy_shadow import (
 from src.gridbot.strategy.codex_v1_live import (
     CODEX_V1_VERSION,
     CodexV1Decision,
+    apply_v1427_five_window_decision,
+    apply_v1430_loss_prune_decision,
+    apply_v1436_live_hotfix_decision,
     build_codex_v1_live_features,
     classify_codex_v133_no_lane_candidate,
     codex_v1_feature_gaps,
@@ -44,7 +156,24 @@ from src.gridbot.strategy.codex_v1_live import (
     live_preflight_rejections,
     select_codex_v1_lane,
 )
+from src.gridbot.mainnet.v1469_lane_observation import (
+    build_v1469_lane_observation,
+)
+from src.gridbot.mainnet.v1469_paired_evaluator import ShadowCostModel
+from src.gridbot.mainnet.v1469_paired_shadow_runtime import (
+    V1469PairedShadowRuntime,
+)
+from src.gridbot.strategy.codex_adaptive_controller import (
+    AdaptiveControllerConfig,
+    AdaptiveControllerInput,
+    AdaptiveRoute,
+    CodexAdaptiveController,
+    ExecutionQuality,
+    ExecutorAction,
+)
 from src.gridbot.strategy.long_pullback import Candle
+from src.gridbot.strategy.market_state import classify_market_state
+from src.gridbot.strategy.market_state import classify_market_state
 from src.gridbot.strategy.wildcat_live import (
     WildcatLiveDecision,
     evaluate_dca_guard,
@@ -57,6 +186,19 @@ logger = get_logger(__name__)
 PARTIAL_TP_SUFFIX = "_tp1"
 MID_TP_SUFFIX = "_tp2"
 FINAL_TP_SUFFIX = "_tp3"
+BE_SL_EXIT_REASONS = {"BE_SL", "TP1_BE_SL"}
+V1459_RUNNER_SOFT_EXIT_REASONS = {
+    "CODEX_MICRO_TRAIL",
+    "CODEX_V1427_TIME_LOCK",
+    "CODEX_V1429_SIDE_OVERRIDE_FAST_LOCK",
+    "CODEX_V1437_STUPS_THIN_LOCK",
+    "CODEX_V1438_STUPS_THIN_LOCK",
+    "CODEX_V1439_SHADOW_THIN_LOCK",
+    "CODEX_V1441_MIXED_THIN_LOCK",
+    "CODEX_V1448_STUPS_FAST_SCALP_LOCK",
+    "STUPS_TIME_PROFIT_LOCK",
+    "STUPS_STALL_PROFIT_LOCK",
+}
 
 # app_config key for the catch-up/rescue runtime kill-switch (Telegram /rescue).
 RESCUE_CONFIG_KEY = "mainnet_rescue_enabled"
@@ -64,13 +206,177 @@ RESCUE_CONFIG_KEY = "mainnet_rescue_enabled"
 # single-ticket notional and loop cumulative-loss protection cap.
 NOTIONAL_CONFIG_KEY = "mainnet_notional_usdc"
 LOOP_LOSS_CAP_CONFIG_KEY = "mainnet_loop_loss_cap_usdc"
+LOOP_COOLDOWN_PENDING_EVENT = "loop_cooldown_pending"
+LOOP_REARM_AUTHORITY_EVENT = "loop_rearm_authority"
 DCA_ENABLED_CONFIG_KEY = "mainnet_dca_enabled"
+ADAPTIVE_CONTINUOUS = "adaptive_continuous"
+V1459_ADAPTIVE_CANARY_CONTRACT = "v1459_adaptive_live_canary_20x72h_v2"
+V1460_ADAPTIVE_CANARY_CONTRACT = "v1460_lane_adaptive_risk_first_20x72h_v1"
+V1461_ADAPTIVE_CANARY_CONTRACT = "v1461_bidirectional_regime_gate_20x72h_v1"
+V1460_CANCEL_RECONCILE_PENDING_KEY = "v1460_cancel_reconcile_pending"
+# Exchange order-history status can lag openOrders/cancel responses.  Keep the
+# paid path frozen while proof converges, but do not turn one transient NEW
+# snapshot into an irreversible session halt.  This window affects only
+# read-only reconciliation; it never extends entry TTL or permits replacement.
+V1460_CANCEL_RECONCILE_TIMEOUT_MS = 30_000
+V1461_AGGTRADE_SETTLEMENT_LAG_MS = 2_000
+ADAPTIVE_SYMBOL = "ETHUSDC"
+ADAPTIVE_NOTIONAL_USDC = 50.0
+ADAPTIVE_NET_LOSS_CAP_USDC = 1.0
+ADAPTIVE_HIGH_WATER_GIVEBACK_USDC = 1.0
+ADAPTIVE_TARGET_PAID_CLOSED_FILLS = 20
+ADAPTIVE_MAX_DURATION_SECONDS = 72 * 60 * 60
+ADAPTIVE_CHECKPOINT_RUNS = 5
+ADAPTIVE_CHECKPOINT_SECONDS = 6 * 60 * 60
+ADAPTIVE_STUP_FILL_SHADOW_VARIANTS = ("STUP_E2", "STUP_E1", "STUP_E0")
+ADAPTIVE_STUP_FILL_SHADOW_OFFSETS_BP = {"STUP_E2": 2.0, "STUP_E1": 1.0, "STUP_E0": 0.0}
 # Telegram-selectable choices (buttons in _buttons()).
 NOTIONAL_CHOICES = (200, 300, 500, 1000)
 LOOP_LOSS_CAP_CHOICES = (0.0, 2.0, 5.0, 10.0, 20.0)
+MAINNET_MIN_ENTRY_NOTIONAL_USDC = 25.0
+
+V143_PROFILE_SOURCE = "reports/v1420_profile_explorer_2026-06-28_29.md"
+WPR_V143_PROFILE_POLICY_TAG = "v145_wpr_profit_lock_exec"
+WPR_V1415_STRONG_FALL_POLICY_TAG = "v1415_wpr_strong_fall_deep_entry"
+WPR_V1419_POLICY_TAG = "v1420_current_market_fixed_buckets_candidate"
+WPR_V1419_DISCOUNT_MIXED_BLOCK_REASON = "v1420_wpr_discount_mixed_bad_block"
+WPR_V1419_FALLING_BAD_BLOCK_REASON = "v1420_wpr_falling_bad_slice_block"
+WPR_V1419_FALLING_RUNNER_POLICY_TAG = "v1420_wpr_falling_discount_runner"
+WPR_V1419_DEEP_STABLE_POLICY_TAG = "v1420_wpr_deep_discount_stable_tight"
+WPR_V1420_DISCOUNT_MIXED_RUNNER_POLICY_TAG = "v1420_wpr_discount_mixed_runner"
+WPR_V1420_DELAYED_RECLAIM_TIGHT_POLICY_TAG = "v1420_wpr_discount_delayed_reclaim_tight"
+WPR_V1420_CONTINUATION_HIGH_RANGE_BLOCK_REASON = "v1420_wpr_continuation_hirange_block"
+WPR_V1420_CONTINUATION_FILTERED_POLICY_TAG = "v1420_wpr_falling_continuation_probe_filtered"
+WPR_V143_PROFILES: dict[str, dict[str, Any]] = {
+    "CNL-WPR-L:deep_discount_stable": {
+        "entry_bp": 2.0,
+        "tp1_bp": 8.0,
+        "sl_bp": 8.0,
+        "be_bp": 2.0,
+        "partial_exit_pct": 0.40,
+        "ttl_s": 180,
+        "replay_n": 29,
+        "replay_wr": 0.875,
+        "replay_net_usdc": 0.22248635,
+        "no_fill_recovery_tp": 11,
+        "no_fill_recovery_loss": 2,
+        "no_fill_recovery_still_no_fill": 8,
+        "no_fill_recovery_watch": "entry0_ttl180_shadow",
+    },
+    "CNL-WPR-L:discount_mixed": {
+        "entry_bp": 0.0,
+        "tp1_bp": 5.0,
+        "full_tp_bp": 16.0,
+        "sl_bp": 15.0,
+        "be_bp": 2.0,
+        "partial_exit_pct": 0.45,
+        "ttl_s": 150,
+        "replay_n": 26,
+        "replay_wr": 0.9230769230769231,
+        "replay_net_usdc": 0.245,
+        "no_fill_recovery_tp": 0,
+        "no_fill_recovery_loss": 1,
+        "no_fill_recovery_still_no_fill": 6,
+        "profit_lock_mfe_bp": 10.0,
+        "profit_lock_floor_bp": 6.0,
+        "profit_lock_giveback_bp": 4.0,
+        "adaptive_tp_engine": "v1420_wpr_discount_mixed_runner",
+        "profile_patch": WPR_V1420_DISCOUNT_MIXED_RUNNER_POLICY_TAG,
+        "live_observation": "v1420_discount_mixed_selective_runner_tp5_full16",
+        "pre_tp_profit_lock_enabled": False,
+        "small_n_forward_watch": True,
+    },
+    "CNL-WPR-L:falling_discount_trap": {
+        "entry_bp": 0.0,
+        "tp1_bp": 4.0,
+        "full_tp_bp": 10.0,
+        "sl_bp": 15.0,
+        "be_bp": 4.0,
+        "partial_exit_pct": 0.60,
+        "ttl_s": 90,
+        "replay_n": 6,
+        "replay_wr": 1.0,
+        "replay_net_usdc": 0.45000000,
+        "small_n_forward_watch": True,
+        "profit_lock_mfe_bp": 6.0,
+        "profit_lock_floor_bp": 6.0,
+        "profit_lock_giveback_bp": 2.0,
+        "adaptive_tp_engine": "v1416_wpr_scalp_runner",
+        "live_observation": "falling_trap_mfe4p3_missed_tp8",
+        "no_fill_recovery_tp": 0,
+        "no_fill_recovery_loss": 0,
+        "no_fill_recovery_still_no_fill": 0,
+    },
+    "CNL-WPR-L:falling_continuation_probe": {
+        "entry_bp": 3.0,
+        "tp1_bp": 6.0,
+        "full_tp_bp": 8.0,
+        "sl_bp": 10.0,
+        "be_bp": 2.0,
+        "partial_exit_pct": 0.40,
+        "ttl_s": 60,
+        "replay_n": 2,
+        "replay_wr": 1.0,
+        "replay_net_usdc": 0.072,
+        "small_n_forward_watch": True,
+        "profit_lock_mfe_bp": 6.0,
+        "profit_lock_floor_bp": 6.0,
+        "profit_lock_giveback_bp": 2.0,
+        "adaptive_tp_engine": "v1420_wpr_falling_continuation_probe_filtered",
+        "profile_patch": WPR_V1420_CONTINUATION_FILTERED_POLICY_TAG,
+        "live_observation": "v1420_continuation_probe_high_range_dump_blocked",
+        "no_fill_recovery_tp": 0,
+        "no_fill_recovery_loss": 0,
+        "no_fill_recovery_still_no_fill": 0,
+    },
+    "CNL-WPR-L:discount_delayed_reclaim": {
+        "entry_bp": 3.0,
+        "tp1_bp": 5.0,
+        "full_tp_bp": 8.0,
+        "sl_bp": 8.0,
+        "be_bp": 2.0,
+        "partial_exit_pct": 0.70,
+        "ttl_s": 75,
+        "replay_n": 1,
+        "replay_wr": 1.0,
+        "replay_net_usdc": 0.0145,
+        "small_n_forward_watch": True,
+        "profit_lock_mfe_bp": 10.0,
+        "profit_lock_floor_bp": 6.0,
+        "profit_lock_giveback_bp": 4.0,
+        "adaptive_tp_engine": "v1420_wpr_discount_delayed_reclaim_tight",
+        "profile_patch": WPR_V1420_DELAYED_RECLAIM_TIGHT_POLICY_TAG,
+        "live_observation": "v1420_discount_delayed_reclaim_single_loss_tight_profile",
+        "no_fill_recovery_tp": 0,
+        "no_fill_recovery_loss": 0,
+        "no_fill_recovery_still_no_fill": 0,
+    },
+    "CNL-WPR-L:fast_reclaim": {
+        "entry_bp": 0.0,
+        "tp1_bp": 6.0,
+        "sl_bp": 6.0,
+        "be_bp": 0.0,
+        "partial_exit_pct": 1.0,
+        "ttl_s": 45,
+        "replay_n": 2,
+        "replay_wr": 1.0,
+        "replay_net_usdc": 0.06000000,
+        "small_n_forward_watch": True,
+        "no_fill_recovery_tp": 0,
+        "no_fill_recovery_loss": 0,
+        "no_fill_recovery_still_no_fill": 0,
+    },
+}
 
 
-TERMINAL_STATUSES = {"COMPLETED", "ENTRY_EXPIRED", "FAILED", "CANCELLED", "EMERGENCY_CLOSED"}
+TERMINAL_STATUSES = {
+    "COMPLETED",
+    "ENTRY_EXPIRED",
+    "ENTRY_REJECTED",
+    "FAILED",
+    "CANCELLED",
+    "EMERGENCY_CLOSED",
+}
 
 
 class GTXSlippageExceeded(Exception):
@@ -86,6 +392,8 @@ class RunStatus:
 class MainnetOneRunManager:
     """Owns one Telegram-approved mainnet lifecycle at a time."""
 
+    V1469_OBSERVATION_SEEN_MAX = 4096
+    V1469_OBSERVATION_MAX_INFLIGHT = 32
     CODEX_V1_SHADOW_SAMPLE_COOLDOWN_S = 90
     CODEX_V1_SHADOW_ENTRY_REF_MOVE_BP = 5.0
     CODEX_V1_SHADOW_MAX_SAMPLES_PER_RUN = 12
@@ -107,8 +415,18 @@ class MainnetOneRunManager:
         telegram_app=None,
         trade_repo: FuturesTradeRepository | None = None,
         config_repo=None,
+        observation_runtime=None,
+        cohort_tracker: V1459CohortTracker | None = None,
+        promotion_repo=None,
+        w6a_profile_repo: V1465W6AProfileRepository | None = None,
+        arm_observation_repo: V1469ArmObservationRepository | None = None,
     ) -> None:
         self._settings = settings
+        self._v1459_guard = V1459ManagerObservationGuard(observation_runtime)
+        self._v1459_reconciliation_hook = V1459TerminalReconciliationHook(
+            observation_runtime
+        )
+        self._v1459_pause_event_run_ids: set[str] = set()
         if (
             CODEX_V1_VERSION.startswith(("_codex_v1.3.7E", "_codex_v1.3.8", "_codex_v1.3.9", "_codex_v1.4"))
             and bool(getattr(self._settings, "mainnet_codex_tp_policy_live_override_enabled", False))
@@ -129,6 +447,78 @@ class MainnetOneRunManager:
         # app_config (key RESCUE_CONFIG_KEY) so it survives restarts and is
         # shared with the Telegram /rescue command. None = not yet loaded.
         self._config_repo = config_repo
+        # The cohort tracker is deliberately separate from _adaptive_session:
+        # operational stops/restarts must not reset the 20-fill measurement.
+        self._v1459_cohort_tracker = cohort_tracker
+        self._v1464_promotion_runtime: V1464PromotionRuntime | None = None
+        self._v1469_arm_observation_repo = arm_observation_repo
+        # These contain bucket-level dedup keys, not durable opportunity IDs.
+        self._v1469_observed_opportunity_ids: set[str] = set()
+        self._v1469_observation_inflight_ids: set[str] = set()
+        self._v1469_observation_tasks: set[asyncio.Task[None]] = set()
+        self._v1469_observation_dropped = 0
+        self._v1469_observation_repo_missing_logged = False
+        self._v1469_paired_shadow_runtime = (
+            V1469PairedShadowRuntime(arm_observation_repo)
+            if arm_observation_repo is not None
+            and bool(
+                getattr(
+                    settings,
+                    "mainnet_codex_v1469_paired_shadow_enabled",
+                    False,
+                )
+            )
+            else None
+        )
+        self._v1469_paired_shadow_rehydrated = False
+        if promotion_repo is not None:
+            self._v1464_promotion_runtime = V1464PromotionRuntime(
+                promotion_repo,
+                settings=settings,
+                boot_id=(
+                    f"{int(time.time() * 1000)}-{uuid.uuid4().hex}"
+                ),
+                owner_id=f"{socket.gethostname()}:{os.getpid()}",
+            )
+        elif bool(
+            getattr(settings, "mainnet_codex_v1464_auto_promotion_enabled", False)
+        ):
+            raise RuntimeError(
+                "v1.4.64 automatic promotion requires durable promotion repository"
+            )
+        self._v1465_w6a_profile_repo = w6a_profile_repo
+        self._v1465_boot_id = f"{int(time.time() * 1000)}-{uuid.uuid4().hex}"
+        self._v1465_owner_id = f"{socket.gethostname()}:{os.getpid()}"
+        # A process restart must not trust an old LIVE lease until the
+        # immutable start/outcome ledger has been checked for pending work.
+        self._v1465_profile_ledger_unsafe = bool(
+            w6a_profile_repo is not None
+            and getattr(
+                settings,
+                "mainnet_codex_v1465_w6a_profile_enforcement_enabled",
+                False,
+            )
+        )
+        self._v1465_profile_ledger_checked_once = False
+        # Historical evidence repair is useful but must never occupy the
+        # 10-second entry/exit scheduler.  One idle-only task handles it with
+        # a cadence; live run management always has priority.
+        self._idle_maintenance_task: asyncio.Task | None = None
+        self._idle_maintenance_next_at_ms: int = 0
+        self._idle_recovery_task: asyncio.Task | None = None
+        self._db_capacity_next_check_ms: int = 0
+        self._db_capacity_last_alert_level: str | None = None
+        self._db_capacity_last_alert_ms: int = 0
+        if bool(
+            getattr(
+                settings,
+                "mainnet_codex_v1465_w6a_profile_enforcement_enabled",
+                False,
+            )
+        ) and w6a_profile_repo is None:
+            raise RuntimeError(
+                "v1.4.65 W6A profile selector requires durable repository"
+            )
         self._rescue_enabled: bool | None = None
         # Telegram-adjustable runtime config (notional ticket size and the
         # loop loss-protection cap), persisted in app_config so they survive
@@ -170,6 +560,9 @@ class MainnetOneRunManager:
         # path re-evaluates every 10s and would otherwise flood run_events
         # while the drift persists.  logger.info still fires every evaluation.
         self._dca_drift_event_keys: set[tuple[str, int]] = set()
+        # Recovery skip audit: log every evaluation, but persist one event per
+        # run/path/reason/layer so loop review has counts without DB spam.
+        self._recovery_skip_event_keys: set[tuple[str, str, str, int]] = set()
         # Trailing take-profit state, keyed by run_id.  _trail_peak holds the
         # best favorable mark price seen since entry (highest for LONG, lowest
         # for SHORT); _trail_armed marks runs whose peak has crossed the arm
@@ -183,6 +576,12 @@ class MainnetOneRunManager:
         # owns the close; the other side skips).
         self._trail_watch_tasks: dict[str, asyncio.Task] = {}
         self._trail_exiting: set[str] = set()
+        # V1.4.34 STUP-S fast floor lock is intentionally one-shot per run;
+        # if the maker-only attempt cannot fill, TP/SL remain in charge.
+        self._stups_fast_floor_lock_attempted: set[str] = set()
+        # V1.4.35 staged STUP-S TP1 floor replacement is also one-shot; if the
+        # maker floor does not fill, the normal TP/SL sync takes over again.
+        self._stups_tp1_floor_lock_attempted: set[str] = set()
         # DCA guard cooldown: maps run_id -> ms timestamp of last guard block.
         # Prevents regime-flicker from bypassing the guard within the cooldown
         # window (mainnet_dca_guard_cooldown_seconds).
@@ -195,6 +594,7 @@ class MainnetOneRunManager:
         self._final_taken: set[str] = set()
         # W6A no-TP1 dynamic exit variables (v1.2.12):
         self._w6a_price_history: dict[str, list[tuple[float, float]]] = {}
+        self._codex_time_lock_price_history: dict[str, list[tuple[float, float]]] = {}
         self._w6a_shadow_recorded: set[str] = set()
         self._w6a_stop_tightened_runs: dict[str, float] = {}
         self._w6a_no_bounce_exiting: set[str] = set()
@@ -215,6 +615,7 @@ class MainnetOneRunManager:
         self._loop_total: int = 0
         self._loop_completed: int = 0
         self._loop_run_ids: list[str] = []
+        self._loop_authority_id: str | None = None
         # Cooldown tracker for loop chains: key = (side, strategy_label),
         # value = cooldown_until_ms.  After an SL exit, the same side +
         # strategy combination is blocked for the configured duration so
@@ -230,6 +631,13 @@ class MainnetOneRunManager:
         # cooldown expires.  Without this, the loop would stall forever after a
         # cooldown skip (the COMPLETED run is gone and nothing re-arms it).
         self._loop_resume: dict | None = None
+        # Adaptive sessions are process-local.  An active run records enough
+        # metadata for safe restart management, but a restart never resumes
+        # continuous re-arming.
+        self._adaptive_session: dict[str, Any] | None = None
+        self._adaptive_last_review: dict[str, Any] | None = None
+        self._adaptive_lifecycle_lock = asyncio.Lock()
+        self._adaptive_handled_terminal_run_ids: set[str] = set()
         # Run ids that have already emitted an entry-trend-guard skip notice, so
         # an armed run skipping a counter-trend signal every cycle does not spam
         # Telegram/DB until either the trend flips or signal_timeout fires.
@@ -244,18 +652,99 @@ class MainnetOneRunManager:
         self._dir_loss_times: dict[str, list[float]] = {}   # side -> [loss_ms]
         self._dir_throttle_until: dict[str, float] = {}     # side -> block_until_ms
         self._dir_throttle_notified: set[str] = set()       # run_ids already TG-notified
+        # Codex state throttle (V1.4.13): state-keyed loss timestamps and block
+        # deadlines so CNL-WPR-L:falling_discount_trap can pause without
+        # blocking healthier CNL-WPR-L states such as discount_mixed.
+        self._codex_state_loss_times: dict[str, list[float]] = {}
+        self._codex_state_throttle_until: dict[str, float] = {}
+        self._codex_state_throttle_meta: dict[str, dict[str, Any]] = {}
+        self._codex_state_throttle_notified: set[str] = set()
         # Codex v1 live gate: track run ids already notified to avoid per-cycle
         # Telegram spam while an ARMED run waits for an accepted lane.
         self._codex_v1_guard_notified: set[str] = set()
         self._codex_v1_reprice_shadow: dict[str, dict[str, Any]] = {}
         self._codex_v1_shadow_samples: dict[str, dict[str, Any]] = {}
         self._codex_v1_shadow_outcomes_logged: set[str] = set()
+        self._v1463_shadow_rehydrated_runs: set[str] = set()
+        self._v1463_terminal_reconcile_needed = False
+        self._v1463_terminal_startup_reconciled = False
+        self._v1463_opportunity_reconcile_needed = True
+        self._v1463_opportunity_startup_reconciled = False
+        self._v1464_terminal_opportunity_ids: set[str] = set()
+        self._v1464_paid_terminal_reconciled = False
         self._codex_v132_tp_policy_samples: dict[str, dict[str, Any]] = {}
         self._codex_v132_tp_policy_outcomes_logged: set[str] = set()
         self._codex_v132_rehydrated_runs: set[str] = set()
+        self._v132_terminal_reconcile_needed = False
+        self._v132_terminal_startup_reconciled = False
         self._codex_v1_shadow_opportunities: dict[str, dict[str, Any]] = {}
+        self._v1462_durable_event_keys: set[tuple[str, ...]] = set()
+        # Consecutive, exact-cohort observations used by the v1.4.64
+        # submit-time regime gate.  A stream change resets the chain; old
+        # observations from a prior state can never confirm the new state.
+        self._v1464_regime_observations: dict[
+            tuple[str, str, str, str],
+            tuple[str, list[int]],
+        ] = {}
         self._codex_v1_shadow_last_sample_by_scope: dict[str, dict[str, Any]] = {}
         self._codex_v1_shadow_sample_counts_by_run: dict[str, int] = {}
+        self._adaptive_gate_notified_opportunities: set[str] = set()
+        self._adaptive_opportunity_ids: set[str] = set()
+        self._adaptive_stup_fill_shadow_started: set[str] = set()
+        self._adaptive_stup_fill_shadow_samples: dict[str, dict[str, Any]] = {}
+        self._adaptive_stup_fill_shadow_unavailable_notified: set[str] = set()
+        self._adaptive_stup_fill_shadow_lock = asyncio.Lock()
+        # v1.4.59 finite profiles default off.  These sets only dedupe
+        # transition evidence and enforce a one-cycle RUNNER extension budget;
+        # they never carry prices, quantities, or order authority.
+        self._v1459_profile_last_transition: dict[tuple[str, str], tuple[str, str, bool]] = {}
+        self._v1459_runner_extension_used: set[str] = set()
+        # Regime hysteresis belongs to one symbol/lane stream.  Keeping a
+        # separate FSM per stream prevents one lane's confirmations or stale
+        # state from affecting another lane; both maps are reset at the start
+        # of every adaptive session.
+        self._v1459_regime_runtimes: dict[tuple[str, str], V1459RegimeRuntime] = {}
+        # Observation authority must never advance the paid lane FSM above.
+        # v1.4.69 therefore owns a symbol-level, shadow-only FSM whose input is
+        # derived causally from candles rather than from first-match ownership.
+        self._v1469_observation_regime_runtimes: dict[
+            str, V1459RegimeRuntime
+        ] = {}
+        self._v1459_regime_last_transition: dict[
+            tuple[str, str, str], tuple[str, str, str]
+        ] = {}
+        self._v1460_policy_last_transition: dict[
+            tuple[str, str, str], tuple[str, str, str, str]
+        ] = {}
+        self._v1461_policy_last_transition: dict[
+            tuple[str, str, str, str], tuple[str, str, str, str]
+        ] = {}
+        self._v1461_token_lock = asyncio.Lock()
+        self._v1461_shadow_aggtrade_caches: dict[str, dict[str, Any]] = {}
+        self._v1460_weak_shadow_samples: dict[str, dict[str, Any]] = {}
+        self._v1460_weak_shadow_started: set[str] = set()
+        self._v1460_weak_shadow_lock = asyncio.Lock()
+        self._v1460_weak_shadow_tracker = V1460WeakStupShadowTracker(
+            client=self._client,
+            repo=self._repo,
+            settings=self._settings,
+            on_outcome=self._v1460_on_weak_shadow_outcome,
+            samples=self._v1460_weak_shadow_samples,
+            started_groups=self._v1460_weak_shadow_started,
+            lock=self._v1460_weak_shadow_lock,
+        )
+        self._adaptive_stup_fill_shadow_tracker = AdaptiveStupFillShadowTracker(
+            client=self._client,
+            repo=self._repo,
+            settings=self._settings,
+            version=CODEX_V1_VERSION,
+            variants=ADAPTIVE_STUP_FILL_SHADOW_OFFSETS_BP,
+            count_event=self._adaptive_fill_shadow_count_event,
+            samples=self._adaptive_stup_fill_shadow_samples,
+            started_groups=self._adaptive_stup_fill_shadow_started,
+            unavailable_groups=self._adaptive_stup_fill_shadow_unavailable_notified,
+            lock=self._adaptive_stup_fill_shadow_lock,
+        )
         self._codex_survival_watch_notified: set[str] = set()
         # #24: loop-scoped block — set to a wall-clock ms deadline whenever the
         # rescue spike gate skips a cycle.  While now < deadline, NORMAL S1
@@ -324,10 +813,10 @@ class MainnetOneRunManager:
                     ]
                 )
             # Determine if latest run is cancellable (not in terminal state)
-            terminal_states = {"COMPLETED", "FAILED", "CANCELLED"}
             latest_cancellable = (
                 latest
-                and latest.get("status") not in terminal_states
+                and str(latest.get("status") or "").upper()
+                not in TERMINAL_STATUSES
                 and latest.get("run_id") != (active.get("run_id") if active else None)
             )
             if latest:
@@ -351,6 +840,8 @@ class MainnetOneRunManager:
 
     async def arm(self, actor: str = "telegram", loop_count: int = 1) -> str:
         await self._ensure_runtime_config_loaded()
+        if self._adaptive_session or self._adaptive_lifecycle_lock.locked():
+            return "⚠️ Adaptive session 啟動或執行中，拒絕 finite loop arm。"
         if not self._settings.mainnet_one_run_enabled:
             return "❌ Mainnet one-run 尚未啟用。請設定 MAINNET_ONE_RUN_ENABLED=true。"
         if not self._settings.mainnet_api_key or not self._settings.mainnet_api_secret:
@@ -381,6 +872,9 @@ class MainnetOneRunManager:
             self._loop_run_ids = [run_id]
             self._loss_streak = 0
             self._loop_net_pnl = 0.0
+            self._loop_authority_id = "loopauth_" + hashlib.sha256(
+                f"{run_id}:{actor}:{loop_count}".encode("utf-8")
+            ).hexdigest()[:24]
         else:
             self._loop_run_ids.append(run_id)
         params = {
@@ -393,7 +887,11 @@ class MainnetOneRunManager:
             "leverage": self._settings.mainnet_leverage,
             "maker_first": True,
             "loop_count": int(loop_count),
+            "loop_index": 1,
             "loop_loss_cap_usdc": self._loop_loss_cap,
+            "loop_authority_id": self._loop_authority_id,
+            "loop_rearm_authorized": True,
+            "loop_authority_updated_ms": int(time.time() * 1000),
         }
         await self._repo.create_run(
             {
@@ -405,6 +903,16 @@ class MainnetOneRunManager:
             }
         )
         await self._repo.log_event(run_id, "armed", params)
+        await self._repo.log_event(
+            run_id,
+            LOOP_REARM_AUTHORITY_EVENT,
+            {
+                "authority_id": self._loop_authority_id,
+                "authorized": True,
+                "source": actor,
+                "loop_count": int(loop_count),
+            },
+        )
         # For loop chains, show position (next/N) instead of (1/N).
         if self._loop_total > 1:
             next_index = (self._loop_completed + 1) if is_chain else 1
@@ -423,7 +931,12 @@ class MainnetOneRunManager:
         active = await self._repo.get_active_run()
         if not active:
             return "目前沒有 active mainnet run。"
-        was_in_loop = self._loop_total > 0
+        active_params = self._run_params(active)
+        was_in_loop = bool(
+            self._loop_total > 0
+            or self._loop_total_from_params(active_params) > 1
+            or self._is_adaptive_run(active)
+        )
         loop_completed = self._loop_completed
         loop_total = self._loop_total
         symbol = active["symbol"]
@@ -434,18 +947,45 @@ class MainnetOneRunManager:
                     await self._client.cancel_order(symbol, int(order["orderId"]))
         except Exception as exc:  # noqa: BLE001
             logger.warning("mainnet_one_run_cancel_orders_failed", error=str(exc))
+        authority_persisted = True
+        if was_in_loop:
+            authority_persisted = await self._persist_loop_rearm_authority(
+                active,
+                authorized=False,
+                source="telegram_cancel",
+            )
         await self._expire_codex_v1_shadow_samples(active, "telegram_cancel")
+        try:
+            await self._drop_codex_v132_tp_policy_samples(
+                str(active.get("run_id") or ""),
+                "telegram_cancel",
+            )
+        except Exception as exc:  # noqa: BLE001 - cancellation safety first
+            self._v132_terminal_reconcile_needed = True
+            logger.warning(
+                "codex_v132_cancel_drop_failed",
+                run_id=active.get("run_id"),
+                error=str(exc)[:200],
+            )
         await self._repo.complete_run(active["run_id"], "CANCELLED", "telegram_cancel")
         await self._repo.log_event(active["run_id"], "cancelled", {"source": "telegram"})
+        if self._is_adaptive_run(active):
+            await self._stop_adaptive_session(active, "manual_cancel", unexpected=False)
         # Clear loop state on cancel
         self._loop_total = 0
         self._loop_completed = 0
         self._loop_run_ids = []
         self._loop_net_pnl = 0.0
+        self._loop_resume = None
         if was_in_loop:
             return (
                 f"🛑 已取消 run：<code>{escape(active['run_id'])}</code>。\n"
                 f"Loop 已中止（已完成 {loop_completed}/{loop_total}）。"
+                + (
+                    ""
+                    if authority_persisted
+                    else "\n⚠️ Durable stop 寫入失敗；重啟服務前請先確認 DB。"
+                )
             )
         return f"🛑 已取消 run：<code>{escape(active['run_id'])}</code>。"
 
@@ -458,38 +998,6132 @@ class MainnetOneRunManager:
         loop state (e.g. after a previous run FAILED before chain-arm
         could fire).
         """
-        if self._loop_total == 0:
+        active = await self._repo.get_active_run()
+        if self._adaptive_session:
+            async with self._adaptive_lifecycle_lock:
+                active = await self._repo.get_active_run()
+                session = self._adaptive_session
+                if not session:
+                    return "目前沒有進行中的 Adaptive loop。"
+                session["stop_requested"] = True
+                session["rearm_enabled"] = False
+                authority_persisted = True
+                if active:
+                    authority_persisted = await self._persist_loop_rearm_authority(
+                        active,
+                        authorized=False,
+                        source="telegram_stop_adaptive_loop",
+                    )
+                if not active:
+                    await self._stop_adaptive_session(
+                        None, "manual_stop", unexpected=False
+                    )
+                    return "⏹ <b>Adaptive loop 已停止</b>。"
+                return (
+                    "⏹ <b>Adaptive loop 已停止 re-arm</b>；active run 會管理至 flat。"
+                    + (
+                        ""
+                        if authority_persisted
+                        else "\n⚠️ Durable stop 寫入失敗；重啟服務前請先確認 DB。"
+                    )
+                )
+        anchor = active
+        if not isinstance(anchor, Mapping):
+            latest = await self._repo.get_latest_run()
+            anchor = latest if isinstance(latest, Mapping) else None
+        anchor_params = self._run_params(anchor or {})
+        persisted_total = self._loop_total_from_params(anchor_params)
+        if self._loop_total == 0 and persisted_total <= 1:
             return "目前沒有進行中的 loop。"
-        was_in_loop_total = self._loop_total
+        was_in_loop_total = self._loop_total or persisted_total
         was_completed = self._loop_completed
-        n_cooldowns = len(
-            [v for v in self._loop_cooldowns.values() if v > int(time.time() * 1000)]
-        )
+        now_ms = int(time.time() * 1000)
+        n_cooldowns = len([v for v in self._loop_cooldowns.values() if v > now_ms])
+        n_state_throttles = len([v for v in self._codex_state_throttle_until.values() if v > now_ms])
+        authority_persisted = True
+        if isinstance(anchor, Mapping):
+            authority_persisted = await self._persist_loop_rearm_authority(
+                anchor,
+                authorized=False,
+                source="telegram_stop_loop",
+            )
         self._loop_total = 0
         self._loop_completed = 0
         self._loop_run_ids = []
         self._loop_cooldowns.clear()
+        self._codex_state_loss_times.clear()
+        self._codex_state_throttle_until.clear()
+        self._codex_state_throttle_meta.clear()
         self._loss_streak = 0
         self._loop_net_pnl = 0.0
+        self._loop_resume = None
         logger.info(
             "mainnet_one_run_loop_stopped",
             completed=was_completed,
             total=was_in_loop_total,
             cooldowns_cleared=n_cooldowns,
+            state_throttles_cleared=n_state_throttles,
+        )
+        persistence_note = (
+            ""
+            if authority_persisted
+            else "\n⚠️ Durable stop 寫入失敗；本 process 已停止，但重啟前請先確認 DB。"
         )
         return (
             f"⏹ <b>Loop 已停止</b>\n"
             f"先前進度：<b>{was_completed}/{was_in_loop_total}</b>\n"
-            f"Cooldown 已清空：<b>{n_cooldowns}</b> 項。\n"
+            f"Cooldown 已清空：<b>{n_cooldowns}</b> 項；State 暫緩清空：<b>{n_state_throttles}</b> 項。\n"
             "目前 active run 不受影響，會繼續執行到結束。"
+            f"{persistence_note}"
         )
+
+    def _kick_idle_recovery(self) -> None:
+        """Run restart/loop handoff recovery off the scheduler's critical path."""
+
+        task = self._idle_recovery_task
+        if task is not None and not task.done():
+            return
+        self._idle_recovery_task = asyncio.create_task(
+            self._run_idle_recovery(),
+            name="cry3-idle-recovery",
+        )
+
+    async def _run_idle_recovery(self) -> None:
+        """Preserve v1.4.66 rearm semantics without delaying a scheduler tick."""
+
+        try:
+            if self._v1459_entry_paused():
+                await self._v1459_note_cycle_pause(None, "ENTRY_PAUSED")
+                return
+            if await self._maybe_resume_idle_adaptive_session():
+                return
+            # No active run: a cooldown-deferred finite loop is permitted to
+            # resume only through its existing durable authority checks.
+            await self._maybe_rehydrate_pending_loop_from_latest_run()
+            await self._maybe_resume_pending_loop()
+        except Exception as exc:  # noqa: BLE001 - retry on the next idle tick
+            logger.warning("mainnet_idle_recovery_failed", error=str(exc)[:200])
+
+    def _kick_idle_maintenance(self) -> None:
+        """Start one rate-limited durable-evidence repair task while idle."""
+
+        now_ms = int(time.time() * 1000)
+        task = self._idle_maintenance_task
+        if task is not None and not task.done():
+            return
+        if now_ms < self._idle_maintenance_next_at_ms:
+            return
+        interval_s = max(
+            15,
+            int(getattr(self._settings, "mainnet_maintenance_reconcile_interval_seconds", 60)),
+        )
+        self._idle_maintenance_next_at_ms = now_ms + interval_s * 1000
+        self._idle_maintenance_task = asyncio.create_task(
+            self._run_idle_maintenance(),
+            name="cry3-idle-evidence-maintenance",
+        )
+
+    async def _run_idle_maintenance(self) -> None:
+        """Repair durable evidence without blocking a live order-management tick."""
+
+        started = time.monotonic()
+        steps = (
+            ("v1464_paid_terminal_reconcile_failed", self._v1464_reconcile_paid_terminals),
+            ("v1465_w6a_profile_ledger_reconcile_failed", self._reconcile_v1465_w6a_profile_ledger),
+            ("v1463_terminal_shadow_reconcile_failed", self._reconcile_recent_terminal_v1463_shadow_samples),
+            ("v1463_unresolved_shadow_opportunity_reconcile_failed", self._reconcile_unresolved_v1462_shadow_opportunities),
+            ("codex_v132_terminal_reconcile_failed", self._reconcile_terminal_v132_tp_policy_samples),
+        )
+        for event, operation in steps:
+            try:
+                await operation()
+            except Exception as exc:  # noqa: BLE001 - retry on the next idle pass
+                logger.warning(event, error=str(exc)[:200])
+        elapsed_s = time.monotonic() - started
+        slow_after_s = float(
+            getattr(self._settings, "mainnet_maintenance_slow_warning_seconds", 5.0)
+        )
+        logger.info("mainnet_idle_maintenance_complete", elapsed_s=round(elapsed_s, 3))
+        if elapsed_s >= max(0.1, slow_after_s):
+            logger.warning(
+                "mainnet_idle_maintenance_slow",
+                elapsed_s=round(elapsed_s, 3),
+                next_after_s=max(15, int(getattr(self._settings, "mainnet_maintenance_reconcile_interval_seconds", 60))),
+            )
+
+    async def _observe_db_capacity(self) -> None:
+        """Emit a rate-limited Telegram warning before the evidence DB fills disk.
+
+        This is intentionally observation-only: it never removes rows, VACUUMs,
+        changes promotion state, or pauses a paid run.
+        """
+
+        if not bool(getattr(self._settings, "mainnet_db_capacity_guard_enabled", True)):
+            return
+        now_ms = int(time.time() * 1000)
+        if now_ms < self._db_capacity_next_check_ms:
+            return
+        interval_s = max(
+            30,
+            int(getattr(self._settings, "mainnet_db_capacity_check_interval_seconds", 300)),
+        )
+        self._db_capacity_next_check_ms = now_ms + interval_s * 1000
+        database = getattr(self._repo, "_db", None)
+        raw_path = getattr(database, "_db_path", None)
+        if not raw_path:
+            logger.debug("mainnet_db_capacity_unavailable", reason="db_path_unavailable")
+            return
+        try:
+            db_path = Path(str(raw_path))
+            free_bytes = int(shutil.disk_usage(db_path.parent).free)
+            db_bytes = sum(
+                candidate.stat().st_size
+                for candidate in (db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm"))
+                if candidate.exists()
+            )
+        except OSError as exc:
+            logger.warning("mainnet_db_capacity_probe_failed", error=str(exc)[:200])
+            return
+
+        free_mb = free_bytes / (1024 * 1024)
+        warn_mb = max(1, int(getattr(self._settings, "mainnet_db_capacity_warn_free_mb", 1536)))
+        critical_mb = max(1, int(getattr(self._settings, "mainnet_db_capacity_critical_free_mb", 768)))
+        level = "CRITICAL" if free_mb <= critical_mb else "WARN" if free_mb <= warn_mb else None
+        logger.info(
+            "mainnet_db_capacity",
+            db_path=str(db_path),
+            db_mb=round(db_bytes / (1024 * 1024), 1),
+            free_mb=round(free_mb, 1),
+            level=level or "OK",
+        )
+        if level is None:
+            self._db_capacity_last_alert_level = None
+            return
+        cooldown_ms = max(
+            60,
+            int(getattr(self._settings, "mainnet_db_capacity_alert_cooldown_seconds", 6 * 60 * 60)),
+        ) * 1000
+        changed = level != self._db_capacity_last_alert_level
+        due = now_ms - self._db_capacity_last_alert_ms >= cooldown_ms
+        if not changed and not due:
+            return
+        self._db_capacity_last_alert_level = level
+        self._db_capacity_last_alert_ms = now_ms
+        await self._notify(
+            f"⚠️ <b>Adaptive DB 容量 {level}</b>\n"
+            f"DB：<code>{escape(str(db_path))}</code>\n"
+            f"DB 大小：<b>{db_bytes / (1024 * 1024):.1f} MB</b>\n"
+            f"剩餘磁碟：<b>{free_mb:.1f} MB</b>\n"
+            "僅告警，未刪除證據、未 VACUUM、未改變交易或轉正狀態。"
+        )
+
+    @staticmethod
+    def _loop_rearm_authorized(params: Mapping[str, Any] | None) -> bool:
+        if not isinstance(params, Mapping):
+            return True
+        # Legacy active loops predate the authority field and remain crash-
+        # rehydratable.  Every v1.4.63 manual stop writes an explicit False.
+        return params.get("loop_rearm_authorized") is not False
+
+    async def _persist_loop_rearm_authority(
+        self,
+        row: Mapping[str, Any],
+        *,
+        authorized: bool,
+        source: str,
+    ) -> bool:
+        run_id = str(row.get("run_id") or "")
+        if not run_id:
+            return False
+        params = dict(self._run_params(row) or {})
+        authority_id = str(
+            params.get("loop_authority_id")
+            or self._loop_authority_id
+            or (
+                "loopauth_"
+                + hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:24]
+            )
+        )
+        updated_ms = int(time.time() * 1000)
+        params.update(
+            {
+                "loop_authority_id": authority_id,
+                "loop_rearm_authorized": bool(authorized),
+                "loop_authority_updated_ms": updated_ms,
+                "loop_authority_source": source,
+            }
+        )
+        params_persisted = False
+        try:
+            await self._repo.update_run(run_id, params_json=params)
+            params_persisted = True
+        except Exception as exc:  # noqa: BLE001 - memory still stops this process
+            logger.error(
+                "mainnet_one_run_loop_authority_update_failed",
+                run_id=run_id,
+                authorized=authorized,
+                error=str(exc)[:200],
+            )
+        self._loop_authority_id = authority_id
+        event_persisted = False
+        try:
+            await self._repo.log_event(
+                run_id,
+                LOOP_REARM_AUTHORITY_EVENT,
+                {
+                    "authority_id": authority_id,
+                    "authorized": bool(authorized),
+                    "source": source,
+                    "updated_at_ms": updated_ms,
+                },
+            )
+            event_persisted = True
+        except Exception as exc:  # noqa: BLE001 - params_json is authoritative
+            logger.warning(
+                "mainnet_one_run_loop_authority_event_failed",
+                run_id=run_id,
+                authorized=authorized,
+                error=str(exc)[:200],
+            )
+        return params_persisted or event_persisted
+
+    async def _loop_rearm_allowed_for_row(
+        self,
+        row: Mapping[str, Any],
+    ) -> bool:
+        params = self._run_params(row)
+        modern_authority = bool(
+            isinstance(params, Mapping)
+            and (
+                "loop_authority_id" in params
+                or "loop_rearm_authorized" in params
+            )
+        )
+        if not self._loop_rearm_authorized(params):
+            return False
+        get_events_by_types = getattr(self._repo, "get_events_by_types", None)
+        run_id = str(row.get("run_id") or "")
+        if not run_id:
+            return not modern_authority
+        if not callable(get_events_by_types):
+            return not modern_authority
+        try:
+            try:
+                events = await get_events_by_types(
+                    run_id,
+                    (LOOP_REARM_AUTHORITY_EVENT,),
+                    limit=None,
+                )
+            except TypeError:
+                # Compatibility for test/legacy repository shims.  Production
+                # supports an unbounded typed query.
+                events = await get_events_by_types(
+                    run_id,
+                    (LOOP_REARM_AUTHORITY_EVENT,),
+                    limit=2_147_483_647,
+                )
+        except Exception as exc:  # noqa: BLE001 - modern ambiguity fails closed
+            logger.warning(
+                "mainnet_one_run_loop_authority_read_failed",
+                run_id=run_id,
+                error=str(exc)[:200],
+            )
+            return not modern_authority
+        authorities: list[tuple[int, int, Mapping[str, Any]]] = []
+        for index, event in enumerate(events or []):
+            if not isinstance(event, Mapping):
+                continue
+            if str(event.get("event_type") or "") != LOOP_REARM_AUTHORITY_EVENT:
+                continue
+            details = self._event_details(event)
+            if not isinstance(details, Mapping):
+                continue
+            try:
+                timestamp = int(
+                    details.get("updated_at_ms")
+                    or event.get("event_time_ms")
+                    or 0
+                )
+            except (TypeError, ValueError):
+                timestamp = 0
+            authorities.append((timestamp, -index, details))
+        if not authorities:
+            return True
+        _timestamp, _order, latest = max(authorities, key=lambda item: (item[0], item[1]))
+        return latest.get("authorized") is not False
+
+    def _is_adaptive_run(self, run: Mapping[str, Any] | None) -> bool:
+        params = self._run_params(run or {})
+        adaptive = params.get("adaptive") if isinstance(params, Mapping) else None
+        return bool(
+            isinstance(params, Mapping)
+            and (
+                params.get("mode") == ADAPTIVE_CONTINUOUS
+                or (isinstance(adaptive, Mapping) and adaptive.get("mode") == ADAPTIVE_CONTINUOUS)
+            )
+        )
+
+    def _v1459_known_owned_adaptive_run(
+        self, run: Mapping[str, Any] | None
+    ) -> bool:
+        if not self._is_adaptive_run(run):
+            return False
+        run_id = str((run or {}).get("run_id") or "")
+        prefix = str(self._settings.mainnet_client_order_prefix or "").rstrip("_")
+        return bool(prefix and run_id.startswith(f"{prefix}_"))
+
+    def _v1459_entry_paused(self) -> bool:
+        return bool(
+            self._v1459_guard.entry_paused
+            or self._v1459_reconciliation_hook.entry_paused
+        )
+
+    def _v1459_blocked_reason(self) -> str | None:
+        return (
+            self._v1459_guard.blocked_reason
+            or self._v1459_reconciliation_hook.blocked_reason
+        )
+
+    def _v1459_profile_candidate_active(
+        self, run: Mapping[str, Any] | None
+    ) -> bool:
+        """Admit owned adaptive Codex runs, including pre-signal ARMED state."""
+
+        return bool(
+            getattr(
+                self._settings,
+                "mainnet_codex_v1459_candidate_selector_enabled",
+                False,
+            )
+            and self._is_adaptive_run(run)
+            and run is not None
+            and (
+                self._run_uses_codex_v1(run)
+                or (
+                    str(run.get("status") or "").upper() == "ARMED"
+                    and self._codex_v1_execution_enabled()
+                )
+            )
+        )
+
+    def _v1459_profile_enforcement_readiness(self):
+        return evaluate_enforcement_readiness(
+            self._settings,
+            guard_enabled=self._v1459_guard.enabled,
+            reconciliation_enabled=self._v1459_reconciliation_hook.enabled,
+        )
+
+    def _v1459_profile_enforcement_active(self) -> bool:
+        if not bool(
+            getattr(
+                self._settings,
+                "mainnet_codex_v1459_live_enforcement_enabled",
+                False,
+            )
+        ):
+            return False
+        return bool(self._v1459_profile_enforcement_readiness().ready)
+
+    def _v1460_candidate_active(
+        self, run: Mapping[str, Any] | None
+    ) -> bool:
+        """Return whether the v1.4.60 lane matrix may annotate this run."""
+
+        return bool(
+            getattr(
+                self._settings,
+                "mainnet_codex_v1460_candidate_selector_enabled",
+                False,
+            )
+            and getattr(
+                self._settings,
+                "mainnet_codex_v1460_lane_matrix_enabled",
+                False,
+            )
+            and (
+                self._v1459_profile_candidate_active(run)
+                or (
+                    bool(
+                        getattr(
+                            self._settings,
+                            "mainnet_codex_v1462_strict_live_allowlist_enabled",
+                            False,
+                        )
+                    )
+                    and run is not None
+                    and (
+                        self._run_uses_codex_v1(run)
+                        or self._codex_v1_execution_enabled()
+                    )
+                )
+            )
+        )
+
+    def _v1460_enforcement_readiness(self) -> tuple[bool, tuple[str, ...]]:
+        requested = bool(
+            getattr(
+                self._settings,
+                "mainnet_codex_v1460_live_enforcement_enabled",
+                False,
+            )
+        )
+        if not requested:
+            return False, ()
+        missing: list[str] = []
+        required_true = (
+            "mainnet_codex_v1459_candidate_selector_enabled",
+            "mainnet_codex_v1459_live_enforcement_enabled",
+            "mainnet_codex_v1460_candidate_selector_enabled",
+            "mainnet_codex_v1460_lane_matrix_enabled",
+            "mainnet_codex_v1460_shadow_evidence_enabled",
+        )
+        for setting_name in required_true:
+            if not bool(getattr(self._settings, setting_name, False)):
+                missing.append(setting_name)
+        required_false = (
+            "mainnet_codex_v1459_regime_switch_enabled",
+            "mainnet_codex_v1459_runner_enabled",
+            "mainnet_codex_v1459_one_step_reprice_enabled",
+            "mainnet_codex_v1460_runner_enabled",
+            "mainnet_codex_v1460_one_step_reprice_enabled",
+        )
+        for setting_name in required_false:
+            if bool(getattr(self._settings, setting_name, False)):
+                missing.append(f"{setting_name}=false")
+        required_exact = {
+            "mainnet_codex_v1460_target_paid_closed_fills": 20,
+            "mainnet_codex_v1460_max_duration_seconds": 72 * 60 * 60,
+            "mainnet_codex_v1460_checkpoint_fills": 5,
+        }
+        for setting_name, expected in required_exact.items():
+            try:
+                actual = int(getattr(self._settings, setting_name, expected))
+            except (TypeError, ValueError, OverflowError):
+                actual = None
+            if actual != expected:
+                missing.append(f"{setting_name}={expected}")
+        profile_readiness = self._v1459_profile_enforcement_readiness()
+        if not profile_readiness.ready:
+            missing.extend(profile_readiness.missing)
+        try:
+            self._v1460_policy_hash()
+        except Exception as exc:  # noqa: BLE001 - invalid numeric contract is not live-ready
+            missing.append(f"v1460_policy_contract:{str(exc)[:120]}")
+        return True, tuple(dict.fromkeys(missing))
+
+    def _v1460_enforcement_active(
+        self, run: Mapping[str, Any] | None
+    ) -> bool:
+        requested, missing = self._v1460_enforcement_readiness()
+        return bool(
+            requested
+            and not missing
+            and self._v1460_candidate_active(run)
+        )
+
+    def _v1460_entry_safety_active(
+        self, run: Mapping[str, Any] | None
+    ) -> bool:
+        """Execution hardening mutates exchange flow only in reviewed mode."""
+
+        return self._v1460_enforcement_active(run)
+
+    def _v1461_candidate_active(self, run: Mapping[str, Any] | None) -> bool:
+        return bool(
+            getattr(
+                self._settings,
+                "mainnet_codex_v1461_candidate_selector_enabled",
+                False,
+            )
+            and getattr(
+                self._settings,
+                "mainnet_codex_v1461_regime_gate_enabled",
+                False,
+            )
+            and self._v1459_profile_candidate_active(run)
+        )
+
+    def _v1462_strict_live_allowlist_active(
+        self, run: Mapping[str, Any] | None
+    ) -> bool:
+        return bool(
+            getattr(
+                self._settings,
+                "mainnet_codex_v1462_strict_live_allowlist_enabled",
+                False,
+            )
+            and run is not None
+            and (
+                self._run_uses_codex_v1(run)
+                or self._codex_v1_execution_enabled()
+            )
+        )
+
+    def _v1462_shadow_all_active(
+        self, run: Mapping[str, Any] | None
+    ) -> bool:
+        return bool(
+            getattr(
+                self._settings,
+                "mainnet_codex_v1462_shadow_all_enabled",
+                False,
+            )
+            and run is not None
+            and (
+                self._run_uses_codex_v1(run)
+                or self._codex_v1_execution_enabled()
+            )
+        )
+
+    def _v1462_observation_selected(self) -> bool:
+        return bool(
+            getattr(
+                self._settings,
+                "mainnet_codex_v1462_strict_live_allowlist_enabled",
+                False,
+            )
+            or getattr(
+                self._settings,
+                "mainnet_codex_v1462_shadow_all_enabled",
+                False,
+            )
+        )
+
+    def _v1469_observation_active(
+        self, run: Mapping[str, Any] | None
+    ) -> bool:
+        """Return whether the observation-only all-lane ledger is selected."""
+
+        return bool(
+            getattr(
+                self._settings,
+                "mainnet_codex_v1469_observation_enabled",
+                False,
+            )
+            and run is not None
+            and (
+                self._run_uses_codex_v1(run)
+                or self._codex_v1_execution_enabled()
+            )
+        )
+
+    async def _v1469_record_lane_observation(
+        self,
+        run: Mapping[str, Any],
+        features: Mapping[str, Any],
+        *,
+        selector_decision: CodexV1Decision,
+        effective_decision: CodexV1Decision,
+        reference_price: float | None = None,
+        regime_market_state: str | None = None,
+    ) -> None:
+        """Queue all compatible lanes without waiting on the paid path."""
+
+        if not self._v1469_observation_active(run):
+            return
+        repository = self._v1469_arm_observation_repo
+        if repository is None:
+            if not self._v1469_observation_repo_missing_logged:
+                self._v1469_observation_repo_missing_logged = True
+                logger.error(
+                    "v1469_observation_repository_unavailable",
+                    run_id=run.get("run_id"),
+                )
+            return
+
+        observed_at_ms = int(time.time() * 1000)
+        try:
+            bucket_seconds = int(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1469_observation_bucket_seconds",
+                    2 * 60,
+                )
+            )
+        except (TypeError, ValueError, OverflowError):
+            bucket_seconds = 0
+        if bucket_seconds <= 0:
+            logger.error(
+                "v1469_observation_invalid_bucket",
+                run_id=run.get("run_id"),
+                bucket_seconds=bucket_seconds,
+            )
+            return
+
+        try:
+            observation_features = dict(features)
+            detailed_state = str(
+                regime_market_state
+                or observation_features.get("v1469_regime_market_state")
+                or observation_features.get("market_state")
+                or "UNCERTAIN"
+            ).strip().upper()
+            if not detailed_state:
+                detailed_state = "UNCERTAIN"
+            observation_features["market_state"] = detailed_state
+            observation_features[
+                "v1469_regime_market_state"
+            ] = detailed_state
+            try:
+                causal_regime = self._v1469_observation_coarse_regime(
+                    run,
+                    observation_features,
+                    market_state=detailed_state,
+                    observed_at_ms=observed_at_ms,
+                )
+            except Exception as exc:  # noqa: BLE001 - shadow fails closed
+                causal_regime = "UNCERTAIN"
+                logger.error(
+                    "v1469_causal_regime_unavailable",
+                    run_id=run.get("run_id"),
+                    error=str(exc)[:300],
+                )
+            observation_features[
+                "v1469_regime_state"
+            ] = causal_regime
+            feature_snapshot = self._codex_v1_payload_features(
+                observation_features
+            )
+            # A predicate-only match has already proven the fields required by
+            # that matched lane.  codex_v1_feature_gaps() is a union across
+            # every lane for the same side/strategy, so using it here would let
+            # an unrelated lane's optional field mark all valid matches
+            # DATA_BLOCKED.  Only opportunity-wide causal fields belong here.
+            feature_gaps: list[str] = []
+            try:
+                normalized_reference_price = float(reference_price)
+            except (TypeError, ValueError, OverflowError):
+                normalized_reference_price = math.nan
+            if math.isfinite(normalized_reference_price) and normalized_reference_price > 0:
+                feature_snapshot["signal_reference_price"] = round(
+                    normalized_reference_price, 12
+                )
+            elif bool(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1469_paired_shadow_enabled",
+                    False,
+                )
+            ):
+                feature_gaps.append("signal_reference_price")
+            batch = build_v1469_lane_observation(
+                environment="MAINNET",
+                run_id=str(run.get("run_id") or ""),
+                observed_at_ms=observed_at_ms,
+                bucket_seconds=bucket_seconds,
+                features=observation_features,
+                feature_snapshot=feature_snapshot,
+                selector_decision=selector_decision,
+                effective_decision=effective_decision,
+                feature_gaps=tuple(sorted(set(feature_gaps))),
+            )
+            dedup_key = batch.dedup_key
+            if (
+                dedup_key in self._v1469_observed_opportunity_ids
+                or dedup_key in self._v1469_observation_inflight_ids
+            ):
+                return
+        except Exception as exc:  # noqa: BLE001 - observation has no paid authority
+            logger.error(
+                "v1469_lane_observation_build_failed",
+                run_id=run.get("run_id"),
+                error=str(exc)[:300],
+            )
+            return
+
+        if (
+            len(self._v1469_observation_tasks)
+            >= self.V1469_OBSERVATION_MAX_INFLIGHT
+        ):
+            self._v1469_observation_dropped += 1
+            logger.warning(
+                "v1469_lane_observation_queue_full",
+                run_id=run.get("run_id"),
+                inflight=len(self._v1469_observation_tasks),
+                dropped=self._v1469_observation_dropped,
+            )
+            return
+
+        self._v1469_observation_inflight_ids.add(dedup_key)
+        task = asyncio.create_task(
+            self._v1469_persist_lane_observation(
+                repository=repository,
+                run_id=str(run.get("run_id") or ""),
+                dedup_key=dedup_key,
+                opportunity=batch.opportunity,
+                candidates=batch.candidates,
+            ),
+            name=f"cry3-v1469-observation-{batch.opportunity_id[-12:]}",
+        )
+        self._v1469_observation_tasks.add(task)
+        task.add_done_callback(self._v1469_observation_tasks.discard)
+
+    async def _v1469_persist_lane_observation(
+        self,
+        *,
+        repository: V1469ArmObservationRepository,
+        run_id: str,
+        dedup_key: str,
+        opportunity: Mapping[str, Any],
+        candidates: Sequence[Mapping[str, Any]],
+    ) -> None:
+        """Persist one bundle off the scheduler/order critical path."""
+
+        try:
+            persistence_result = await repository.insert_observation(
+                opportunity,
+                tuple(candidates),
+            )
+            paired_runtime = getattr(
+                self, "_v1469_paired_shadow_runtime", None
+            )
+            source_replay = bool(
+                isinstance(persistence_result, Mapping)
+                and persistence_result.get("source_replay")
+            )
+            if paired_runtime is not None and not source_replay:
+                paired_summary = (
+                    await paired_runtime.start_observation(
+                        opportunity,
+                        tuple(candidates),
+                    )
+                )
+                if int(paired_summary.get("capacity_dropped") or 0) > 0:
+                    logger.error(
+                        "v1469_paired_shadow_capacity_dropped",
+                        run_id=run_id,
+                        opportunity_id=opportunity.get(
+                            "opportunity_id"
+                        ),
+                        **paired_summary,
+                    )
+            if (
+                len(self._v1469_observed_opportunity_ids)
+                >= self.V1469_OBSERVATION_SEEN_MAX
+            ):
+                # Durable IDs are immutable and repository writes idempotent.
+                # Clearing this fast-path cache merely permits a later no-op.
+                self._v1469_observed_opportunity_ids.clear()
+            self._v1469_observed_opportunity_ids.add(dedup_key)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - no paid authority
+            logger.error(
+                "v1469_lane_observation_persistence_failed",
+                run_id=run_id,
+                error=str(exc)[:300],
+            )
+        finally:
+            self._v1469_observation_inflight_ids.discard(dedup_key)
+
+    async def shutdown_v1469_observation_writer(
+        self,
+        *,
+        timeout_seconds: float = 5.0,
+    ) -> None:
+        """Drain observation writes before DB close, then cancel safely."""
+
+        pending = {
+            task for task in self._v1469_observation_tasks if not task.done()
+        }
+        if not pending:
+            return
+        done, still_pending = await asyncio.wait(
+            pending,
+            timeout=max(0.0, float(timeout_seconds)),
+        )
+        for task in done:
+            try:
+                task.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:  # defensive: worker normally absorbs errors
+                logger.error(
+                    "v1469_observation_shutdown_task_failed",
+                    error=str(exc)[:300],
+                )
+        if not still_pending:
+            return
+        for task in still_pending:
+            task.cancel()
+        await asyncio.gather(*still_pending, return_exceptions=True)
+        logger.warning(
+            "v1469_observation_shutdown_cancelled",
+            cancelled=len(still_pending),
+        )
+
+    @staticmethod
+    def _v1469_symbol_market_state(candles: Sequence[Candle]) -> str:
+        """Return one causal, owner-independent coarse state for a symbol."""
+
+        if not candles:
+            return "UNCERTAIN"
+        market = classify_market_state(list(candles), len(candles) - 1)
+        if market is None or str(market.risk_mode).lower() == "off":
+            return "UNCERTAIN"
+        return {
+            "up": "TREND_UP",
+            "down": "TREND_DOWN",
+            "range": "RANGE",
+        }.get(str(market.trend).lower(), "UNCERTAIN")
+
+    def _v1469_observation_regime_config(self) -> V1459RegimeConfig:
+        """Build the isolated v1.4.69 shadow regime confirmation contract."""
+
+        return V1459RegimeConfig(
+            confirmations=max(
+                1,
+                int(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v1469_regime_confirmations",
+                        2,
+                    )
+                ),
+            ),
+            min_dwell_ms=max(
+                0,
+                int(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v1469_regime_min_dwell_seconds",
+                        15,
+                    )
+                ),
+            )
+            * 1000,
+            stale_after_ms=max(
+                1,
+                int(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v1469_regime_max_age_seconds",
+                        60,
+                    )
+                ),
+            )
+            * 1000,
+        )
+
+    def _v1469_observation_coarse_regime(
+        self,
+        run: Mapping[str, Any],
+        features: Mapping[str, Any],
+        *,
+        market_state: str,
+        observed_at_ms: int,
+    ) -> str:
+        """Advance only the symbol-level shadow FSM and return its snapshot."""
+
+        symbol = str(
+            run.get("symbol")
+            or features.get("symbol")
+            or getattr(self._settings, "mainnet_symbol", "")
+            or ""
+        ).strip().upper()
+        if not symbol:
+            return "UNCERTAIN"
+        runtimes = getattr(
+            self, "_v1469_observation_regime_runtimes", None
+        )
+        if runtimes is None:
+            runtimes = {}
+            self._v1469_observation_regime_runtimes = runtimes
+        runtime = runtimes.get(symbol)
+        if runtime is None:
+            runtime = V1459RegimeRuntime(
+                self._v1469_observation_regime_config()
+            )
+            runtimes[symbol] = runtime
+        try:
+            feature_age_s = max(
+                0.0, float(features.get("feature_age_seconds") or 0.0)
+            )
+        except (TypeError, ValueError, OverflowError):
+            feature_age_s = 0.0
+        event_time_ms = max(
+            0, int(observed_at_ms) - int(feature_age_s * 1000)
+        )
+        overlay = runtime.evaluate(
+            str(market_state or "UNCERTAIN"),
+            decision_time_ms=int(observed_at_ms),
+            event_time_ms=event_time_ms,
+            available_at_ms=int(observed_at_ms),
+        )
+        return overlay.state.value
+
+    def _v1462_execution_controls_safe(self) -> bool:
+        closed_flags = (
+            "mainnet_codex_v1459_runner_enabled",
+            "mainnet_codex_v1459_one_step_reprice_enabled",
+            "mainnet_codex_v1460_runner_enabled",
+            "mainnet_codex_v1460_one_step_reprice_enabled",
+            "mainnet_codex_v1461_runner_enabled",
+            "mainnet_codex_v1461_one_step_reprice_enabled",
+        )
+        return bool(
+            not any(bool(getattr(self._settings, name, False)) for name in closed_flags)
+            and not bool(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_recovery_enabled",
+                    False,
+                )
+            )
+            and not bool(getattr(self, "_dca_enabled", False))
+        )
+
+    def _v1462_candidate_ticket(
+        self,
+        raw_decision: CodexV1Decision,
+        effective_decision: CodexV1Decision,
+    ) -> PreRejectCandidateTicket:
+        try:
+            fallback_notional = float(
+                self._settings.mainnet_effective_entry_notional_usdc
+            )
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            fallback_notional = MAINNET_MIN_ENTRY_NOTIONAL_USDC
+        return build_pre_reject_candidate_ticket(
+            asdict(raw_decision),
+            asdict(effective_decision),
+            fallback_notional_usdc=max(
+                MAINNET_MIN_ENTRY_NOTIONAL_USDC,
+                fallback_notional,
+            ),
+        )
+
+    def _v1463_frozen_effective_plan(
+        self,
+        decision: WildcatLiveDecision,
+        codex_decision: CodexV1Decision,
+        ticket: PreRejectCandidateTicket,
+    ) -> dict[str, Any] | None:
+        """Freeze the same side/geometry/horizon the paid executor would use."""
+
+        try:
+            plan_codex = replace(
+                codex_decision,
+                entry_offset_bp=float(ticket.entry_offset_bp),
+                size_mult=float(ticket.size_mult),
+                notional_mult=float(ticket.notional_mult),
+                requested_notional_usdc=float(ticket.requested_notional_usdc),
+            )
+            effective = self._apply_codex_v1_decision(decision, plan_codex)
+        except Exception as exc:  # noqa: BLE001 - evidence must fail closed
+            logger.warning(
+                "v1463_shadow_effective_plan_failed",
+                lane=ticket.effective_lane,
+                error=str(exc)[:200],
+            )
+            return None
+        side = str(effective.side or "").upper()
+        if side not in {"LONG", "SHORT"}:
+            return None
+        entries = list(effective.signal.entries or [])
+        entry = self._codex_v1_shadow_price(entries[0] if entries else None)
+        stop = self._codex_v1_shadow_price(effective.signal.stop_loss)
+        if entry is None or stop is None:
+            return None
+        try:
+            tp1_pct = float(effective.partial_tp_pct)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(tp1_pct) or tp1_pct <= 0.0:
+            return None
+        tp1 = entry * (1.0 + tp1_pct if side == "LONG" else 1.0 - tp1_pct)
+        tp1 = self._codex_v1_shadow_price(tp1)
+        if tp1 is None:
+            return None
+        full_tp = self._codex_v1_shadow_price(
+            (effective.signal.take_profits or [None])[0]
+        )
+        try:
+            applied_notional_usdc = float(effective.signal.planned_notional_usdc)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(applied_notional_usdc) or applied_notional_usdc <= 0.0:
+            return None
+
+        action = dict(ticket.action_parameters)
+        try:
+            profile_entry_ttl = int(float(action.get("ttl_s")))
+        except (TypeError, ValueError, OverflowError):
+            profile_entry_ttl = 0
+        default_entry_ttl = max(
+            1,
+            int(getattr(self._settings, "mainnet_entry_order_ttl_seconds", 45) or 45),
+        )
+        entry_ttl_s = profile_entry_ttl if profile_entry_ttl > 0 else default_entry_ttl
+        metrics = (
+            codex_decision.metrics
+            if isinstance(codex_decision.metrics, Mapping)
+            else {}
+        )
+        if (
+            str(metrics.get("v1441_research_selector_action") or "").upper()
+            == "STRICT_TTL_OR_FILL_POLICY"
+            and str(ticket.effective_lane or "").upper() == "CNL-WPR-L"
+        ):
+            entry_ttl_s = min(
+                entry_ttl_s,
+                max(
+                    1,
+                    int(
+                        getattr(
+                            self._settings,
+                            "mainnet_codex_v1442_cnl_wpr_strict_entry_ttl_seconds",
+                            20,
+                        )
+                        or 20
+                    ),
+                ),
+            )
+        elif profile_entry_ttl <= 0:
+            entry_ttl_s = self._codex_v1_entry_ttl_overrides().get(
+                str(ticket.effective_lane or "").upper(),
+                entry_ttl_s,
+            )
+
+        hold_value = action.get("max_hold_s", action.get("hold_s"))
+        try:
+            outcome_ttl_s = int(float(hold_value))
+        except (TypeError, ValueError, OverflowError):
+            outcome_ttl_s = 0
+        if outcome_ttl_s <= 0:
+            try:
+                outcome_ttl_s = int(effective.max_holding_bars) * 60
+            except (TypeError, ValueError, OverflowError):
+                outcome_ttl_s = 0
+        outcome_ttl_s = max(entry_ttl_s, outcome_ttl_s or entry_ttl_s)
+
+        sl_bp = abs(stop - entry) / entry * 10_000.0
+        return {
+            "schema": "v1463.frozen-effective-ticket.1",
+            "side": side,
+            "strategy": str(effective.strategy or ticket.strategy),
+            "entry_price": round(entry, 12),
+            "tp1_price": round(tp1, 12),
+            "sl_price": round(stop, 12),
+            "full_tp_price": round(full_tp, 12) if full_tp is not None else None,
+            "entry_offset_bp": float(ticket.entry_offset_bp),
+            "tp1_bp": round(tp1_pct * 10_000.0, 12),
+            "sl_bp": round(sl_bp, 12),
+            "partial_exit_pct": float(effective.partial_exit_pct),
+            # This is the notional the paid executor would actually submit
+            # after cumulative caps, lane caps, and the exchange minimum lift.
+            "requested_notional_usdc": applied_notional_usdc,
+            "planned_notional_usdc": applied_notional_usdc,
+            "ticket_requested_notional_usdc": float(
+                ticket.requested_notional_usdc
+            ),
+            "ticket_notional_source": ticket.notional_source,
+            "entry_ttl_s": int(entry_ttl_s),
+            "outcome_ttl_s": int(outcome_ttl_s),
+            "action_parameters": action,
+        }
+
+    @staticmethod
+    def _v1462_resolved_profile_hash(
+        ticket: PreRejectCandidateTicket,
+        execution_plan: Mapping[str, Any] | None = None,
+    ) -> str:
+        """Return the lifecycle-owned stable execution-profile identity.
+
+        The frozen plan remains the authoritative outcome ticket, but absolute
+        prices and runtime identifiers must not turn every market observation
+        into a separate promotion cohort.
+        """
+
+        return stable_profile_hash(ticket, execution_plan or {})
+
+    @staticmethod
+    def _v1462_lane_definition_hash(
+        ticket: PreRejectCandidateTicket,
+    ) -> str | None:
+        """Resolve the effective lane identity; unknown lanes fail closed."""
+
+        try:
+            lane = v1462_lane_for(ticket.effective_lane)
+        except KeyError:
+            return None
+        return v1462_lane_definition_hash(lane)
+
+    def _v1462_cohort_identity(
+        self,
+        ticket: PreRejectCandidateTicket,
+        *,
+        symbol: str,
+        raw_accepted: bool,
+        pre_gate_accepted: bool,
+        final_incumbent_accepted: bool,
+        reject_lineage: Sequence[str] = (),
+        permits_order: bool = False,
+        execution_plan: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Build the immutable promotion-cohort join contract."""
+
+        lineage = tuple(str(item) for item in reject_lineage if str(item))
+        return {
+            "environment": "MAINNET",
+            "symbol": str(symbol or "").strip().upper(),
+            "registry_version": V1462_REGISTRY_VERSION,
+            "registry_hash": V1462_REGISTRY_HASH,
+            "lane_definition_hash": self._v1462_lane_definition_hash(ticket),
+            "v1462_policy_hash": V1462_POLICY_HASH,
+            "admission_policy_hash": V1462_POLICY_HASH,
+            "profile_identity_schema": "v1464.stable-profile.1",
+            "resolved_profile_hash": self._v1462_resolved_profile_hash(
+                ticket,
+                execution_plan,
+            ),
+            "lane_code": ticket.effective_lane,
+            "effective_lane": ticket.effective_lane,
+            "strategy": ticket.strategy,
+            "raw_accepted": bool(raw_accepted),
+            "pre_gate_accepted": bool(pre_gate_accepted),
+            "final_incumbent_accepted": bool(final_incumbent_accepted),
+            "reject_lineage": list(lineage),
+            "reject_reopen_flag": bool(lineage),
+            "reject_reopen_detected": bool(lineage),
+            "classifier_side": ticket.classifier_side,
+            "effective_side": ticket.effective_side,
+            "market_state": ticket.market_state,
+            "mode": "LIVE" if permits_order else "SHADOW",
+            "final_route": "LIVE" if permits_order else "SHADOW",
+        }
+
+    @staticmethod
+    def _v1462_reject_reopen_lineage(
+        *decisions: CodexV1Decision,
+    ) -> tuple[str, ...]:
+        """Extract durable evidence that an accepted decision was reopened.
+
+        Several legacy overlays reject a candidate and a later tree/profile
+        restores ``accepted=True``.  Looking only at the final boolean therefore
+        loses the reject lineage.  v1.4.62 treats any explicit reopen marker, an
+        incumbent-reject record, or a legacy reject/block marker as Shadow-only.
+        """
+
+        markers: list[str] = []
+
+        def add(path: str, value: Any) -> None:
+            rendered = str(value).strip()
+            marker = f"{path}:{rendered}" if rendered else path
+            if marker not in markers:
+                markers.append(marker)
+
+        def inspect(value: Any, path: str, *, depth: int = 0) -> None:
+            if depth > 5:
+                return
+            if isinstance(value, Mapping):
+                for raw_key, child in value.items():
+                    key = str(raw_key or "").strip()
+                    key_l = key.lower()
+                    child_path = f"{path}.{key}" if path else key
+                    if (
+                        child
+                        and (
+                            "reopen" in key_l
+                            or "incumbent_reject" in key_l
+                            or "reject_lineage" in key_l
+                        )
+                    ):
+                        add(child_path, child if not isinstance(child, (Mapping, list, tuple, set)) else "present")
+                    inspect(child, child_path, depth=depth + 1)
+                return
+            if isinstance(value, (list, tuple, set, frozenset)):
+                for index, child in enumerate(value):
+                    inspect(child, f"{path}[{index}]", depth=depth + 1)
+                return
+            if not isinstance(value, str):
+                return
+            token = value.strip().lower()
+            if not token:
+                return
+            if "reopen" in token or (
+                "legacy" in token
+                and any(part in token for part in ("reject", "block"))
+            ):
+                add(path, value)
+
+        for index, decision in enumerate(decisions):
+            prefix = f"decision[{index}]"
+            inspect(decision.risk_tags, f"{prefix}.risk_tags")
+            inspect(decision.policy_tag, f"{prefix}.policy_tag")
+            inspect(decision.reason, f"{prefix}.reason")
+            inspect(decision.metrics, f"{prefix}.metrics")
+        return tuple(markers)
+
+    def _v1462_opportunity_id(
+        self,
+        run: Mapping[str, Any],
+        ticket: PreRejectCandidateTicket,
+        observed_at_ms: int,
+        execution_plan: Mapping[str, Any] | None = None,
+    ) -> str:
+        profile_hash = self._v1462_resolved_profile_hash(ticket, execution_plan)
+        return "v1462_opp_" + self._codex_v1_shadow_stable_hash(
+            run.get("symbol"),
+            V1462_REGISTRY_VERSION,
+            V1462_REGISTRY_HASH,
+            V1462_POLICY_HASH,
+            ticket.classifier_lane,
+            ticket.effective_lane,
+            ticket.market_state,
+            ticket.effective_side,
+            ticket.strategy,
+            profile_hash,
+            self._codex_v1_shadow_2min_bucket(observed_at_ms),
+        )
+
+    def _v1464_regime_snapshot(
+        self,
+        cohort: Any,
+        *,
+        observed_at_ms: int,
+        supportive: bool,
+    ) -> PromotionRegimeSnapshot:
+        """Record a consecutive exact-cohort regime observation.
+
+        Confirmation is intentionally process-local and very short lived.  A
+        state/cohort change resets the stream, while durable shadow/paid
+        evidence remains in SQLite.  This prevents a historical regime from
+        authorizing a ticket after the market has already changed.
+        """
+
+        cohort_payload = asdict(cohort)
+        stream_key = (
+            str(cohort_payload.get("environment") or ""),
+            str(cohort_payload.get("symbol") or ""),
+            str(cohort_payload.get("lane_code") or ""),
+            f"{cohort_payload.get('effective_side') or ''}:"
+            f"{cohort_payload.get('strategy') or ''}",
+        )
+        cohort_key = str(cohort.key)
+        confirmation_window_ms = max(
+            1,
+            int(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1464_regime_confirmation_window_seconds",
+                    45,
+                )
+            ),
+        ) * 1000
+        previous_key, previous_times = self._v1464_regime_observations.get(
+            stream_key,
+            ("", []),
+        )
+        if not supportive:
+            times = []
+        elif previous_key != cohort_key:
+            times: list[int] = []
+        else:
+            cutoff = int(observed_at_ms) - confirmation_window_ms
+            times = [
+                int(value)
+                for value in previous_times
+                if cutoff <= int(value) < int(observed_at_ms)
+            ]
+        if supportive and (
+            not times or times[-1] != int(observed_at_ms)
+        ):
+            times.append(int(observed_at_ms))
+        minimum = max(
+            1,
+            int(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1464_regime_confirmations",
+                    2,
+                )
+            ),
+        )
+        times = times[-max(minimum, 4) :]
+        self._v1464_regime_observations[stream_key] = (cohort_key, times)
+        payload = {
+            **cohort_payload,
+            "observed_at_ms": int(observed_at_ms),
+            "supportive": bool(supportive),
+            "confirmations": len(times),
+            "confirmation_observed_at_ms": tuple(times),
+            "confirmation_cohort_keys": tuple(cohort_key for _ in times),
+        }
+        fields = PromotionRegimeSnapshot.__dataclass_fields__
+        return PromotionRegimeSnapshot(
+            **{name: payload[name] for name in fields if name in payload}
+        )
+
+    async def _v1465_apply_w6a_profile_selection(
+        self,
+        *,
+        ticket: PreRejectCandidateTicket,
+        final_incumbent: CodexV1Decision,
+        wildcat_decision: WildcatLiveDecision,
+        metrics: dict[str, Any],
+        cohort_identity: Mapping[str, Any],
+        frozen_execution_plan: Mapping[str, Any] | None,
+        features: Mapping[str, Any] | None,
+        observed_at_ms: int,
+        admission_safe: bool,
+        source_run_id: str,
+    ) -> CodexV1Decision | None:
+        """Apply one fresh exact-state W6A winner; every miss stays SHADOW."""
+
+        if (
+            str(ticket.effective_lane or "").upper() != "W6A"
+            or not bool(
+                getattr(
+                    self._settings,
+                    (
+                        "mainnet_codex_v1465_w6a_profile_"
+                        "enforcement_enabled"
+                    ),
+                    False,
+                )
+            )
+        ):
+            return None
+        if not admission_safe:
+            metrics["v1465_w6a_profile_selection"] = {
+                "adaptive_authorized": False,
+                "persistence_healthy": True,
+                "reason": "v1465.upstream_admission_unsafe",
+            }
+            return None
+        repo = self._v1465_w6a_profile_repo
+        if repo is None:
+            metrics["v1465_w6a_profile_selection"] = {
+                "adaptive_authorized": False,
+                "persistence_healthy": False,
+                "reason": "v1465.profile_repository_missing",
+            }
+            return None
+        state = classify_w6a_market_state(features or {})
+        selector = W6ASelector(
+            environment=str(cohort_identity.get("environment") or "mainnet"),
+            symbol=str(cohort_identity.get("symbol") or "").upper(),
+            lane_code="W6A",
+            market_state=state.state,
+            effective_side=str(ticket.effective_side or "").upper(),
+            strategy=str(ticket.strategy or ""),
+        )
+        try:
+            selection = await repo.get_selection(selector)
+        except Exception as exc:  # noqa: BLE001 - paid path fails closed
+            metrics["v1465_w6a_profile_selection"] = {
+                "adaptive_authorized": False,
+                "persistence_healthy": False,
+                "reason": "v1465.selection_read_failed",
+                "error": f"{type(exc).__name__}:{str(exc)[:160]}",
+            }
+            return None
+        if (
+            selection is None
+            or str(selection.get("status") or "") != "LIVE"
+            or int(selection.get("expires_at_ms") or 0) <= observed_at_ms
+            or str(selection.get("policy_hash") or "")
+            != self._v1465_w6a_selector_policy_hash()
+        ):
+            # A deployment can enable enforcement after a SHADOW soak.  Reuse
+            # the already-durable, still-fresh 15/30/90-minute evidence here so
+            # activation is not delayed until another terminal outcome arrives.
+            # The recompute is bounded to one 90-minute exact-cohort query and
+            # its CAS write remains the sole promotion authority.
+            try:
+                await self._v1465_recompute_w6a_selection(
+                    selector,
+                    now_ms=observed_at_ms,
+                    source_run_id=source_run_id,
+                )
+                selection = await repo.get_selection(selector)
+            except W6ASelectionConflictError:
+                # Another worker won the CAS.  Only trust its newly persisted
+                # state; never retry using this worker's stale evidence rows.
+                selection = await repo.get_selection(selector)
+            except Exception as exc:  # noqa: BLE001 - paid path fails closed
+                metrics["v1465_w6a_profile_selection"] = {
+                    "adaptive_authorized": False,
+                    "persistence_healthy": False,
+                    "reason": "v1465.selection_recompute_failed",
+                    "error": f"{type(exc).__name__}:{str(exc)[:160]}",
+                }
+                return None
+        rejection = None
+        if selection is None:
+            rejection = "selection_missing"
+        elif state.state == "falling_trap":
+            rejection = "falling_trap_paid_disabled"
+        elif str(selection.get("status") or "") != "LIVE":
+            rejection = "selection_not_live"
+        elif int(selection.get("expires_at_ms") or 0) <= observed_at_ms:
+            rejection = "selection_expired"
+        elif str(selection.get("policy_hash") or "") != (
+            self._v1465_w6a_selector_policy_hash()
+        ):
+            rejection = "selector_policy_hash_mismatch"
+        winner_id = (
+            str(selection.get("winner_profile_id") or "").upper()
+            if selection is not None
+            else ""
+        )
+        if rejection is None and winner_id not in W6A_PROFILES:
+            rejection = "winner_profile_unknown"
+        expected_profile_hash = (
+            self._v1465_w6a_profile_hash(winner_id)
+            if winner_id in W6A_PROFILES
+            else ""
+        )
+        if (
+            rejection is None
+            and str(
+                selection.get("winner_resolved_profile_hash") or ""
+            )
+            != expected_profile_hash
+        ):
+            rejection = "winner_profile_hash_mismatch"
+        try:
+            selected_cap = float(
+                (selection or {}).get("notional_cap_usdc") or 0.0
+            )
+            candidate_cap = float(
+                (frozen_execution_plan or {}).get(
+                    "planned_notional_usdc"
+                )
+                or 0.0
+            )
+        except (TypeError, ValueError, OverflowError):
+            selected_cap = candidate_cap = 0.0
+        applied_cap = min(selected_cap, candidate_cap)
+        if (
+            rejection is None
+            and (
+                not math.isfinite(applied_cap)
+                or applied_cap < MAINNET_MIN_ENTRY_NOTIONAL_USDC
+            )
+        ):
+            rejection = "selection_cap_below_exchange_minimum"
+        selection_payload = {
+            "adaptive_authorized": rejection is None,
+            "persistence_healthy": True,
+            "reason": (
+                "v1465.w6a_profile_lease_authorized"
+                if rejection is None
+                else f"v1465.{rejection}"
+            ),
+            "selector_key": selector.key,
+            "market_state": state.state,
+            "market_state_snapshot": {
+                "missing": list(state.missing),
+                "risk_score": state.risk_score,
+                "no_reclaim": state.no_reclaim,
+                "risk_flags": dict(state.risk_flags),
+                "stale_hard": state.stale_hard,
+            },
+            "winner_profile_id": winner_id or None,
+            "winner_resolved_profile_hash": expected_profile_hash or None,
+            "generation": (
+                None if selection is None else selection.get("generation")
+            ),
+            "issued_at_ms": (
+                None if selection is None else selection.get("issued_at_ms")
+            ),
+            "expires_at_ms": (
+                None if selection is None else selection.get("expires_at_ms")
+            ),
+            "evidence_revision": (
+                None
+                if selection is None
+                else selection.get("evidence_revision")
+            ),
+            "policy_hash": self._v1465_w6a_selector_policy_hash(),
+            "notional_cap_usdc": applied_cap,
+            "evaluated_at_ms": observed_at_ms,
+            "execution_controls": {
+                "full_exit": True,
+                "runner_enabled": False,
+                "one_step_reprice_enabled": False,
+                "dca_enabled": False,
+            },
+        }
+        metrics["v1465_w6a_profile_selection"] = selection_payload
+        if rejection is not None:
+            return None
+        profile = W6A_PROFILES[winner_id]
+        metrics.update(
+            {
+                "entry_bp": float(profile.entry_offset_bp),
+                "tp1_bp": float(profile.tp_bp),
+                "full_tp_bp": float(profile.tp_bp),
+                "sl_bp": float(profile.sl_bp),
+                "ttl_s": int(profile.entry_ttl_seconds),
+                "partial_exit_pct": 1.0,
+                "applied_notional_cap_usdc": applied_cap,
+                "v1465_w6a_profile_id": winner_id,
+                "v1465_w6a_market_state": state.state,
+                "v1465_exact_sl_enabled": True,
+            }
+        )
+        selected_decision = replace(
+            final_incumbent,
+            accepted=True,
+            reason="v1465.w6a_profile_lease_authorized",
+            entry_offset_bp=float(profile.entry_offset_bp),
+            requested_notional_usdc=applied_cap,
+            metrics=metrics,
+            risk_tags=tuple(
+                dict.fromkeys(
+                    (
+                        *final_incumbent.risk_tags,
+                        "v1465_w6a_profile_lease",
+                        "v1465_full_exit",
+                        "v1465_no_runner",
+                        "v1465_no_reprice",
+                        "v1465_no_dca",
+                    )
+                )
+            ),
+        )
+        selected_action = dict(ticket.action_parameters)
+        selected_action.update(
+            {
+                "entry_bp": float(profile.entry_offset_bp),
+                "tp1_bp": float(profile.tp_bp),
+                "full_tp_bp": float(profile.tp_bp),
+                "sl_bp": float(profile.sl_bp),
+                "ttl_s": int(profile.entry_ttl_seconds),
+                "partial_exit_pct": 1.0,
+            }
+        )
+        selected_ticket = replace(
+            ticket,
+            entry_offset_bp=float(profile.entry_offset_bp),
+            requested_notional_usdc=applied_cap,
+            notional_source="v1465_w6a_profile_selection",
+            policy_tag="v1465_w6a_profile_selection",
+            action_parameters=selected_action,
+        )
+        selected_plan = self._v1463_frozen_effective_plan(
+            wildcat_decision,
+            selected_decision,
+            selected_ticket,
+        )
+        selected_plan_invalid = self._v1463_frozen_plan_invalid_reason(
+            selected_plan
+        )
+        geometry_safe = bool(
+            selected_plan_invalid is None
+            and selected_plan is not None
+            and math.isclose(
+                float(selected_plan.get("entry_offset_bp") or 0.0),
+                float(profile.entry_offset_bp),
+                abs_tol=1e-9,
+            )
+            and math.isclose(
+                float(selected_plan.get("tp1_bp") or 0.0),
+                float(profile.tp_bp),
+                abs_tol=1e-6,
+            )
+            and math.isclose(
+                float(selected_plan.get("sl_bp") or 0.0),
+                float(profile.sl_bp),
+                abs_tol=1e-6,
+            )
+            and int(selected_plan.get("entry_ttl_s") or 0)
+            == int(profile.entry_ttl_seconds)
+            and math.isclose(
+                float(selected_plan.get("partial_exit_pct") or 0.0),
+                1.0,
+                abs_tol=1e-9,
+            )
+        )
+        if not geometry_safe:
+            selection_payload.update(
+                {
+                    "adaptive_authorized": False,
+                    "reason": "v1465.selected_execution_plan_invalid",
+                    "selected_execution_plan_error": (
+                        selected_plan_invalid or "profile_geometry_mismatch"
+                    ),
+                }
+            )
+            metrics["v1465_w6a_profile_selection"] = selection_payload
+            return None
+        assert selected_plan is not None
+        selected_plan_hash = hashlib.sha256(
+            json.dumps(
+                selected_plan,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        selection_payload.update(
+            {
+                "selected_candidate_ticket": selected_ticket.to_payload(),
+                "selected_execution_plan": selected_plan,
+                "selected_execution_plan_hash": selected_plan_hash,
+            }
+        )
+        metrics["v1465_w6a_profile_selection"] = selection_payload
+        base_admission = (
+            dict(metrics.get("v1462_admission") or {})
+            if isinstance(metrics.get("v1462_admission"), Mapping)
+            else {}
+        )
+        metrics["v1462_admission"] = {
+            **base_admission,
+            "v1465_base_candidate_ticket": base_admission.get(
+                "candidate_ticket"
+            ),
+            "v1465_base_frozen_execution_plan": base_admission.get(
+                "frozen_execution_plan"
+            ),
+            "candidate_ticket": selected_ticket.to_payload(),
+            "frozen_execution_plan": selected_plan,
+            "profile_identity_schema": "v1465.w6a-profile.1",
+            "resolved_profile_hash": expected_profile_hash,
+            "v1465_selector_key": selector.key,
+            "v1465_winner_profile_id": winner_id,
+            "v1465_selected_execution_plan_hash": selected_plan_hash,
+        }
+        return selected_decision
+
+    async def _v1462_apply_strict_admission(
+        self,
+        run: Mapping[str, Any],
+        raw_decision: CodexV1Decision,
+        pre_gate_accepted: bool,
+        final_incumbent: CodexV1Decision,
+        v1460_decision: CodexV1Decision,
+        *,
+        wildcat_decision: WildcatLiveDecision,
+        reject_lineage: Sequence[str] = (),
+        candidate_ticket: PreRejectCandidateTicket | None = None,
+        features: Mapping[str, Any] | None = None,
+    ) -> CodexV1Decision:
+        if not self._v1462_strict_live_allowlist_active(run):
+            return v1460_decision
+        metrics = (
+            dict(v1460_decision.metrics)
+            if isinstance(v1460_decision.metrics, Mapping)
+            else {}
+        )
+        v1460_policy = (
+            metrics.get("v1460_lane_adaptive")
+            if isinstance(metrics.get("v1460_lane_adaptive"), Mapping)
+            else {}
+        )
+        matrix_rule_id = str(v1460_policy.get("matrix_rule_id") or "UNKNOWN")
+        ticket = candidate_ticket or self._v1462_candidate_ticket(
+            raw_decision,
+            final_incumbent,
+        )
+        incumbent_metrics = (
+            final_incumbent.metrics
+            if isinstance(final_incumbent.metrics, Mapping)
+            else {}
+        )
+        safe_lineage = (
+            incumbent_metrics.get("v1463_admission_lineage")
+            if isinstance(
+                incumbent_metrics.get("v1463_admission_lineage"), Mapping
+            )
+            else None
+        )
+        admission = evaluate_strict_admission(
+            matrix_rule_id=matrix_rule_id,
+            raw_accepted=bool(raw_decision.accepted),
+            pre_gate_accepted=bool(pre_gate_accepted),
+            final_incumbent_accepted=bool(final_incumbent.accepted),
+            reject_lineage=reject_lineage,
+            execution_controls_safe=self._v1462_execution_controls_safe(),
+            promotion_enforcement_enabled=bool(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1462_promotion_enforcement_enabled",
+                    False,
+                )
+            ),
+            candidate=ticket,
+            safe_lineage=safe_lineage,
+        )
+        frozen_execution_plan = self._v1463_frozen_effective_plan(
+            wildcat_decision,
+            final_incumbent,
+            ticket,
+        )
+        if admission.permits_order and frozen_execution_plan is None:
+            admission = evaluate_strict_admission(
+                matrix_rule_id="v1463.frozen_execution_plan_missing",
+                raw_accepted=admission.raw_accepted,
+                pre_gate_accepted=admission.pre_gate_accepted,
+                final_incumbent_accepted=admission.final_incumbent_accepted,
+                reject_lineage=admission.reject_lineage,
+                candidate=ticket,
+            )
+        observed_at_ms = int(time.time() * 1000)
+        opportunity_id = self._v1462_opportunity_id(
+            run,
+            ticket,
+            observed_at_ms,
+            frozen_execution_plan,
+        )
+        cohort_identity = self._v1462_cohort_identity(
+            ticket,
+            symbol=str(run.get("symbol") or ""),
+            raw_accepted=admission.raw_accepted,
+            pre_gate_accepted=admission.pre_gate_accepted,
+            final_incumbent_accepted=admission.final_incumbent_accepted,
+            reject_lineage=admission.reject_lineage,
+            permits_order=admission.permits_order,
+            execution_plan=frozen_execution_plan,
+        )
+        metrics["v1462_admission"] = {
+            **admission.to_payload(),
+            **cohort_identity,
+            "opportunity_id": opportunity_id,
+            "v1462_opportunity_id": opportunity_id,
+            "candidate_ticket": ticket.to_payload(),
+            "frozen_execution_plan": frozen_execution_plan,
+        }
+        try:
+            v1462_lane_for(ticket.effective_lane)
+        except KeyError:
+            registry_identity_reason = "out_of_registry"
+        else:
+            registry_identity_reason = validate_exact_registry_identity(
+                cohort_identity
+            )
+        adaptive_applied: CodexV1Decision | None = None
+        v1465_w6a_owns_authority = bool(
+            str(ticket.effective_lane or "").upper() == "W6A"
+            and getattr(
+                self._settings,
+                "mainnet_codex_v1465_w6a_profile_selector_enabled",
+                False,
+            )
+        )
+        v1465_w6a_enforcement = bool(
+            v1465_w6a_owns_authority
+            and getattr(
+                self._settings,
+                "mainnet_codex_v1465_w6a_profile_enforcement_enabled",
+                False,
+            )
+        )
+        session = self._adaptive_session or {}
+        v1465_admission_safe = bool(
+            admission.raw_accepted
+            and admission.pre_gate_accepted
+            and admission.final_incumbent_accepted
+            and not admission.reject_lineage
+            and safe_lineage is None
+            and registry_identity_reason is None
+            and not self._v1459_guard.identity_unsafe
+            and self._v1462_execution_controls_safe()
+            and self._v1463_frozen_plan_invalid_reason(
+                frozen_execution_plan
+            )
+            is None
+            and not (
+                session.get("stop_requested")
+                or session.get("safety_halt_reason")
+                or self._v1459_entry_paused()
+            )
+        )
+        if (
+            v1465_w6a_enforcement
+            and admission.reason == "v1462.shadow.rule_not_allowlisted"
+        ):
+            adaptive_applied = (
+                await self._v1465_apply_w6a_profile_selection(
+                    ticket=ticket,
+                    final_incumbent=final_incumbent,
+                    wildcat_decision=wildcat_decision,
+                    metrics=metrics,
+                    cohort_identity=cohort_identity,
+                    frozen_execution_plan=frozen_execution_plan,
+                    features=features,
+                    observed_at_ms=observed_at_ms,
+                    admission_safe=v1465_admission_safe,
+                    source_run_id=str(run.get("run_id") or ""),
+                )
+            )
+        if (
+            registry_identity_reason is not None
+            and self._v1464_promotion_runtime is not None
+            and bool(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1464_auto_promotion_enabled",
+                    False,
+                )
+            )
+            and admission.reason == "v1462.shadow.rule_not_allowlisted"
+        ):
+            logger.info(
+                "entry_codex_v1464_identity_quarantined",
+                run_id=run.get("run_id"),
+                opportunity_id=opportunity_id,
+                lane_code=ticket.effective_lane,
+                reason=registry_identity_reason,
+            )
+            metrics["v1464_adaptive_promotion"] = {
+                "adaptive_authorized": False,
+                "persistence_healthy": True,
+                "reason": f"v1464.{registry_identity_reason}",
+                "state": "SHADOW",
+                "registry_quarantined": True,
+                "order_api_calls": 0,
+            }
+        if (
+            self._v1464_promotion_runtime is not None
+            and not v1465_w6a_owns_authority
+            and bool(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1464_auto_promotion_enabled",
+                    False,
+                )
+            )
+            and registry_identity_reason is None
+            and admission.reason == "v1462.shadow.rule_not_allowlisted"
+            and safe_lineage is None
+            and self._v1463_frozen_plan_invalid_reason(
+                frozen_execution_plan
+            )
+            is None
+        ):
+            try:
+                cohort = promotion_cohort_from_identity(
+                    cohort_identity,
+                    config=self._v1464_promotion_runtime.config,
+                )
+                candidate_notional = float(
+                    frozen_execution_plan["planned_notional_usdc"]
+                )
+                execution_controls_safe = (
+                    self._v1462_execution_controls_safe()
+                )
+                session = self._adaptive_session or {}
+                risk = PromotionRiskInput(
+                    raw_accepted=bool(admission.raw_accepted),
+                    pre_gate_accepted=bool(admission.pre_gate_accepted),
+                    final_incumbent_accepted=bool(
+                        admission.final_incumbent_accepted
+                    ),
+                    reject_lineage=tuple(admission.reject_lineage),
+                    identity_valid=bool(
+                        cohort_identity.get("lane_definition_hash")
+                        and cohort_identity.get("resolved_profile_hash")
+                        and cohort_identity.get("profile_identity_schema")
+                        == "v1464.stable-profile.1"
+                    ),
+                    integrity_safe=not bool(
+                        self._v1459_guard.identity_unsafe
+                    ),
+                    execution_controls_safe=execution_controls_safe,
+                    database_healthy=True,
+                    global_halted=bool(
+                        session.get("stop_requested")
+                        or session.get("safety_halt_reason")
+                        or self._v1459_entry_paused()
+                    ),
+                )
+                regime = self._v1464_regime_snapshot(
+                    cohort,
+                    observed_at_ms=observed_at_ms,
+                    supportive=bool(
+                        admission.raw_accepted
+                        and admission.pre_gate_accepted
+                        and admission.final_incumbent_accepted
+                        and not admission.reject_lineage
+                        and execution_controls_safe
+                    ),
+                )
+                evaluation_id = (
+                    "v1464_eval_"
+                    + self._codex_v1_shadow_stable_hash(
+                        run.get("run_id"),
+                        opportunity_id,
+                        observed_at_ms,
+                    )
+                )
+                runtime_result = (
+                    await self._v1464_promotion_runtime.evaluate_candidate(
+                        cohort=cohort,
+                        candidate_notional_usdc=candidate_notional,
+                        regime=regime,
+                        risk=risk,
+                        now_ms=observed_at_ms,
+                        evaluation_id=evaluation_id,
+                    )
+                )
+                adaptive_payload = {
+                    **runtime_result.metadata.to_payload(),
+                    "persistence_healthy": bool(
+                        runtime_result.persistence_healthy
+                    ),
+                    "error": runtime_result.error,
+                    "regime_snapshot": asdict(regime),
+                    "risk_snapshot": asdict(risk),
+                    "execution_controls": {
+                        "runner_enabled": False,
+                        "one_step_reprice_enabled": False,
+                        "dca_enabled": False,
+                    },
+                }
+                metrics["v1464_adaptive_promotion"] = adaptive_payload
+                if (
+                    runtime_result.persistence_healthy
+                    and runtime_result.metadata.adaptive_authorized
+                    and runtime_result.decision.permits_order
+                ):
+                    applied_cap = min(
+                        candidate_notional,
+                        float(
+                            runtime_result.metadata.applied_notional_usdc
+                        ),
+                        float(runtime_result.metadata.notional_cap_usdc),
+                    )
+                    prior_cap = metrics.get("applied_notional_cap_usdc")
+                    try:
+                        prior_cap_value = float(prior_cap)
+                    except (TypeError, ValueError, OverflowError):
+                        prior_cap_value = 0.0
+                    if math.isfinite(prior_cap_value) and prior_cap_value > 0:
+                        applied_cap = min(applied_cap, prior_cap_value)
+                    if (
+                        math.isfinite(applied_cap)
+                        and applied_cap
+                        >= MAINNET_MIN_ENTRY_NOTIONAL_USDC
+                    ):
+                        metrics["applied_notional_cap_usdc"] = applied_cap
+                        adaptive_applied = replace(
+                            final_incumbent,
+                            accepted=True,
+                            reason="v1464.adaptive_lease_authorized",
+                            requested_notional_usdc=applied_cap,
+                            metrics=metrics,
+                            risk_tags=tuple(
+                                dict.fromkeys(
+                                    (
+                                        *final_incumbent.risk_tags,
+                                        "v1464_adaptive_lease",
+                                        "v1464_no_runner",
+                                        "v1464_no_reprice",
+                                        "v1464_no_dca",
+                                    )
+                                )
+                            ),
+                        )
+                    elif math.isfinite(applied_cap) and applied_cap > 0:
+                        metrics["v1464_adaptive_promotion"] = {
+                            **adaptive_payload,
+                            "adaptive_authorized": False,
+                            "reason": "v1464.cap_below_exchange_minimum",
+                            "exchange_min_notional_usdc": (
+                                MAINNET_MIN_ENTRY_NOTIONAL_USDC
+                            ),
+                        }
+            except Exception as exc:  # noqa: BLE001 - promotion must fail closed
+                logger.error(
+                    "entry_codex_v1464_adaptive_evaluation_failed",
+                    run_id=run.get("run_id"),
+                    opportunity_id=opportunity_id,
+                    error=str(exc)[:200],
+                )
+                metrics["v1464_adaptive_promotion"] = {
+                    "adaptive_authorized": False,
+                    "persistence_healthy": False,
+                    "reason": "v1464.runtime_evaluation_failed",
+                    "error": f"{type(exc).__name__}:{str(exc)[:160]}",
+                }
+        if adaptive_applied is not None:
+            applied = adaptive_applied
+        elif admission.permits_order:
+            applied = replace(v1460_decision, metrics=metrics)
+        else:
+            applied = replace(
+                v1460_decision,
+                accepted=False,
+                reason=admission.reason,
+                size_mult=0.0,
+                notional_mult=0.0,
+                requested_notional_usdc=0.0,
+                metrics=metrics,
+                risk_tags=tuple(
+                    dict.fromkeys(
+                        (*v1460_decision.risk_tags, "v1462_shadow_only")
+                    )
+                ),
+            )
+        # Every paid-capable run needs its own durable admission audit row even
+        # when two sequential runs refer to the same deduplicated opportunity.
+        # Cohort aggregation deduplicates on opportunity_id, not by dropping
+        # the per-run order-authority record.
+        admission_event_key = (
+            "entry_codex_v1462_admission",
+            str(run.get("run_id") or ""),
+            opportunity_id,
+        )
+        v1465_selection_metadata = (
+            metrics.get("v1465_w6a_profile_selection")
+            if isinstance(
+                metrics.get("v1465_w6a_profile_selection"),
+                Mapping,
+            )
+            else {}
+        )
+        audit_candidate_ticket = (
+            v1465_selection_metadata.get("selected_candidate_ticket")
+            if isinstance(
+                v1465_selection_metadata.get("selected_candidate_ticket"),
+                Mapping,
+            )
+            else ticket.to_payload()
+        )
+        audit_execution_plan = (
+            v1465_selection_metadata.get("selected_execution_plan")
+            if isinstance(
+                v1465_selection_metadata.get("selected_execution_plan"),
+                Mapping,
+            )
+            else frozen_execution_plan
+        )
+        try:
+            if admission_event_key not in self._v1462_durable_event_keys:
+                await self._repo.log_event(
+                    str(run.get("run_id") or ""),
+                    "entry_codex_v1462_admission",
+                    {
+                        **admission.to_payload(),
+                        **cohort_identity,
+                        "opportunity_id": opportunity_id,
+                        "v1462_opportunity_id": opportunity_id,
+                        "lane_code": ticket.effective_lane,
+                        "classifier_lane": ticket.classifier_lane,
+                        "side": ticket.effective_side,
+                        "market_state": ticket.market_state,
+                        "candidate_ticket": audit_candidate_ticket,
+                        "frozen_execution_plan": audit_execution_plan,
+                        "v1464_adaptive_promotion": metrics.get(
+                            "v1464_adaptive_promotion"
+                        ),
+                        "v1465_w6a_profile_selection": (
+                            v1465_selection_metadata or None
+                        ),
+                        "profile_identity_schema": (
+                            "v1465.w6a-profile.1"
+                            if v1465_selection_metadata.get(
+                                "adaptive_authorized"
+                            )
+                            else cohort_identity.get(
+                                "profile_identity_schema"
+                            )
+                        ),
+                        "resolved_profile_hash": (
+                            v1465_selection_metadata.get(
+                                "winner_resolved_profile_hash"
+                            )
+                            if v1465_selection_metadata.get(
+                                "adaptive_authorized"
+                            )
+                            else cohort_identity.get(
+                                "resolved_profile_hash"
+                            )
+                        ),
+                        "observed_at_ms": observed_at_ms,
+                        "order_api_calls": 0,
+                    },
+                )
+                self._v1462_durable_event_keys.add(admission_event_key)
+        except Exception as exc:  # noqa: BLE001 - strict audit must fail closed
+            logger.error(
+                "entry_codex_v1462_admission_persistence_failed",
+                run_id=run.get("run_id"),
+                error=str(exc)[:200],
+            )
+            failed_metrics = dict(metrics)
+            failed_cohort_identity = {
+                **cohort_identity,
+                "final_route": "SHADOW",
+            }
+            failed_metrics["v1462_admission"] = {
+                **admission.to_payload(),
+                **failed_cohort_identity,
+                "mode": "SHADOW",
+                "permits_order": False,
+                "reason": "v1462.admission_persistence_failed",
+                "opportunity_id": opportunity_id,
+                "v1462_opportunity_id": opportunity_id,
+                "candidate_ticket": ticket.to_payload(),
+                "frozen_execution_plan": frozen_execution_plan,
+            }
+            return replace(
+                v1460_decision,
+                accepted=False,
+                reason="v1462.admission_persistence_failed",
+                size_mult=0.0,
+                notional_mult=0.0,
+                requested_notional_usdc=0.0,
+                metrics=failed_metrics,
+            )
+        return applied
+
+    def _v1461_gate_config(self) -> AdaptiveGateConfig:
+        return AdaptiveGateConfig(
+            compatibility_schema_version="v1461.lane-compatibility.2-aggtrade-cost",
+            execution_contract_hash=self._v1460_policy_hash(),
+            shadow_all_strategy_rejects_enabled=bool(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1461_shadow_all_strategy_rejects_enabled",
+                    False,
+                )
+            ),
+            runner_enabled=bool(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1461_runner_enabled",
+                    False,
+                )
+            ),
+            one_step_reprice_enabled=bool(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1461_one_step_reprice_enabled",
+                    False,
+                )
+            ),
+            max_notional_usdc=float(
+                getattr(self._settings, "mainnet_codex_v1461_max_notional_usdc", 50.0)
+            ),
+            probation_notional_usdc=float(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1461_probation_notional_usdc",
+                    25.0,
+                )
+            ),
+            fast_min_evaluable=int(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1461_fast_min_evaluable_opportunities",
+                    4,
+                )
+            ),
+            fast_min_tp_first=int(
+                getattr(self._settings, "mainnet_codex_v1461_fast_min_tp_first", 3)
+            ),
+            probation_min_evaluable=int(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1461_probation_min_evaluable_opportunities",
+                    6,
+                )
+            ),
+            probation_min_tp_first=int(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1461_probation_min_tp_first",
+                    4,
+                )
+            ),
+            min_ev_per_opportunity_usdc=float(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1461_min_ev_per_opportunity_usdc",
+                    0.0,
+                )
+            ),
+            evidence_max_age_seconds=int(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1461_evidence_max_age_seconds",
+                    6 * 60 * 60,
+                )
+            ),
+            regime_confirmations=int(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1461_regime_confirmations",
+                    2,
+                )
+            ),
+            episode_exit_confirmation_seconds=int(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1461_episode_exit_confirmation_seconds",
+                    5 * 60,
+                )
+            ),
+            lane_loss_streak_limit=int(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1461_lane_consecutive_loss_limit",
+                    2,
+                )
+            ),
+            lane_net_loss_cap_usdc=float(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1461_lane_net_loss_cap_usdc",
+                    0.12,
+                )
+            ),
+            cohort_net_loss_cap_usdc=float(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1461_session_net_loss_cap_usdc",
+                    0.30,
+                )
+            ),
+        )
+
+    def _v1461_enforcement_readiness(self) -> tuple[bool, tuple[str, ...]]:
+        requested = bool(
+            getattr(
+                self._settings,
+                "mainnet_codex_v1461_live_enforcement_enabled",
+                False,
+            )
+        )
+        if not requested:
+            return False, ()
+        missing: list[str] = []
+        v1460_requested, v1460_missing = self._v1460_enforcement_readiness()
+        if not v1460_requested:
+            missing.append("mainnet_codex_v1460_live_enforcement_enabled")
+        missing.extend(v1460_missing)
+        for name in (
+            "mainnet_codex_v1459_candidate_selector_enabled",
+            "mainnet_codex_v1459_live_enforcement_enabled",
+            # v1.4.61 changes admission only; v1.4.60B remains the reviewed
+            # execution-safety layer for immutable TTL and cancel/fill races.
+            "mainnet_codex_v1460_candidate_selector_enabled",
+            "mainnet_codex_v1460_lane_matrix_enabled",
+            "mainnet_codex_v1460_live_enforcement_enabled",
+            "mainnet_codex_v1460_shadow_evidence_enabled",
+            "mainnet_codex_v1461_candidate_selector_enabled",
+            "mainnet_codex_v1461_regime_gate_enabled",
+            "mainnet_codex_v1461_shadow_all_strategy_rejects_enabled",
+        ):
+            if not bool(getattr(self._settings, name, False)):
+                missing.append(name)
+        for name in (
+            "mainnet_codex_v1459_runner_enabled",
+            "mainnet_codex_v1459_one_step_reprice_enabled",
+            "mainnet_codex_v1460_runner_enabled",
+            "mainnet_codex_v1460_one_step_reprice_enabled",
+            "mainnet_codex_v1461_runner_enabled",
+            "mainnet_codex_v1461_one_step_reprice_enabled",
+        ):
+            if bool(getattr(self._settings, name, False)):
+                missing.append(f"{name}=false")
+        exact = {
+            "mainnet_codex_v1461_target_paid_closed_fills": 20,
+            "mainnet_codex_v1461_max_duration_seconds": 72 * 60 * 60,
+            "mainnet_codex_v1461_checkpoint_fills": 5,
+        }
+        for name, expected in exact.items():
+            try:
+                actual = int(getattr(self._settings, name, expected))
+            except (TypeError, ValueError, OverflowError):
+                actual = None
+            if actual != expected:
+                missing.append(f"{name}={expected}")
+        profile = self._v1459_profile_enforcement_readiness()
+        if not profile.ready:
+            missing.extend(profile.missing)
+        try:
+            self._v1461_gate_config().policy_hash
+        except Exception as exc:  # noqa: BLE001 - invalid live contract
+            missing.append(f"v1461_policy_contract:{str(exc)[:120]}")
+        return True, tuple(dict.fromkeys(missing))
+
+    def _v1461_enforcement_active(self, run: Mapping[str, Any] | None) -> bool:
+        # v1.4.62 replaces v1.4.61 promotion with a strict paid-admission
+        # boundary while observation continues.  Once either v1.4.62 switch is
+        # selected, no v1.4.61 evidence/token may reopen a rejected candidate.
+        if self._v1462_observation_selected():
+            return False
+        requested, missing = self._v1461_enforcement_readiness()
+        return bool(
+            requested
+            and not missing
+            and self._v1460_entry_safety_active(run)
+            and self._v1461_candidate_active(run)
+        )
+
+    def _adaptive_canary_contract(self) -> str:
+        if self._v1461_config_selected():
+            return V1461_ADAPTIVE_CANARY_CONTRACT
+        return (
+            V1460_ADAPTIVE_CANARY_CONTRACT
+            if self._v1460_config_selected()
+            else V1459_ADAPTIVE_CANARY_CONTRACT
+        )
+
+    def _v1460_lane_adaptive_config(self) -> LaneAdaptiveConfig:
+        """Build and validate the closed matrix contract from reviewed settings."""
+
+        return LaneAdaptiveConfig(
+            weak_min_evaluable=int(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1460_weak_min_evaluable_opportunities",
+                    8,
+                )
+            ),
+            weak_min_tp_first=int(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1460_weak_min_tp_first",
+                    6,
+                )
+            ),
+            weak_min_cost_adjusted_ev_per_opportunity=float(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1460_weak_min_ev_per_opportunity_usdc",
+                    0.0,
+                )
+            ),
+            control_max_notional_usdc=float(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1460_max_notional_usdc",
+                    50.0,
+                )
+            ),
+            probation_max_notional_usdc=float(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1460_probation_notional_usdc",
+                    25.0,
+                )
+            ),
+            lane_loss_streak_limit=int(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1460_lane_consecutive_loss_limit",
+                    2,
+                )
+            ),
+            lane_loss_limit_usdc=float(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1460_lane_net_loss_cap_usdc",
+                    0.12,
+                )
+            ),
+            cohort_loss_limit_usdc=float(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1460_session_net_loss_cap_usdc",
+                    0.30,
+                )
+            ),
+        )
+
+    def _v1460_policy_contract_payload(self) -> dict[str, Any]:
+        """Identity for matrix, incumbent exits, sizing, evidence and stops."""
+
+        lane_config = self._v1460_lane_adaptive_config()
+        dump = getattr(self._settings, "model_dump", None)
+        if callable(dump):
+            settings_values = dump()
+        else:
+            settings_values = dict(getattr(self._settings, "__dict__", {}) or {})
+        contract_tokens = (
+            "tp",
+            "sl",
+            "hold",
+            "notional",
+            "ttl",
+            "partial_exit",
+            "entry_offset",
+        )
+        incumbent_contract = {
+            name: value
+            for name, value in settings_values.items()
+            if isinstance(name, str)
+            and name.startswith("mainnet_")
+            and any(token in name for token in contract_tokens)
+            and isinstance(value, (str, int, float, bool, type(None)))
+        }
+        for name in (
+            "mainnet_entry_order_ttl_seconds",
+            "mainnet_expected_taker_fee_rate",
+            "mainnet_require_zero_maker_fee",
+        ):
+            incumbent_contract[name] = getattr(self._settings, name, None)
+        return {
+            "contract": self._adaptive_canary_contract(),
+            "code_version": CODEX_V1_VERSION,
+            "lane_matrix_policy_hash": lane_config.policy_hash,
+            "incumbent_tp_sl_hold_ttl_notional": incumbent_contract,
+            "incumbent_wpr_profiles": WPR_V143_PROFILES,
+            "shadow_promotion": {
+                "min_evaluable": lane_config.weak_min_evaluable,
+                "min_tp_first": lane_config.weak_min_tp_first,
+                "min_ev_per_opportunity_exclusive": (
+                    lane_config.weak_min_cost_adjusted_ev_per_opportunity
+                ),
+                "max_ambiguous": lane_config.weak_max_ambiguous,
+                "max_incomplete": lane_config.weak_max_incomplete,
+            },
+            "shadow_evidence_contract": {
+                "maker_fee_rate": float(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v1460_weak_shadow_maker_fee_rate",
+                        0.0,
+                    )
+                ),
+                "taker_fee_rate": float(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v1460_weak_shadow_taker_fee_rate",
+                        0.0004,
+                    )
+                ),
+                "max_pages": int(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v1460_weak_shadow_max_pages",
+                        10,
+                    )
+                ),
+                "page_limit": int(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v1460_weak_shadow_page_limit",
+                        1000,
+                    )
+                ),
+                "max_fetch_failures": int(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v1460_weak_shadow_max_fetch_failures",
+                        3,
+                    )
+                ),
+                "max_hold_liquidity": "TAKER",
+            },
+            "risk_stops": {
+                "lane_loss_streak_limit": lane_config.lane_loss_streak_limit,
+                "lane_loss_limit_usdc": lane_config.lane_loss_limit_usdc,
+                "cohort_loss_limit_usdc": lane_config.cohort_loss_limit_usdc,
+                "cancel_reconcile_timeout_ms": V1460_CANCEL_RECONCILE_TIMEOUT_MS,
+            },
+            "closed_actions": {
+                "runner_enabled": bool(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v1460_runner_enabled",
+                        False,
+                    )
+                ),
+                "one_step_reprice_enabled": bool(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v1460_one_step_reprice_enabled",
+                        False,
+                    )
+                ),
+                "global_entry_offset_relaxation": False,
+                "global_ttl_relaxation": False,
+            },
+        }
+
+    def _v1460_policy_hash(self) -> str:
+        payload = json.dumps(
+            self._v1460_policy_contract_payload(),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _v1460_weak_evidence_input(self) -> WeakStateShadowEvidence:
+        session = self._adaptive_session or {}
+        evidence = session.get("v1460_weak_evidence")
+        values = evidence if isinstance(evidence, Mapping) else {}
+        evaluable = max(0, int(values.get("evaluable") or 0))
+        tp_first = max(0, int(values.get("tp_first") or 0))
+        ambiguous = max(0, int(values.get("ambiguous") or 0))
+        incomplete = max(0, int(values.get("incomplete") or 0))
+        net_pnl = float(values.get("net_pnl_usdc") or 0.0)
+        ev_per_opportunity = net_pnl / evaluable if evaluable else 0.0
+        return WeakStateShadowEvidence(
+            evaluable=evaluable,
+            tp_first=tp_first,
+            cost_adjusted_ev_per_opportunity=ev_per_opportunity,
+            data_complete=bool(
+                values.get("data_complete", False)
+                and ambiguous == 0
+                and incomplete == 0
+            ),
+            ambiguous=ambiguous,
+            incomplete=incomplete,
+        )
+
+    def _v1460_risk_input(
+        self,
+        decision: CodexV1Decision,
+    ) -> LaneAdaptiveRiskInput:
+        session = self._adaptive_session or {}
+        lane = str(decision.lane_code or decision.lane or "UNKNOWN").upper()
+        market_state = self._codex_v1_market_state_from_decision(decision) or "UNKNOWN"
+        lane_state_key = "|".join((lane, market_state))
+        streaks = session.get("v1460_lane_state_loss_streaks")
+        net_by_key = session.get("v1460_lane_state_net_pnl_usdc")
+        isolated = session.get("v1460_isolated_keys") or ()
+        return LaneAdaptiveRiskInput(
+            integrity_safe=not bool(self._v1459_guard.identity_unsafe),
+            global_halted=bool(session.get("stop_requested")),
+            lane_state_isolated=lane_state_key in isolated,
+            consecutive_complete_losses=max(
+                0,
+                int(
+                    (streaks or {}).get(lane_state_key, 0)
+                    if isinstance(streaks, Mapping)
+                    else 0
+                ),
+            ),
+            lane_net_pnl_usdc=float(
+                (net_by_key or {}).get(lane_state_key, 0.0)
+                if isinstance(net_by_key, Mapping)
+                else 0.0
+            ),
+            cohort_net_pnl_usdc=float(session.get("net_pnl_usdc") or 0.0),
+        )
+
+    async def _v1460_apply_lane_policy(
+        self,
+        run: Mapping[str, Any],
+        decision: CodexV1Decision,
+    ) -> CodexV1Decision:
+        """Annotate or enforce the closed lane matrix after incumbent admission."""
+
+        if not self._v1460_candidate_active(run) or not decision.accepted:
+            return decision
+        enforcement = self._v1460_enforcement_active(run)
+        mode = "enforcement" if enforcement else "candidate-only"
+        run_id = str(run.get("run_id") or "")
+        lane = str(decision.lane_code or decision.lane or "UNKNOWN").upper()
+        market_state = self._codex_v1_market_state_from_decision(decision) or "UNKNOWN"
+
+        def fail_closed(reason: str, exc: Exception) -> CodexV1Decision:
+            logger.error(
+                reason,
+                run_id=run_id,
+                lane_code=lane,
+                market_state=market_state,
+                error=str(exc)[:200],
+            )
+            if not enforcement:
+                return decision
+            if self._adaptive_session is not None:
+                self._adaptive_session["stop_requested"] = True
+                self._adaptive_session["rearm_enabled"] = False
+                self._adaptive_session["safety_halt_reason"] = reason
+            metrics = dict(decision.metrics) if isinstance(decision.metrics, Mapping) else {}
+            metrics["v1460_lane_adaptive"] = {
+                "action_mode": AdaptiveActionMode.HALT.value,
+                "incumbent_accepted": True,
+                "matrix_rule_id": reason,
+                "risk_scale": 0.0,
+                "max_notional_usdc": 0.0,
+                "evidence_gate": {"required": False, "error": str(exc)[:200]},
+                "policy_hash": None,
+                "mode": mode,
+                "permits_order": False,
+            }
+            return replace(
+                decision,
+                accepted=False,
+                size_mult=0.0,
+                notional_mult=0.0,
+                requested_notional_usdc=0.0,
+                metrics=metrics,
+            )
+
+        try:
+            adaptive = select_lane_adaptive_decision(
+                lane=lane,
+                market_state=market_state,
+                incumbent_accepted=bool(decision.accepted),
+                weak_evidence=self._v1460_weak_evidence_input(),
+                risk=self._v1460_risk_input(decision),
+                config=self._v1460_lane_adaptive_config(),
+            )
+            adaptive = replace(adaptive, policy_hash=self._v1460_policy_hash())
+            applied = apply_lane_adaptive_decision(
+                decision,
+                adaptive,
+                mode=mode,
+            )
+        except Exception as exc:  # noqa: BLE001 - enforcement must fail closed
+            return fail_closed("v1460_lane_policy_evaluation_failed", exc)
+
+        transition_key = (run_id, lane, market_state)
+        transition = (
+            adaptive.action_mode.value,
+            adaptive.matrix_rule_id,
+            mode,
+            adaptive.policy_hash,
+        )
+        if self._v1460_policy_last_transition.get(transition_key) != transition:
+            details = {
+                "lane_code": lane,
+                "market_state": market_state,
+                "action_mode": adaptive.action_mode.value,
+                "matrix_rule_id": adaptive.matrix_rule_id,
+                "risk_scale": adaptive.risk_scale,
+                "max_notional_usdc": adaptive.max_notional_usdc,
+                "evidence_gate": dict(adaptive.evidence_gate),
+                "policy_hash": adaptive.policy_hash,
+                "mode": mode,
+                "incumbent_accepted": bool(decision.accepted),
+                "accepted_after": bool(applied.accepted),
+                "permits_order": adaptive.permits_order,
+                "shadow_candidates": list(adaptive.shadow_candidates),
+            }
+            try:
+                await self._repo.log_event(
+                    run_id,
+                    "v1460_lane_policy_transition",
+                    details,
+                )
+            except Exception as exc:  # noqa: BLE001 - live mutation needs audit
+                return fail_closed("v1460_lane_policy_persistence_failed", exc)
+            self._v1460_policy_last_transition[transition_key] = transition
+
+        if enforcement and adaptive.action_mode is AdaptiveActionMode.HALT:
+            await self._v1460_halt_paid_path(
+                run,
+                adaptive.matrix_rule_id,
+                {
+                    "lane_code": lane,
+                    "market_state": market_state,
+                    "policy_hash": adaptive.policy_hash,
+                },
+            )
+        return applied
+
+    def _v1461_coarse_regime(
+        self,
+        run: Mapping[str, Any],
+        decision: CodexV1Decision,
+    ) -> str:
+        metrics = decision.metrics if isinstance(decision.metrics, Mapping) else {}
+        # Prefer the v1.4.59 profile result produced later in the same logical
+        # observation.  A prior v1.4.61 annotation may belong to an earlier
+        # candidate-only pass and must never mask a newly adverse state.
+        existing = str(metrics.get("v1459_regime_state") or "").upper()
+        if existing in {"TREND_UP", "TREND_DOWN", "RANGE", "SHOCK", "UNCERTAIN"}:
+            return existing
+        prior_v1461 = (
+            metrics.get("v1461_adaptive_gate")
+            if isinstance(metrics.get("v1461_adaptive_gate"), Mapping)
+            else None
+        )
+        prior_state = str((prior_v1461 or {}).get("market_state") or "").upper()
+        if prior_state in {
+            "TREND_UP",
+            "TREND_DOWN",
+            "RANGE",
+            "SHOCK",
+            "UNCERTAIN",
+        }:
+            return prior_state
+        symbol = str(run.get("symbol") or self._settings.mainnet_symbol or "").upper()
+        lane = str(decision.lane_code or decision.lane or "UNKNOWN").upper()
+        runtime_key = (symbol, lane)
+        runtime = self._v1459_regime_runtimes.get(runtime_key)
+        if runtime is None:
+            runtime = V1459RegimeRuntime(self._v1459_regime_config())
+            self._v1459_regime_runtimes[runtime_key] = runtime
+        now_ms = int(time.time() * 1000)
+        overlay = runtime.evaluate(
+            self._codex_v1_market_state_from_decision(decision),
+            decision_time_ms=now_ms,
+            event_time_ms=now_ms,
+            available_at_ms=now_ms,
+        )
+        return overlay.state.value
+
+    @staticmethod
+    def _v1461_compatibility(
+        lane: str,
+        coarse_state: str,
+        detailed_state: str,
+    ) -> RegimeCompatibility:
+        lane_u = str(lane or "UNKNOWN").upper().replace("_", "-")
+        coarse = str(coarse_state or "UNKNOWN").upper()
+        detail = str(detailed_state or "").lower().replace("-", "_")
+        if coarse == "SHOCK" or any(
+            token in detail
+            for token in ("shock", "counter_recoil", "falling_discount_trap")
+        ):
+            return RegimeCompatibility.HARD_BLOCK
+        if coarse not in {"TREND_UP", "TREND_DOWN", "RANGE"}:
+            return RegimeCompatibility.UNKNOWN
+        if lane_u == "STUP-S":
+            if any(
+                token in detail
+                for token in ("clean_extension", "hot_continuation", "strong_up_continuation")
+            ):
+                return RegimeCompatibility.SUPPORTIVE
+            if any(
+                token in detail
+                for token in ("near_vwap", "no_momentum", "weak_chop", "mixed")
+            ):
+                return RegimeCompatibility.NEUTRAL
+            if coarse in {"TREND_DOWN", "RANGE"}:
+                return RegimeCompatibility.SUPPORTIVE
+            return RegimeCompatibility.ADVERSE
+        if lane_u in {"CNL-WPR-L", "CNL-WPR-LONG"}:
+            if any(
+                token in detail
+                for token in ("fast_reclaim", "discount_mixed", "delayed_reclaim")
+            ):
+                return RegimeCompatibility.SUPPORTIVE
+            if any(token in detail for token in ("deep_discount", "ambiguous", "trap")):
+                return RegimeCompatibility.ADVERSE
+            if coarse in {"TREND_UP", "RANGE"}:
+                return RegimeCompatibility.SUPPORTIVE
+            return RegimeCompatibility.ADVERSE
+        if lane_u == "W6C":
+            if coarse == "TREND_DOWN":
+                return RegimeCompatibility.SUPPORTIVE
+            if coarse == "RANGE":
+                return RegimeCompatibility.NEUTRAL
+            return RegimeCompatibility.ADVERSE
+        if lane_u in {"RP1", "S1P-L", "W6A", "W6B"}:
+            if coarse == "TREND_UP":
+                return RegimeCompatibility.SUPPORTIVE
+            if coarse == "RANGE":
+                return RegimeCompatibility.NEUTRAL
+            return RegimeCompatibility.ADVERSE
+        # Unclassified legacy lanes remain observation-only until an explicit
+        # coarse compatibility map is reviewed.
+        return RegimeCompatibility.UNKNOWN
+
+    def _v1461_episode_id(
+        self,
+        gate_family_id: str,
+        lane: str,
+        coarse_state: str,
+        now_ms: int,
+    ) -> str:
+        session = self._adaptive_session
+        base_key = "|".join((str(gate_family_id), str(lane))).upper()
+        if not session:
+            return f"{base_key}|{coarse_state}|ep0"
+        states = session.setdefault("v1461_episode_states", {})
+        state = states.setdefault(
+            base_key,
+            {
+                "current_state": None,
+                "sequence_by_state": {},
+                "episode_id_by_state": {},
+                "last_left_at_ms_by_state": {},
+            },
+        )
+        current = str(state.get("current_state") or "")
+        sequences = state.setdefault("sequence_by_state", {})
+        episode_ids = state.setdefault("episode_id_by_state", {})
+        last_left = state.setdefault("last_left_at_ms_by_state", {})
+        if current and current != coarse_state:
+            last_left[current] = now_ms
+        episode_id = str(episode_ids.get(coarse_state) or "")
+        separation_ms = (
+            self._v1461_gate_config().episode_exit_confirmation_seconds * 1000
+        )
+        prior_left = int(last_left.get(coarse_state) or 0)
+        last_seen_at_ms = int(state.get("last_seen_at_ms") or 0)
+        observation_gap_confirmed = bool(
+            episode_id
+            and last_seen_at_ms > 0
+            and now_ms - last_seen_at_ms >= separation_ms
+        )
+        if not episode_id or (
+            current != coarse_state
+            and prior_left > 0
+            and now_ms - prior_left >= separation_ms
+        ) or observation_gap_confirmed:
+            seq = int(sequences.get(coarse_state) or 0) + 1
+            sequences[coarse_state] = seq
+            episode_id = f"{base_key}|{coarse_state}|ep{seq}"
+            episode_ids[coarse_state] = episode_id
+        state["current_state"] = coarse_state
+        state["last_seen_at_ms"] = now_ms
+        state["current_episode_id"] = episode_id
+        return episode_id
+
+    def _v1461_evidence_input(self, key: str) -> V1461GateEvidence:
+        session = self._adaptive_session or {}
+        all_evidence = session.get("v1461_gate_evidence")
+        values = (
+            all_evidence.get(key, {})
+            if isinstance(all_evidence, Mapping)
+            else {}
+        )
+        now_ms = int(time.time() * 1000)
+        cutoff_ms = now_ms - self._v1461_gate_config().evidence_max_age_seconds * 1000
+        active_hash = self._v1461_gate_config().policy_hash
+        records = values.get("records") if isinstance(values, Mapping) else None
+
+        def _record_time_ms(record: Mapping[str, Any]) -> int:
+            try:
+                return int(
+                    record.get("resolved_at_ms")
+                    or record.get("processed_at_ms")
+                    or 0
+                )
+            except (TypeError, ValueError, OverflowError):
+                return 0
+
+        def _record_complete(record: Mapping[str, Any]) -> bool:
+            if not bool(record.get("data_complete")):
+                return False
+            if str(record.get("outcome") or "") not in {
+                "tp1_first",
+                "sl_first",
+                "max_hold",
+                "no_fill",
+            }:
+                return False
+            try:
+                pnl = float(record["net_pnl_usdc"])
+            except (KeyError, TypeError, ValueError, OverflowError):
+                return False
+            return not isinstance(record.get("net_pnl_usdc"), bool) and math.isfinite(pnl)
+
+        matching_records = [
+            record
+            for record in (records or ())
+            if isinstance(record, Mapping)
+            and str(record.get("policy_hash") or "") == active_hash
+            and cutoff_ms <= _record_time_ms(record) <= now_ms
+        ]
+        valid_records = [
+            record for record in matching_records if _record_complete(record)
+        ]
+        opportunities = len(matching_records)
+        tp_first = sum(
+            1 for record in valid_records if record.get("outcome") == "tp1_first"
+        )
+        sl_first = sum(
+            1 for record in valid_records if record.get("outcome") == "sl_first"
+        )
+        no_fill = sum(
+            1 for record in valid_records if record.get("outcome") == "no_fill"
+        )
+        max_hold = sum(
+            1 for record in valid_records if record.get("outcome") == "max_hold"
+        )
+        ambiguous = sum(
+            1
+            for record in matching_records
+            if str(record.get("outcome") or "") == "ambiguous_both"
+        )
+        incomplete = sum(
+            1
+            for record in matching_records
+            if not _record_complete(record)
+            and str(record.get("outcome") or "") != "ambiguous_both"
+        )
+        evaluable = tp_first + sl_first + max_hold
+        net_pnl = sum(float(record["net_pnl_usdc"]) for record in valid_records)
+        last_record = max(
+            matching_records,
+            key=_record_time_ms,
+            default=None,
+        )
+        episode_ids = {
+            str(record.get("episode_id") or "")
+            for record in valid_records
+            if str(record.get("episode_id") or "")
+        }
+        return V1461GateEvidence(
+            opportunities=opportunities,
+            evaluable=evaluable,
+            tp_first=tp_first,
+            sl_first=sl_first,
+            max_hold=max_hold,
+            no_fill=no_fill,
+            ambiguous=ambiguous,
+            incomplete=incomplete,
+            net_pnl_usdc=net_pnl,
+            last_outcome=(last_record or {}).get("outcome"),
+            last_outcome_at_ms=(
+                int(
+                    _record_time_ms(last_record)
+                )
+                if last_record is not None
+                else None
+            ),
+            matching_episode_count=len(episode_ids),
+            first_probe_net_pnl_usdc=(
+                float(values["first_probe_net_pnl_usdc"])
+                if values.get("first_probe_net_pnl_usdc") is not None
+                else None
+            ),
+            first_probe_episode_id=(
+                str(values["first_probe_episode_id"])
+                if values.get("first_probe_episode_id")
+                else None
+            ),
+            paid_complete=max(0, int(values.get("paid_complete") or 0)),
+            paid_wins=max(0, int(values.get("paid_wins") or 0)),
+            paid_net_pnl_usdc=float(values.get("paid_net_pnl_usdc") or 0.0),
+            paid_integrity_complete=bool(
+                values.get("paid_integrity_complete", True)
+            ),
+        )
+
+    def _v1461_risk_input(self, key: str) -> AdaptiveGateRiskInput:
+        session = self._adaptive_session or {}
+        streaks = session.get("v1461_gate_loss_streaks")
+        net_by_key = session.get("v1461_gate_net_pnl_usdc")
+        quarantined = session.get("v1461_quarantined_keys") or ()
+        return AdaptiveGateRiskInput(
+            integrity_safe=not bool(self._v1459_guard.identity_unsafe),
+            global_halted=bool(session.get("stop_requested")),
+            key_quarantined=key in quarantined,
+            consecutive_paid_losses=max(
+                0,
+                int(streaks.get(key, 0) if isinstance(streaks, Mapping) else 0),
+            ),
+            key_net_pnl_usdc=float(
+                net_by_key.get(key, 0.0) if isinstance(net_by_key, Mapping) else 0.0
+            ),
+            cohort_net_pnl_usdc=float(session.get("net_pnl_usdc") or 0.0),
+        )
+
+    async def _v1461_apply_gate_policy(
+        self,
+        run: Mapping[str, Any],
+        decision: CodexV1Decision,
+        *,
+        incumbent_accepted: bool,
+        gate_family_id: str,
+        promotion_eligible: bool,
+    ) -> CodexV1Decision:
+        if not self._v1461_candidate_active(run):
+            return decision
+        enforcement = self._v1461_enforcement_active(run)
+        mode = "enforcement" if enforcement else "candidate-only"
+        now_ms = int(time.time() * 1000)
+        lane = str(decision.lane_code or decision.lane or "UNKNOWN").upper()
+        detailed_state = self._codex_v1_market_state_from_decision(decision) or "UNKNOWN"
+
+        def fail_closed(reason: str, exc: Exception) -> CodexV1Decision:
+            logger.error(
+                reason,
+                run_id=run.get("run_id"),
+                lane_code=lane,
+                gate_family_id=gate_family_id,
+                error=str(exc)[:200],
+            )
+            if not enforcement:
+                return decision
+            if self._adaptive_session is not None:
+                self._adaptive_session["stop_requested"] = True
+                self._adaptive_session["rearm_enabled"] = False
+                self._adaptive_session["safety_halt_reason"] = reason
+            metrics = dict(decision.metrics) if isinstance(decision.metrics, Mapping) else {}
+            metrics["v1461_adaptive_gate"] = {
+                "action_mode": V1461ActionMode.HALT.value,
+                "permits_order": False,
+                "matrix_rule_id": reason,
+                "policy_hash": None,
+                "mode": mode,
+                "error": str(exc)[:200],
+            }
+            return replace(
+                decision,
+                accepted=False,
+                size_mult=0.0,
+                notional_mult=0.0,
+                requested_notional_usdc=0.0,
+                metrics=metrics,
+            )
+
+        try:
+            coarse_state = self._v1461_coarse_regime(run, decision)
+            compatibility = self._v1461_compatibility(
+                lane, coarse_state, detailed_state
+            )
+            episode_id = self._v1461_episode_id(
+                gate_family_id, lane, coarse_state, now_ms
+            )
+            key = v1461_promotion_key(gate_family_id, lane, coarse_state)
+            consumed = self._adaptive_session.get("v1461_consumed_tokens", set()) if self._adaptive_session else set()
+            adaptive = select_adaptive_gate_decision(
+                incumbent_accepted=incumbent_accepted,
+                promotion_eligible=promotion_eligible,
+                gate_family_id=gate_family_id,
+                lane=lane,
+                market_state=coarse_state,
+                episode_id=episode_id,
+                compatibility=compatibility,
+                evidence=self._v1461_evidence_input(key),
+                risk=self._v1461_risk_input(key),
+                now_ms=now_ms,
+                token_consumed=False,
+                config=self._v1461_gate_config(),
+            )
+            if adaptive.token_id and adaptive.token_id in consumed:
+                adaptive = select_adaptive_gate_decision(
+                    incumbent_accepted=incumbent_accepted,
+                    promotion_eligible=promotion_eligible,
+                    gate_family_id=gate_family_id,
+                    lane=lane,
+                    market_state=coarse_state,
+                    episode_id=episode_id,
+                    compatibility=compatibility,
+                    evidence=self._v1461_evidence_input(key),
+                    risk=self._v1461_risk_input(key),
+                    now_ms=now_ms,
+                    token_consumed=True,
+                    config=self._v1461_gate_config(),
+                )
+            applied = apply_adaptive_gate_decision(decision, adaptive, mode=mode)
+        except Exception as exc:  # noqa: BLE001 - live admission fails closed
+            return fail_closed("v1461_gate_evaluation_failed", exc)
+
+        transition_key = (
+            str(run.get("run_id") or ""),
+            gate_family_id,
+            lane,
+            coarse_state,
+        )
+        transition = (
+            adaptive.action_mode.value,
+            adaptive.matrix_rule_id,
+            mode,
+            adaptive.policy_hash,
+        )
+        if self._v1461_policy_last_transition.get(transition_key) != transition:
+            payload = {
+                "gate_family_id": gate_family_id,
+                "lane_code": lane,
+                "detailed_market_state": detailed_state,
+                "coarse_market_state": coarse_state,
+                "compatibility": compatibility.value,
+                "episode_id": episode_id,
+                "action_mode": adaptive.action_mode.value,
+                "matrix_rule_id": adaptive.matrix_rule_id,
+                "risk_scale": adaptive.risk_scale,
+                "max_notional_usdc": adaptive.max_notional_usdc,
+                "evidence_gate": dict(adaptive.evidence_gate),
+                "token_id": adaptive.token_id,
+                "policy_hash": adaptive.policy_hash,
+                "mode": mode,
+                "incumbent_accepted": incumbent_accepted,
+                "accepted_after": bool(applied.accepted),
+                "permits_order": adaptive.permits_order,
+            }
+            try:
+                await self._repo.log_event(
+                    str(run.get("run_id") or ""),
+                    "v1461_adaptive_gate_transition",
+                    payload,
+                )
+            except Exception as exc:  # noqa: BLE001 - mutation requires audit
+                return fail_closed("v1461_gate_persistence_failed", exc)
+            self._v1461_policy_last_transition[transition_key] = transition
+        return applied
+
+    def _v1459_regime_config(self) -> V1459RegimeConfig:
+        """Build the bounded live profile menu from explicit v1.4.59 settings."""
+
+        max_notional = min(
+            ADAPTIVE_NOTIONAL_USDC,
+            float(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1459_regime_max_notional_usdc",
+                    ADAPTIVE_NOTIONAL_USDC,
+                )
+            ),
+        )
+        trend_profile: V1459ActionProfile = replace(
+            TREND_RUNNER,
+            max_notional_usdc=max_notional,
+            size_mult=float(
+                getattr(self._settings, "mainnet_codex_v1459_trend_size_mult", 1.0)
+            ),
+            entry_offset_bp=float(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1459_trend_entry_offset_bp",
+                    2.0,
+                )
+            ),
+            tp1_bp=float(
+                getattr(self._settings, "mainnet_codex_v1459_trend_tp1_bp", 6.0)
+            ),
+            full_tp_bp=float(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1459_trend_full_tp_bp",
+                    16.0,
+                )
+            ),
+            partial_exit_pct=float(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1459_trend_partial_exit_pct",
+                    0.70,
+                )
+            ),
+            sl_bp=float(
+                getattr(self._settings, "mainnet_codex_v1459_trend_sl_bp", 10.0)
+            ),
+            be_bp=float(
+                getattr(self._settings, "mainnet_codex_v1459_trend_be_bp", 2.0)
+            ),
+            ttl_s=int(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1459_trend_entry_ttl_seconds",
+                    60,
+                )
+            ),
+            hold_s=int(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1459_trend_hold_seconds",
+                    720,
+                )
+            ),
+        )
+        range_profile: V1459ActionProfile = replace(
+            RANGE_SCALP,
+            max_notional_usdc=max_notional,
+            size_mult=float(
+                getattr(self._settings, "mainnet_codex_v1459_range_size_mult", 0.75)
+            ),
+            entry_offset_bp=float(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1459_range_entry_offset_bp",
+                    1.0,
+                )
+            ),
+            tp1_bp=float(
+                getattr(self._settings, "mainnet_codex_v1459_range_tp1_bp", 5.0)
+            ),
+            full_tp_bp=float(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1459_range_full_tp_bp",
+                    8.0,
+                )
+            ),
+            partial_exit_pct=float(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1459_range_partial_exit_pct",
+                    1.0,
+                )
+            ),
+            sl_bp=float(
+                getattr(self._settings, "mainnet_codex_v1459_range_sl_bp", 8.0)
+            ),
+            be_bp=float(
+                getattr(self._settings, "mainnet_codex_v1459_range_be_bp", 2.0)
+            ),
+            ttl_s=int(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1459_range_entry_ttl_seconds",
+                    90,
+                )
+            ),
+            hold_s=int(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1459_range_hold_seconds",
+                    360,
+                )
+            ),
+        )
+        return V1459RegimeConfig(
+            confirmations=max(
+                1,
+                int(
+                    getattr(
+                        self._settings,
+                        (
+                            "mainnet_codex_v1461_regime_confirmations"
+                            if self._v1461_config_selected()
+                            else "mainnet_codex_v1459_regime_confirmations"
+                        ),
+                        2,
+                    )
+                ),
+            ),
+            min_dwell_ms=max(
+                0,
+                int(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v1459_regime_min_dwell_seconds",
+                        15,
+                    )
+                ),
+            )
+            * 1000,
+            stale_after_ms=max(
+                0,
+                int(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v1459_regime_stale_after_seconds",
+                        90,
+                    )
+                ),
+            )
+            * 1000,
+            max_notional_usdc=max_notional,
+            trend_profile=trend_profile,
+            range_profile=range_profile,
+            shock_profile=replace(
+                SHOCK_RISK_OFF,
+                max_notional_usdc=max_notional,
+            ),
+            fallback_profile=replace(
+                INCUMBENT_FALLBACK,
+                max_notional_usdc=max_notional,
+            ),
+        )
+
+    async def _v1459_apply_regime_profile(
+        self,
+        run: Mapping[str, Any],
+        decision: CodexV1Decision,
+        *,
+        features: Mapping[str, Any] | None = None,
+    ) -> CodexV1Decision:
+        """Audit or enforce one debounced regime profile before entry submit."""
+
+        if (
+            not self._v1459_profile_candidate_active(run)
+            or getattr(
+                self._settings,
+                "mainnet_codex_v1459_regime_switch_enabled",
+                False,
+            )
+            is not True
+            or not decision.accepted
+        ):
+            return decision
+
+        enforcement = self._v1459_profile_enforcement_active()
+        mode = "enforcement" if enforcement else "candidate-only"
+        symbol = str(
+            run.get("symbol") or self._settings.mainnet_symbol or ""
+        ).upper()
+        lane_code = str(
+            decision.lane_code or decision.lane or "UNKNOWN"
+        ).upper()
+        run_id = str(run.get("run_id") or "")
+        runtime_key = (symbol, lane_code)
+        transition_key = (run_id, symbol, lane_code)
+        now_ms = int(time.time() * 1000)
+        feature_age_s = self._codex_v143_metric_float(
+            features, "feature_age_seconds"
+        )
+        if feature_age_s is None:
+            feature_age_s = self._codex_v143_metric_float(
+                decision.metrics, "feature_age_seconds"
+            )
+        event_time_ms = now_ms - int(
+            max(0.0, float(feature_age_s or 0.0)) * 1000
+        )
+
+        def fail_closed(reason: str, exc: Exception) -> CodexV1Decision:
+            logger.error(
+                reason,
+                run_id=run.get("run_id"),
+                symbol=symbol,
+                lane_code=lane_code,
+                error=str(exc)[:200],
+            )
+            if not enforcement:
+                return decision
+            if self._adaptive_session is not None:
+                self._adaptive_session["stop_requested"] = True
+                self._adaptive_session["rearm_enabled"] = False
+            metrics = (
+                dict(decision.metrics)
+                if isinstance(decision.metrics, Mapping)
+                else {}
+            )
+            metrics.update(
+                {
+                    "v1459_regime_mode": mode,
+                    "v1459_regime_fail_closed": True,
+                    "v1459_regime_failure_reason": reason,
+                }
+            )
+            return replace(
+                decision,
+                accepted=False,
+                entry_offset_bp=None,
+                size_mult=0.0,
+                notional_mult=0.0,
+                requested_notional_usdc=0.0,
+                reason=reason,
+                risk_tags=tuple(
+                    dict.fromkeys(
+                        (*decision.risk_tags, "v1459_regime_fail_closed")
+                    )
+                ),
+                metrics=metrics,
+                policy_tag="v1.4.59_regime_overlay",
+            )
+
+        try:
+            runtime = self._v1459_regime_runtimes.get(runtime_key)
+            if runtime is None:
+                runtime = V1459RegimeRuntime(self._v1459_regime_config())
+                self._v1459_regime_runtimes[runtime_key] = runtime
+            overlay = runtime.evaluate(
+                self._codex_v1_market_state_from_decision(decision),
+                decision_time_ms=now_ms,
+                event_time_ms=event_time_ms,
+                available_at_ms=now_ms,
+            )
+            applied = apply_v1459_regime_overlay(
+                decision,
+                overlay,
+                mode=mode,
+            )
+        except Exception as exc:  # noqa: BLE001 - enforcement must fail closed
+            return fail_closed("v1459_regime_evaluation_failed", exc)
+
+        if mode == "enforcement" and isinstance(applied.metrics, Mapping):
+            applied_metrics = dict(applied.metrics)
+            if applied_metrics.get("entry_offset_bp") is not None:
+                applied_metrics["entry_bp"] = applied_metrics[
+                    "entry_offset_bp"
+                ]
+            applied = replace(applied, metrics=applied_metrics)
+
+        transition = (
+            overlay.state.value,
+            overlay.profile.name,
+            mode,
+        )
+        if self._v1459_regime_last_transition.get(transition_key) == transition:
+            return applied
+        payload = {
+            "symbol": symbol,
+            "lane_code": lane_code,
+            "market_state": self._codex_v1_market_state_from_decision(
+                decision
+            )
+            or None,
+            "state": transition[0],
+            "profile": transition[1],
+            "mode": transition[2],
+            "accepted_before": bool(decision.accepted),
+            "accepted_after": bool(applied.accepted),
+            "audit": dict(overlay.audit_payload),
+            "profile_actions": asdict(overlay.profile),
+        }
+        try:
+            await self._repo.log_event(
+                run_id,
+                "v1459_regime_profile_transition",
+                payload,
+            )
+        except Exception as exc:  # noqa: BLE001 - mutated entry needs durable audit
+            return fail_closed(
+                "v1459_regime_transition_persistence_failed",
+                exc,
+            )
+        self._v1459_regime_last_transition[transition_key] = transition
+        return applied
+
+    async def _v1459_owned_hard_sl_present(
+        self,
+        run: Mapping[str, Any],
+        position: PositionInfo | None = None,
+    ) -> bool:
+        """Prove a live, run-owned, position-covering exchange hard SL."""
+
+        if not self._v1459_profile_candidate_active(run):
+            return False
+        if position is None:
+            return False
+        try:
+            position_qty = abs(float(position.position_amt))
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not math.isfinite(position_qty) or position_qty <= 0:
+            return False
+        run_id = str(run.get("run_id") or "")
+        symbol = str(run.get("symbol") or self._settings.mainnet_symbol)
+        if not run_id or not symbol:
+            return False
+        expected_side = "SELL" if float(position.position_amt) > 0 else "BUY"
+        try:
+            orders = await self._client.get_open_algo_orders(symbol)
+        except Exception as exc:  # noqa: BLE001 - incomplete proof means PROTECT
+            logger.warning(
+                "v1459_hard_sl_proof_failed",
+                run_id=run_id,
+                error=str(exc)[:200],
+            )
+            return False
+        expected_client_id = f"{run_id}_sl"
+        active_statuses = {"NEW", "WORKING", "PENDING"}
+        for order in orders or ():
+            if str(order.get("clientAlgoId") or "") != expected_client_id:
+                continue
+            if str(order.get("orderType") or "").upper() != "STOP_MARKET":
+                continue
+            if str(order.get("side") or "").upper() != expected_side:
+                continue
+            order_symbol = str(order.get("symbol") or symbol)
+            if order_symbol != symbol:
+                continue
+            reduce_only = order.get("reduceOnly")
+            if isinstance(reduce_only, str):
+                reduce_only = reduce_only.strip().lower() == "true"
+            if reduce_only is not True:
+                continue
+            status = str(
+                order.get("algoStatus") or order.get("status") or ""
+            ).upper()
+            if status not in active_statuses:
+                continue
+            raw_qty = order.get("quantity", order.get("origQty"))
+            try:
+                stop_qty = abs(float(raw_qty))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if not math.isfinite(stop_qty) or stop_qty + 1e-12 < position_qty:
+                continue
+            return True
+        return False
+
+    async def _v1459_log_profile_transition(
+        self,
+        run: Mapping[str, Any],
+        *,
+        phase: str,
+        decision: Any,
+        facts: Mapping[str, Any],
+        incumbent_reason: str | None = None,
+    ) -> bool:
+        """Persist one event per changed profile; never spam each manage tick."""
+
+        if not self._v1459_profile_candidate_active(run):
+            return True
+        run_id = str(run.get("run_id") or "")
+        enforcement = self._v1459_profile_enforcement_active()
+        transition = (
+            str(decision.profile.value),
+            str(decision.reason.value),
+            enforcement,
+        )
+        key = (run_id, str(phase))
+        if self._v1459_profile_last_transition.get(key) == transition:
+            return True
+        payload = {
+            "phase": str(phase),
+            "profile": transition[0],
+            "reason": transition[1],
+            "policy_hash": str(decision.policy_hash),
+            "adaptive_eligible": bool(decision.adaptive_eligible),
+            "incumbent_eligible": bool(decision.incumbent_eligible),
+            "enforcement": enforcement,
+            "incumbent_reason": incumbent_reason,
+            "facts": dict(facts),
+        }
+        try:
+            await self._repo.log_event(
+                run_id,
+                "v1459_profile_transition",
+                payload,
+            )
+        except Exception as exc:  # noqa: BLE001 - adaptive mutation fails closed
+            logger.error(
+                "v1459_profile_transition_failed",
+                run_id=run_id,
+                phase=phase,
+                enforcement=enforcement,
+                error=str(exc)[:200],
+            )
+            if enforcement and self._adaptive_session is not None:
+                self._adaptive_session["stop_requested"] = True
+                self._adaptive_session["rearm_enabled"] = False
+            return False
+        self._v1459_profile_last_transition[key] = transition
+        return True
+
+    async def _v1459_apply_exit_profile(
+        self,
+        run: Mapping[str, Any],
+        *,
+        decision: ExitPolicyDecision,
+        incumbent_reason: str | None,
+        facts: Mapping[str, Any],
+    ) -> str | None:
+        """Apply only the frozen, reversible exit actions."""
+
+        recorded = await self._v1459_log_profile_transition(
+            run,
+            phase="EXIT",
+            decision=decision,
+            facts=facts,
+            incumbent_reason=incumbent_reason,
+        )
+        if not recorded or not self._v1459_profile_enforcement_active():
+            return incumbent_reason
+        signal = self._codex_v1_signal_payload(run)
+        codex = (
+            signal.get("codex_v1")
+            if isinstance(signal, Mapping)
+            else {}
+        )
+        if not isinstance(codex, Mapping):
+            codex = {}
+        metrics = (
+            codex.get("metrics")
+            if isinstance(codex.get("metrics"), Mapping)
+            else {}
+        )
+        regime_enforced = (
+            str(metrics.get("v1459_regime_mode") or "").lower()
+            == "enforcement"
+        )
+        exit_mode = str(metrics.get("exit_mode") or "").upper()
+        regime_state = str(
+            metrics.get("v1459_regime_state") or ""
+        ).upper()
+        if decision.profile is ExitProfile.EARLY_FAIL:
+            if regime_enforced and exit_mode != "EARLY_FAIL":
+                return incumbent_reason
+            return "CODEX_EARLY_FAIL"
+        if decision.profile is ExitProfile.RUNNER:
+            if regime_enforced and (
+                exit_mode != "RUNNER" or regime_state == "RANGE"
+            ):
+                return incumbent_reason
+            run_id = str(run.get("run_id") or "")
+            if (
+                incumbent_reason in V1459_RUNNER_SOFT_EXIT_REASONS
+                and run_id not in self._v1459_runner_extension_used
+                and self._v1459_cycle_mode(run) == "NORMAL"
+            ):
+                self._v1459_runner_extension_used.add(run_id)
+                return None
+        return incumbent_reason
+
+    async def _v1459_observe_entry_profile(
+        self,
+        run: Mapping[str, Any],
+        *,
+        order_id: int,
+        existing_order: Mapping[str, Any],
+        open_orders: Sequence[Mapping[str, Any]],
+        age_ms: int,
+        ttl_seconds: int,
+        bid: float,
+        ask: float,
+        deviation_bps: float,
+    ) -> EntryPolicyDecision | None:
+        """Select and persist entry intent; callers retain mutation authority."""
+
+        if not self._v1459_profile_candidate_active(run):
+            return None
+        config = build_profile_config(self._settings)
+        if not config.flags.one_step_reprice_enabled:
+            return None
+        signal = self._codex_v1_signal_payload(run)
+        lane_code = self._codex_v1_signal_lane_code(signal)
+        codex = signal.get("codex_v1") if isinstance(signal, Mapping) else {}
+        if not isinstance(codex, Mapping):
+            codex = {}
+        metrics = (
+            codex.get("metrics")
+            if isinstance(codex.get("metrics"), Mapping)
+            else {}
+        )
+        action_id = str(
+            metrics.get("v1455_action")
+            or metrics.get("v1427_action")
+            or metrics.get("v1421_action")
+            or ""
+        ).upper()
+        maker_mode = str(metrics.get("maker_mode") or "").strip().upper()
+        codex_accepted = bool(
+            codex.get("accepted") is True or codex.get("enabled") is True
+        )
+        run_id = str(run.get("run_id") or "")
+        owned_orders = [
+            row
+            for row in open_orders
+            if str(row.get("clientOrderId") or "").startswith(f"{run_id}_")
+        ]
+        ownership_clear = bool(
+            len(owned_orders) == 1
+            and int(owned_orders[0].get("orderId") or 0) == int(order_id)
+            and str(existing_order.get("clientOrderId") or "").startswith(
+                f"{run_id}_entry"
+            )
+        )
+        spread_bp = float("inf")
+        if bid > 0 and ask >= bid:
+            mid = (bid + ask) / 2.0
+            if mid > 0:
+                spread_bp = (ask - bid) / mid * 10_000.0
+        try:
+            spread_limit_bp = max(
+                0.0,
+                float(self._settings.mainnet_entry_slippage_bps),
+            )
+        except (TypeError, ValueError):
+            spread_limit_bp = 0.0
+        must_expire = age_ms >= max(1, int(ttl_seconds)) * 1000
+        reprice_window_open = bool(
+            not must_expire
+            and age_ms * 2 >= max(1, int(ttl_seconds)) * 1000
+        )
+        price_still_repriceable = maker_mode == "ONE_STEP_REPRICE"
+        if not maker_mode:
+            # Backward-compatible incumbent evidence when no regime profile
+            # has annotated the order yet.
+            price_still_repriceable = "_E2_" in action_id or "_E1_" in action_id
+        facts = {
+            "accepted_by_incumbent_gate": codex_accepted,
+            "reprice_window_open": reprice_window_open,
+            "signal_still_valid": str(run.get("status") or "")
+            not in TERMINAL_STATUSES,
+            "spread_normal": spread_bp <= spread_limit_bp,
+            "ownership_clear": ownership_clear,
+            "cancel_before_replace_required": True,
+            "price_still_repriceable": price_still_repriceable,
+            "reprice_already_used": self._entry_requote_counts.get(run_id, 0)
+            >= 1,
+            "must_expire": must_expire,
+            "age_ms": int(age_ms),
+            "ttl_seconds": int(ttl_seconds),
+            "spread_bp": round(spread_bp, 6)
+            if math.isfinite(spread_bp)
+            else None,
+            "spread_limit_bp": round(spread_limit_bp, 6),
+            "deviation_bps": round(float(deviation_bps), 6),
+            "lane_code": lane_code or None,
+            "action_id": action_id or None,
+            "maker_mode": maker_mode or None,
+        }
+        decision = select_entry_profile(
+            EntryPolicyInput(
+                accepted_by_incumbent_gate=facts[
+                    "accepted_by_incumbent_gate"
+                ],
+                reprice_window_open=facts["reprice_window_open"],
+                signal_still_valid=facts["signal_still_valid"],
+                spread_normal=facts["spread_normal"],
+                ownership_clear=facts["ownership_clear"],
+                cancel_before_replace_required=True,
+                price_still_repriceable=facts[
+                    "price_still_repriceable"
+                ],
+                reprice_already_used=facts["reprice_already_used"],
+                must_expire=facts["must_expire"],
+            ),
+            config,
+        )
+        recorded = await self._v1459_log_profile_transition(
+            run,
+            phase="ENTRY",
+            decision=decision,
+            facts=facts,
+        )
+        if not recorded and self._v1459_profile_enforcement_active():
+            return None
+        return decision
+
+    def _v1459_cycle_mode(self, active: Mapping[str, Any] | None) -> str:
+        if self._v1459_guard.identity_unsafe:
+            return "IDENTITY_UNSAFE"
+        if not self._v1459_entry_paused():
+            return "NORMAL"
+        status = str((active or {}).get("status") or "")
+        if (
+            status in {"ENTRY_PENDING", "RUNNING", "CLOSING"}
+            and self._v1459_known_owned_adaptive_run(active)
+            and self._v1459_guard.permits_known_owned_risk_reduction
+        ):
+            return "RISK_REDUCTION_ONLY"
+        return "ENTRY_PAUSED"
+
+    async def _v1459_note_cycle_pause(
+        self,
+        active: Mapping[str, Any] | None,
+        mode: str,
+    ) -> None:
+        run_id = str((active or {}).get("run_id") or "")
+        event_key = run_id or f"no_run:{mode}"
+        if event_key in self._v1459_pause_event_run_ids:
+            return
+        self._v1459_pause_event_run_ids.add(event_key)
+        details = {
+            "mode": mode,
+            "reason": self._v1459_blocked_reason(),
+            "run_status": (active or {}).get("status"),
+            "new_entry_permitted": False,
+            "known_owned_risk_reduction_permitted": mode == "RISK_REDUCTION_ONLY",
+        }
+        logger.error("v1459_runtime_cycle_restricted", run_id=run_id or None, **details)
+        if run_id and mode != "IDENTITY_UNSAFE":
+            try:
+                await self._repo.log_event(run_id, "v1459_runtime_cycle_restricted", details)
+            except Exception as exc:  # noqa: BLE001 - restriction must remain latched
+                logger.error(
+                    "v1459_runtime_restriction_event_failed",
+                    run_id=run_id,
+                    error=str(exc)[:200],
+                )
+
+    @staticmethod
+    def _adaptive_route_stats_snapshot(
+        session: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "state_net_pnl_usdc": dict(session.get("state_net_pnl_usdc") or {}),
+            "state_throttle_count": dict(session.get("state_throttle_count") or {}),
+            "state_throttle_deadlines": dict(
+                session.get("state_throttle_deadlines") or {}
+            ),
+            "route_loss_streaks": dict(session.get("route_loss_streaks") or {}),
+            "v1460_lane_state_loss_streaks": dict(
+                session.get("v1460_lane_state_loss_streaks") or {}
+            ),
+            "v1460_lane_state_net_pnl_usdc": dict(
+                session.get("v1460_lane_state_net_pnl_usdc") or {}
+            ),
+            "v1460_isolated_keys": sorted(
+                session.get("v1460_isolated_keys") or ()
+            ),
+            "v1460_weak_evidence": dict(
+                session.get("v1460_weak_evidence") or {}
+            ),
+            "v1461_gate_evidence": dict(
+                session.get("v1461_gate_evidence") or {}
+            ),
+            "v1461_episode_states": dict(
+                session.get("v1461_episode_states") or {}
+            ),
+            "v1461_consumed_tokens": sorted(
+                session.get("v1461_consumed_tokens") or ()
+            ),
+            "v1461_gate_loss_streaks": dict(
+                session.get("v1461_gate_loss_streaks") or {}
+            ),
+            "v1461_gate_net_pnl_usdc": dict(
+                session.get("v1461_gate_net_pnl_usdc") or {}
+            ),
+            "v1461_quarantined_keys": sorted(
+                session.get("v1461_quarantined_keys") or ()
+            ),
+            "v1461_paid_results": list(
+                session.get("v1461_paid_results") or ()
+            ),
+        }
+
+    def _v1459_restored_adaptive_session(
+        self,
+        active: Mapping[str, Any],
+        metadata: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        restored = self._v1459_guard.restored_session()
+        expected_session_id = str(metadata.get("session_id") or "")
+        if not restored or str(restored.get("session_id") or "") != expected_session_id:
+            return None
+        route_stats = dict(restored.get("route_stats") or {})
+        session = dict(restored)
+        session.update(
+            {
+                "actor": metadata.get("actor") or "restart",
+                "deadline_at_ms": int(
+                    metadata.get("deadline_at_ms")
+                    or (
+                        time.time() * 1000
+                        + self._adaptive_max_duration_seconds() * 1000
+                    )
+                ),
+                "run_ids": [str(active.get("run_id") or "")],
+                "prior_runtime": metadata.get("prior_runtime") or {},
+                "config_sha": metadata.get("config_sha") or self._adaptive_config_sha(),
+                "state_net_pnl_usdc": dict(route_stats.get("state_net_pnl_usdc") or {}),
+                "state_throttle_count": dict(route_stats.get("state_throttle_count") or {}),
+                "state_throttle_deadlines": dict(route_stats.get("state_throttle_deadlines") or {}),
+                "route_loss_streaks": dict(route_stats.get("route_loss_streaks") or {}),
+                "v1460_lane_state_loss_streaks": dict(
+                    route_stats.get("v1460_lane_state_loss_streaks") or {}
+                ),
+                "v1460_lane_state_net_pnl_usdc": dict(
+                    route_stats.get("v1460_lane_state_net_pnl_usdc") or {}
+                ),
+                "v1460_isolated_keys": set(
+                    route_stats.get("v1460_isolated_keys") or ()
+                ),
+                "v1460_weak_evidence": dict(
+                    route_stats.get("v1460_weak_evidence") or {}
+                ),
+                "v1461_gate_evidence": dict(
+                    route_stats.get("v1461_gate_evidence") or {}
+                ),
+                "v1461_episode_states": dict(
+                    route_stats.get("v1461_episode_states") or {}
+                ),
+                "v1461_consumed_tokens": set(
+                    route_stats.get("v1461_consumed_tokens") or ()
+                ),
+                "v1461_gate_loss_streaks": dict(
+                    route_stats.get("v1461_gate_loss_streaks") or {}
+                ),
+                "v1461_gate_net_pnl_usdc": dict(
+                    route_stats.get("v1461_gate_net_pnl_usdc") or {}
+                ),
+                "v1461_quarantined_keys": set(
+                    route_stats.get("v1461_quarantined_keys") or ()
+                ),
+                "v1461_paid_results": list(
+                    route_stats.get("v1461_paid_results") or ()
+                ),
+                "rearm_enabled": bool(restored.get("rearm_enabled")),
+                "stop_requested": bool(restored.get("stop_requested", True)),
+                "restart_recovered": True,
+            }
+        )
+        return session
+
+    @staticmethod
+    def _adaptive_feature_timestamps(
+        features: Mapping[str, Any] | None,
+        decision_at_ms: int,
+    ) -> dict[str, int]:
+        timestamps = {"decision_at_ms": decision_at_ms}
+        values = features if isinstance(features, Mapping) else {}
+        try:
+            setup_ms = int(float(values.get("setup_started_at_ms")))
+            if 0 <= setup_ms <= decision_at_ms:
+                timestamps["setup_started_at_ms"] = setup_ms
+        except (TypeError, ValueError):
+            pass
+        try:
+            age_ms = max(0, int(float(values.get("feature_age_seconds")) * 1000))
+            timestamps["market_features_at_ms"] = max(0, decision_at_ms - age_ms)
+        except (TypeError, ValueError):
+            timestamps["market_features_at_ms"] = decision_at_ms
+        return timestamps
+
+    def _adaptive_config_sha(self) -> str:
+        config = {
+            "canary_contract": self._adaptive_canary_contract(),
+            "code_version": CODEX_V1_VERSION,
+            "controller_config_sha256": CodexAdaptiveController(
+                AdaptiveControllerConfig(
+                    policy_version=CODEX_V1_VERSION,
+                    challenger_enabled=True,
+                    live_enforcement_enabled=True,
+                )
+            ).config_sha256,
+            "dca_enabled": False,
+            "high_water_giveback_usdc": (
+                0.0
+                if self._v1460_config_selected()
+                else ADAPTIVE_HIGH_WATER_GIVEBACK_USDC
+            ),
+            "max_duration_seconds": self._adaptive_max_duration_seconds(),
+            "checkpoint_fills": self._adaptive_checkpoint_fills(),
+            "target_paid_closed_fills": self._adaptive_target_paid_closed_fills(),
+            "mode": ADAPTIVE_CONTINUOUS,
+            "net_loss_cap_usdc": self._adaptive_net_loss_cap_usdc(),
+            "notional_usdc": ADAPTIVE_NOTIONAL_USDC,
+            "recovery_enabled": False,
+            "symbol": ADAPTIVE_SYMBOL,
+            "v1458_cnl_wpr_deep_gate": True,
+            "v1458_stup_fill_shadow_variants": ADAPTIVE_STUP_FILL_SHADOW_VARIANTS,
+            "v1460": {
+                "policy_hash": (
+                    self._v1460_policy_hash()
+                    if self._v1460_config_selected()
+                    else None
+                ),
+                "candidate_selector_enabled": bool(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v1460_candidate_selector_enabled",
+                        False,
+                    )
+                ),
+                "lane_matrix_enabled": bool(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v1460_lane_matrix_enabled",
+                        False,
+                    )
+                ),
+                "live_enforcement_enabled": bool(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v1460_live_enforcement_enabled",
+                        False,
+                    )
+                ),
+                "max_notional_usdc": float(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v1460_max_notional_usdc",
+                        50.0,
+                    )
+                ),
+                "probation_notional_usdc": float(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v1460_probation_notional_usdc",
+                        25.0,
+                    )
+                ),
+                "weak_min_evaluable_opportunities": int(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v1460_weak_min_evaluable_opportunities",
+                        8,
+                    )
+                ),
+                "weak_min_tp_first": int(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v1460_weak_min_tp_first",
+                        6,
+                    )
+                ),
+                "weak_min_ev_per_opportunity_usdc": float(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v1460_weak_min_ev_per_opportunity_usdc",
+                        0.0,
+                    )
+                ),
+                "lane_consecutive_loss_limit": int(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v1460_lane_consecutive_loss_limit",
+                        2,
+                    )
+                ),
+                "lane_net_loss_cap_usdc": float(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v1460_lane_net_loss_cap_usdc",
+                        0.12,
+                    )
+                ),
+                "session_net_loss_cap_usdc": float(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v1460_session_net_loss_cap_usdc",
+                        0.30,
+                    )
+                ),
+                "runner_enabled": bool(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v1460_runner_enabled",
+                        False,
+                    )
+                ),
+                "one_step_reprice_enabled": bool(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v1460_one_step_reprice_enabled",
+                        False,
+                    )
+                ),
+            },
+            "v1461": {
+                "policy_hash": (
+                    self._v1461_gate_config().policy_hash
+                    if self._v1461_config_selected()
+                    else None
+                ),
+                "candidate_selector_enabled": bool(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v1461_candidate_selector_enabled",
+                        False,
+                    )
+                ),
+                "regime_gate_enabled": bool(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v1461_regime_gate_enabled",
+                        False,
+                    )
+                ),
+                "live_enforcement_enabled": bool(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v1461_live_enforcement_enabled",
+                        False,
+                    )
+                ),
+                "shadow_all_strategy_rejects_enabled": bool(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v1461_shadow_all_strategy_rejects_enabled",
+                        False,
+                    )
+                ),
+                "episode_exit_confirmation_seconds": int(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v1461_episode_exit_confirmation_seconds",
+                        5 * 60,
+                    )
+                ),
+            },
+        }
+        payload = json.dumps(config, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _new_adaptive_counters() -> dict[str, Any]:
+        return {
+            "opportunities": 0,
+            "entry_placed": 0,
+            "paid_closed_fills": 0,
+            "wins": 0,
+            "losses": 0,
+            "flats": 0,
+            "incomplete_reconciliations": 0,
+            "normal_fill": 0,
+            "late_fill": 0,
+            "ttl_expired": 0,
+            "gross_pnl_usdc": 0.0,
+            "commission_usdc": 0.0,
+            "funding_usdc": 0.0,
+            "net_pnl_usdc": 0.0,
+            "gate_skips": 0,
+            "recovery_skipped": 0,
+            "recovery_placed": 0,
+            "recovery_filled": 0,
+            "route_state_action_pnl": {},
+            "fill_shadow": {
+                variant: {"opportunities": 0, "filled": 0, "no_fill": 0}
+                for variant in ADAPTIVE_STUP_FILL_SHADOW_VARIANTS
+            },
+        }
+
+    def _adaptive_counters(self) -> dict[str, Any] | None:
+        session = self._adaptive_session
+        if not session:
+            return None
+        counters = session.get("counters")
+        if not isinstance(counters, dict):
+            counters = self._new_adaptive_counters()
+            session["counters"] = counters
+        counters.setdefault("paid_closed_fills", 0)
+        counters.setdefault("wins", 0)
+        counters.setdefault("losses", 0)
+        counters.setdefault("flats", 0)
+        counters.setdefault("incomplete_reconciliations", 0)
+        return counters
+
+    @staticmethod
+    def _adaptive_paid_closed_fills(session: Mapping[str, Any]) -> int:
+        counters = session.get("counters")
+        if not isinstance(counters, Mapping):
+            return 0
+        try:
+            return max(0, int(counters.get("paid_closed_fills") or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def _adaptive_fill_shadow_count_event(self, event: str, variant: str) -> None:
+        counters = self._adaptive_counters()
+        if counters is None or variant not in ADAPTIVE_STUP_FILL_SHADOW_VARIANTS:
+            return
+        fill_shadow = counters.setdefault("fill_shadow", {})
+        bucket = fill_shadow.setdefault(
+            variant,
+            {"opportunities": 0, "filled": 0, "no_fill": 0},
+        )
+        key = "opportunities" if event == "started" else event
+        if key in {"opportunities", "filled", "no_fill"}:
+            bucket[key] = int(bucket.get(key) or 0) + 1
+
+    def _adaptive_terminal_route(self, run: Mapping[str, Any]) -> tuple[str, str, str, str]:
+        signal = self._codex_v1_signal_payload(run)
+        codex = signal.get("codex_v1") if isinstance(signal, Mapping) else None
+        adaptive = signal.get("adaptive") if isinstance(signal, Mapping) else None
+        decision = adaptive.get("decision") if isinstance(adaptive, Mapping) else None
+        metrics = codex.get("metrics") if isinstance(codex, Mapping) and isinstance(codex.get("metrics"), Mapping) else {}
+        lane = str((codex or {}).get("lane_code") or (decision or {}).get("lane_code") or "UNKNOWN")
+        state = str(metrics.get("market_state") or (decision or {}).get("market_state") or "UNKNOWN")
+        action_payload = (decision or {}).get("live_effective_action") or (decision or {}).get("incumbent_action")
+        action = str(action_payload.get("action_id") if isinstance(action_payload, Mapping) else "UNKNOWN")
+        route = str((decision or {}).get("live_effective_route") or (decision or {}).get("incumbent_route") or "NORMAL")
+        return lane, state, action, route
+
+    def _v1461_terminal_policy(
+        self, run: Mapping[str, Any]
+    ) -> Mapping[str, Any] | None:
+        signal = self._codex_v1_signal_payload(run)
+        adaptive = signal.get("adaptive") if isinstance(signal, Mapping) else None
+        decision = adaptive.get("decision") if isinstance(adaptive, Mapping) else None
+        policy = (
+            decision.get("v1461_adaptive_gate")
+            if isinstance(decision, Mapping)
+            and isinstance(decision.get("v1461_adaptive_gate"), Mapping)
+            else None
+        )
+        if policy is not None:
+            return policy
+        codex = signal.get("codex_v1") if isinstance(signal, Mapping) else None
+        metrics = (
+            codex.get("metrics")
+            if isinstance(codex, Mapping)
+            and isinstance(codex.get("metrics"), Mapping)
+            else None
+        )
+        return (
+            metrics.get("v1461_adaptive_gate")
+            if isinstance(metrics, Mapping)
+            and isinstance(metrics.get("v1461_adaptive_gate"), Mapping)
+            else None
+        )
+
+    def _adaptive_counter_summary(self, session: Mapping[str, Any]) -> str:
+        counters = session.get("counters") if isinstance(session.get("counters"), Mapping) else {}
+        return (
+            f"opp={int(counters.get('opportunities') or 0)} / placed={int(counters.get('entry_placed') or 0)} / "
+            f"paid={int(counters.get('paid_closed_fills') or 0)} / "
+            f"W/L/F={int(counters.get('wins') or 0)}/{int(counters.get('losses') or 0)}/{int(counters.get('flats') or 0)} / "
+            f"fill={int(counters.get('normal_fill') or 0)} / late={int(counters.get('late_fill') or 0)} / "
+            f"ttl={int(counters.get('ttl_expired') or 0)} / gate={int(counters.get('gate_skips') or 0)}"
+        )
+
+    def _v1460_canary_evaluation_payload(
+        self,
+        session: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        if not self._v1460_config_selected():
+            return None
+        counters = (
+            session.get("counters")
+            if isinstance(session.get("counters"), Mapping)
+            else {}
+        )
+        paid = max(0, int(counters.get("paid_closed_fills") or 0))
+        wins = max(0, int(counters.get("wins") or 0))
+        losses = max(0, int(counters.get("losses") or 0))
+        flats = max(0, int(counters.get("flats") or 0))
+        opportunities = max(0, int(counters.get("opportunities") or 0))
+        incomplete = max(
+            0,
+            int(counters.get("incomplete_reconciliations") or 0),
+        )
+        stop_reason = str(session.get("stop_reason") or "")
+        safety_reason = str(session.get("safety_halt_reason") or "").strip()
+        safety_stop_reasons = {
+            "entry_late_fill_ttl",
+            "net_loss_cap",
+            "unexpected_cycle_exception",
+            "unexpected_preflight_exception",
+            "unexpected_preflight_rejected",
+            "adaptive_arm_persistence_failed",
+            "v1460_lane_policy_evaluation_failed",
+            "v1460_lane_policy_persistence_failed",
+        }
+        safety_halt = bool(
+            safety_reason
+            or incomplete > 0
+            or stop_reason in safety_stop_reasons
+        )
+        if safety_halt and not safety_reason:
+            safety_reason = stop_reason or "incomplete_reconciliation"
+        try:
+            evaluation = evaluate_canary(
+                CanaryKpiSnapshot(
+                    paid_closed_fills=paid,
+                    exact_reconciled_paid_closed_fills=paid,
+                    wins=wins,
+                    losses=losses,
+                    flats=flats,
+                    dedup_incumbent_eligible_opportunities=opportunities,
+                    net_pnl_usdc=Decimal(
+                        str(counters.get("net_pnl_usdc") or 0.0)
+                    ),
+                    incomplete_reconciliations=incomplete,
+                    deadline_reached=stop_reason == "wall_clock_cap",
+                    safety_halt=safety_halt,
+                    safety_halt_reason=safety_reason if safety_halt else None,
+                )
+            )
+        except (CanaryContractError, ArithmeticError, ValueError) as exc:
+            return {
+                "status": "SAFETY_HALT",
+                "integrity_error": str(exc),
+                "paid_closed_fills": paid,
+                "wins": wins,
+                "losses": losses,
+                "flats": flats,
+                "dedup_incumbent_eligible_opportunities": opportunities,
+                "net_pnl_usdc": float(counters.get("net_pnl_usdc") or 0.0),
+            }
+        return {
+            "status": evaluation.status.value,
+            "paid_closed_fills": paid,
+            "wins": wins,
+            "losses": losses,
+            "flats": flats,
+            "raw_win_rate": str(evaluation.raw_win_rate.actual),
+            "wilson_95_lower_bound_report_only": str(
+                evaluation.wilson_95_lower_bound_report_only
+            ),
+            "net_pnl_usdc": str(evaluation.net_pnl_usdc.actual),
+            "ev_per_fill_usdc": str(evaluation.ev_per_fill.actual),
+            "ev_per_dedup_opportunity_usdc": str(
+                evaluation.realized_ev_per_dedup_opportunity.actual
+            ),
+            "dedup_incumbent_eligible_opportunities": opportunities,
+            "incomplete_reconciliations": incomplete,
+            "criteria": {
+                criterion.name.value: bool(criterion.met)
+                for criterion in evaluation.criteria
+            },
+        }
+
+    def _v1460_canary_status_line(self, session: Mapping[str, Any]) -> str:
+        evaluation = self._v1460_canary_evaluation_payload(session)
+        if not evaluation:
+            return ""
+        return (
+            f"{'v1.4.61' if self._v1461_config_selected() else 'v1.4.60B'} 驗收："
+            f"<b>{escape(str(evaluation.get('status') or 'UNKNOWN'))}</b> | "
+            f"WR=<code>{escape(str(evaluation.get('raw_win_rate') or '-'))}</code> | "
+            f"Wilson95-LB=<code>{escape(str(evaluation.get('wilson_95_lower_bound_report_only') or '-'))}</code> | "
+            f"EV/fill=<code>{escape(str(evaluation.get('ev_per_fill_usdc') or '-'))}</code> | "
+            f"EV/op=<code>{escape(str(evaluation.get('ev_per_dedup_opportunity_usdc') or '-'))}</code>"
+        )
+
+    def _v1460_config_selected(self) -> bool:
+        return bool(
+            getattr(
+                self._settings,
+                "mainnet_codex_v1460_candidate_selector_enabled",
+                False,
+            )
+            and getattr(
+                self._settings,
+                "mainnet_codex_v1460_lane_matrix_enabled",
+                False,
+            )
+        )
+
+    def _v1461_config_selected(self) -> bool:
+        return bool(
+            getattr(
+                self._settings,
+                "mainnet_codex_v1461_candidate_selector_enabled",
+                False,
+            )
+            and getattr(
+                self._settings,
+                "mainnet_codex_v1461_regime_gate_enabled",
+                False,
+            )
+        )
+
+    def _adaptive_net_loss_cap_usdc(self) -> float:
+        if self._v1461_config_selected():
+            return max(
+                0.0,
+                float(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v1461_session_net_loss_cap_usdc",
+                        0.30,
+                    )
+                ),
+            )
+        if self._v1460_config_selected():
+            return max(
+                0.0,
+                float(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v1460_session_net_loss_cap_usdc",
+                        0.30,
+                    )
+                ),
+            )
+        return ADAPTIVE_NET_LOSS_CAP_USDC
+
+    def _adaptive_target_paid_closed_fills(self) -> int:
+        if self._v1461_config_selected():
+            return max(
+                1,
+                int(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v1461_target_paid_closed_fills",
+                        ADAPTIVE_TARGET_PAID_CLOSED_FILLS,
+                    )
+                ),
+            )
+        if self._v1460_config_selected():
+            return max(
+                1,
+                int(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v1460_target_paid_closed_fills",
+                        ADAPTIVE_TARGET_PAID_CLOSED_FILLS,
+                    )
+                ),
+            )
+        return ADAPTIVE_TARGET_PAID_CLOSED_FILLS
+
+    def _adaptive_max_duration_seconds(self) -> int:
+        if self._v1461_config_selected():
+            return max(
+                1,
+                int(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v1461_max_duration_seconds",
+                        ADAPTIVE_MAX_DURATION_SECONDS,
+                    )
+                ),
+            )
+        if self._v1460_config_selected():
+            return max(
+                1,
+                int(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v1460_max_duration_seconds",
+                        ADAPTIVE_MAX_DURATION_SECONDS,
+                    )
+                ),
+            )
+        return ADAPTIVE_MAX_DURATION_SECONDS
+
+    def _adaptive_checkpoint_fills(self) -> int:
+        if self._v1461_config_selected():
+            return max(
+                1,
+                int(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v1461_checkpoint_fills",
+                        ADAPTIVE_CHECKPOINT_RUNS,
+                    )
+                ),
+            )
+        if self._v1460_config_selected():
+            return max(
+                1,
+                int(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v1460_checkpoint_fills",
+                        ADAPTIVE_CHECKPOINT_RUNS,
+                    )
+                ),
+            )
+        return ADAPTIVE_CHECKPOINT_RUNS
+
+    def _adaptive_runtime_snapshot(self) -> dict[str, Any]:
+        return {
+            "equity_cap_usdc": float(self._settings.mainnet_equity_cap_usdc),
+            "initial_notional_usdc": float(self._settings.mainnet_initial_notional_usdc),
+            "max_cumulative_notional_usdc": float(self._settings.mainnet_max_cumulative_notional_usdc),
+            "loop_loss_cap_usdc": float(self._loop_loss_cap),
+            "dca_enabled": bool(self._dca_enabled),
+            "recovery_enabled": bool(self._settings.mainnet_recovery_enabled),
+            "recovery_steps": int(self._settings.mainnet_recovery_steps),
+        }
+
+    def _apply_adaptive_runtime(self) -> None:
+        self._settings.mainnet_recovery_steps = 0
+        self._apply_notional(ADAPTIVE_NOTIONAL_USDC)
+        self._settings.mainnet_max_cumulative_notional_usdc = ADAPTIVE_NOTIONAL_USDC
+        self._loop_loss_cap = self._adaptive_net_loss_cap_usdc()
+        self._dca_enabled = False
+        self._settings.mainnet_recovery_enabled = False
+
+    def _restore_adaptive_runtime(self, snapshot: Mapping[str, Any] | None) -> None:
+        if not isinstance(snapshot, Mapping):
+            return
+        try:
+            self._settings.mainnet_equity_cap_usdc = float(snapshot["equity_cap_usdc"])
+            self._settings.mainnet_initial_notional_usdc = float(snapshot["initial_notional_usdc"])
+            self._settings.mainnet_max_cumulative_notional_usdc = float(snapshot["max_cumulative_notional_usdc"])
+            self._loop_loss_cap = max(0.0, float(snapshot["loop_loss_cap_usdc"]))
+            self._dca_enabled = bool(snapshot["dca_enabled"])
+            self._settings.mainnet_recovery_enabled = bool(snapshot["recovery_enabled"] )
+            self._settings.mainnet_recovery_steps = int(snapshot["recovery_steps"])
+        except (KeyError, TypeError, ValueError) as exc:
+            logger.warning("adaptive_runtime_restore_skipped", error=str(exc)[:200])
+
+    def _adaptive_metadata(self, session: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "mode": ADAPTIVE_CONTINUOUS,
+            "canary_contract": self._adaptive_canary_contract(),
+            "session_id": session["session_id"],
+            "actor": session["actor"],
+            "symbol": ADAPTIVE_SYMBOL,
+            "notional_usdc": ADAPTIVE_NOTIONAL_USDC,
+            "net_loss_cap_usdc": self._adaptive_net_loss_cap_usdc(),
+            "high_water_giveback_usdc": (
+                0.0
+                if self._v1460_config_selected()
+                else ADAPTIVE_HIGH_WATER_GIVEBACK_USDC
+            ),
+            "started_at_ms": int(session["started_at_ms"]),
+            "deadline_at_ms": int(session["deadline_at_ms"]),
+            "max_duration_seconds": self._adaptive_max_duration_seconds(),
+            "target_paid_closed_fills": self._adaptive_target_paid_closed_fills(),
+            "dca_enabled": False,
+            "recovery_enabled": False,
+            "codex_v1_version": CODEX_V1_VERSION,
+            "config_sha": session["config_sha"],
+            "policy_hash": (
+                self._v1461_gate_config().policy_hash
+                if self._v1461_config_selected()
+                else (
+                    self._v1460_policy_hash()
+                    if self._v1460_config_selected()
+                    else None
+                )
+            ),
+            "prior_runtime": dict(session["prior_runtime"]),
+        }
+
+    async def _ensure_v1459_cohort_tracking(self, session: Mapping[str, Any]) -> None:
+        """Open the measurement-only cohort session without touching orders."""
+
+        tracker = self._v1459_cohort_tracker
+        if tracker is None:
+            return
+        try:
+            await tracker.ensure_session(
+                code_version=CODEX_V1_VERSION,
+                config_sha=str(session.get("config_sha") or ""),
+                symbol=ADAPTIVE_SYMBOL,
+                canary_contract=self._adaptive_canary_contract(),
+                target_paid_closed_fills=self._adaptive_target_paid_closed_fills(),
+            )
+        except Exception as exc:  # noqa: BLE001 - observation cannot change trading lifecycle
+            logger.error("v1459_cohort_tracking_open_failed", error=str(exc)[:200])
+
+    async def _v1459_cohort_tracking_status(
+        self, session: Mapping[str, Any] | None
+    ) -> str:
+        tracker = self._v1459_cohort_tracker
+        if tracker is None:
+            return ""
+        try:
+            tracked = await tracker.get_session()
+            if session is not None:
+                await self._ensure_v1459_cohort_tracking(session)
+                tracked = await tracker.get_session()
+            if tracked is None:
+                return ""
+            snapshot = await tracker.snapshot(tracked)
+            return tracker.format_status(tracked, snapshot)
+        except Exception as exc:  # noqa: BLE001 - status must remain available
+            logger.error("v1459_cohort_tracking_status_failed", error=str(exc)[:200])
+            return "📡 v1.4.59 cohort tracking 暫時不可用。"
+
+    def _adaptive_metadata_for_run(self, run: Mapping[str, Any]) -> dict[str, Any] | None:
+        params = self._run_params(run)
+        adaptive = params.get("adaptive") if isinstance(params, Mapping) else None
+        return dict(adaptive) if isinstance(adaptive, Mapping) else None
+
+    @staticmethod
+    def _adaptive_opportunity_bucket(
+        run: Mapping[str, Any],
+        features: Mapping[str, Any] | None,
+    ) -> int:
+        if isinstance(features, Mapping):
+            setup_started_at_ms = features.get("setup_started_at_ms")
+            try:
+                if setup_started_at_ms is not None:
+                    return max(0, int(float(setup_started_at_ms)) // 60_000)
+            except (TypeError, ValueError):
+                pass
+        try:
+            return max(0, int(run.get("armed_at_ms") or 0) // 60_000)
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _adaptive_is_cnl_deep_no_lane_gate(
+        raw_decision: CodexV1Decision | None,
+        decision: CodexV1Decision,
+    ) -> bool:
+        metrics = decision.metrics if isinstance(decision.metrics, Mapping) else {}
+        return bool(
+            decision.accepted
+            and str(decision.lane_code or "").upper() == "CNL-WPR-L"
+            and str(metrics.get("market_state") or decision.regime or "")
+            == "CNL-WPR-L:deep_discount_stable"
+            and raw_decision is not None
+            and not raw_decision.accepted
+            and raw_decision.reason == "no_codex_v1_lane_match"
+            and metrics.get("promotion_source") == "no_lane_shadow_reprice_canary"
+        )
+
+    async def _adaptive_record_opportunity(
+        self, decision_payload: Mapping[str, Any] | None
+    ) -> bool:
+        if not self._adaptive_session or not isinstance(decision_payload, Mapping):
+            return True
+        opportunity_id = str(decision_payload.get("opportunity_id") or "")
+        if not opportunity_id or opportunity_id in self._adaptive_opportunity_ids:
+            return True
+        write = await self._v1459_guard.record_opportunity(
+            session_id=str(self._adaptive_session.get("session_id") or ""),
+            decision_payload=decision_payload,
+            observed_at_ms=int(time.time() * 1000),
+        )
+        if not write.continue_live:
+            self._adaptive_session["stop_requested"] = True
+            self._adaptive_session["rearm_enabled"] = False
+            logger.error(
+                "v1459_opportunity_persistence_blocked",
+                status=write.status,
+                reason=write.reason,
+            )
+            return False
+        self._adaptive_opportunity_ids.add(opportunity_id)
+        counters = self._adaptive_counters()
+        if counters is not None:
+            counters["opportunities"] = int(counters.get("opportunities") or 0) + 1
+        return True
+
+    def _adaptive_decision_payload(
+        self,
+        run: Mapping[str, Any],
+        decision: CodexV1Decision | None,
+        raw_decision: CodexV1Decision | None = None,
+        features: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        metadata = self._adaptive_metadata_for_run(run)
+        if not metadata or decision is None:
+            return None
+        decision_at_ms = int(time.time() * 1000)
+        opportunity_bucket = self._adaptive_opportunity_bucket(run, features)
+        observation_features = self._codex_v1_payload_features(features or {})
+        observation_feature_timestamps = self._adaptive_feature_timestamps(
+            features, decision_at_ms
+        )
+        metrics = decision.metrics if isinstance(decision.metrics, Mapping) else {}
+        v1460_policy = (
+            metrics.get("v1460_lane_adaptive")
+            if isinstance(metrics.get("v1460_lane_adaptive"), Mapping)
+            else None
+        )
+        v1461_policy = (
+            metrics.get("v1461_adaptive_gate")
+            if isinstance(metrics.get("v1461_adaptive_gate"), Mapping)
+            else None
+        )
+        # A v1.4.60 enforcement block sets decision.accepted=False, but the
+        # opportunity denominator must retain the incumbent's original
+        # eligibility.  Older v1.4.59 payloads have no overlay telemetry and
+        # therefore keep their existing decision.accepted behavior.
+        incumbent_accepted = bool(
+            v1461_policy.get("incumbent_accepted", decision.accepted)
+            if v1461_policy is not None
+            else (
+                v1460_policy.get("incumbent_accepted", decision.accepted)
+                if v1460_policy is not None
+                else decision.accepted
+            )
+        )
+        action_id = str(
+            metrics.get("v1455_action")
+            or metrics.get("v1427_action")
+            or metrics.get("v1421_action")
+            or decision.policy_tag
+            or decision.reason
+            or "UNKNOWN"
+        )
+        tp_raw = metrics.get("v1455_action_tp_bp") or metrics.get("tp1_bp") or metrics.get("full_tp_bp")
+        try:
+            tp_bp = float(tp_raw)
+        except (TypeError, ValueError):
+            match = re.search(r"TP(?P<tp>\d+(?:\.\d+)?)", action_id.upper())
+            tp_bp = float(match.group("tp")) if match else 0.0
+        action = ExecutorAction(
+            action_id=action_id,
+            tp_bp=tp_bp,
+            executor_profile=str(metrics.get("profile_anchor") or metrics.get("policy_tag") or action_id),
+        )
+        exact_live_gate = bool(
+            getattr(self._settings, "mainnet_codex_v1458_cnl_wpr_deep_gate_enabled", True)
+            and self._adaptive_is_cnl_deep_no_lane_gate(raw_decision, decision)
+        )
+        if exact_live_gate:
+            challenger_route = AdaptiveRoute.OBSERVE_ONLY
+        elif str(metrics.get("v1455_route") or "").upper() == AdaptiveRoute.THIN_SCALP.value:
+            challenger_route = AdaptiveRoute.THIN_SCALP
+        else:
+            challenger_route = None
+        config = AdaptiveControllerConfig(
+            policy_version=CODEX_V1_VERSION,
+            challenger_enabled=True,
+            live_enforcement_enabled=bool(
+                getattr(self._settings, "mainnet_codex_v1458_cnl_wpr_deep_gate_enabled", True)
+            ),
+        )
+        envelope = CodexAdaptiveController(config).decide(
+            AdaptiveControllerInput(
+                adaptive_session_id=str(metadata.get("session_id") or ""),
+                symbol=str(run.get("symbol") or self._settings.mainnet_symbol),
+                lane_code=str(decision.lane_code or ""),
+                market_state=self._codex_v1_market_state_from_decision(decision),
+                side=str(decision.side or ""),
+                opportunity_bucket=opportunity_bucket,
+                execution_quality=ExecutionQuality.EXECUTABLE,
+                incumbent_accepted=incumbent_accepted,
+                incumbent_action=action,
+                challenger_route=challenger_route,
+            )
+        )
+        action_payload = asdict(action)
+        payload = {
+            "adaptive_session_id": envelope.adaptive_session_id,
+            "adaptive_policy_version": envelope.policy_version,
+            "adaptive_config_sha256": metadata.get("config_sha"),
+            "controller_config_sha256": envelope.config_sha256,
+            "opportunity_id": envelope.opportunity_id,
+            "source_run_id": str(run.get("run_id") or ""),
+            "opportunity_bucket": opportunity_bucket,
+            "decision_at_ms": decision_at_ms,
+            "symbol": str(run.get("symbol") or self._settings.mainnet_symbol),
+            "side": str(decision.side or ""),
+            "observation_features": observation_features,
+            "observation_feature_timestamps": observation_feature_timestamps,
+            "market_state": envelope.market_state,
+            "execution_quality": envelope.execution_quality.value if envelope.execution_quality else None,
+            "incumbent_route": envelope.incumbent_route.value,
+            "incumbent_action": action_payload,
+            "challenger_route": envelope.challenger_route.value,
+            "challenger_action": action_payload,
+            "selected_route": envelope.selected_route.value,
+            "selected_action": asdict(envelope.selected_action) if envelope.selected_action else None,
+            "live_effective_route": envelope.live_effective_route.value,
+            "live_effective_action": (
+                asdict(envelope.live_effective_action) if envelope.live_effective_action else None
+            ),
+            "enforcement_applied": envelope.enforcement_applied,
+            "live_gate_reason": envelope.live_gate_reason,
+            "live_gate_source": "no_lane_shadow_reprice_canary" if exact_live_gate else None,
+            "lane_code": decision.lane_code,
+            "promotion_source": metrics.get("promotion_source"),
+            "raw_classifier_accepted": raw_decision.accepted if raw_decision is not None else None,
+            "raw_classifier_reason": raw_decision.reason if raw_decision is not None else None,
+            "decision_mode": envelope.decision_mode.value,
+            "stop_reason": envelope.stop_reason,
+            "shadow_only": not envelope.enforcement_applied,
+        }
+        if v1460_policy is not None:
+            payload["v1460_lane_adaptive"] = dict(v1460_policy)
+            payload["incumbent_eligible"] = incumbent_accepted
+            action_mode = str(v1460_policy.get("action_mode") or "")
+            v1460_enforced = str(v1460_policy.get("mode") or "") == "enforcement"
+            payload["v1460_enforcement_applied"] = v1460_enforced
+            if v1460_enforced and action_mode in {
+                AdaptiveActionMode.SHADOW_BLOCK.value,
+                AdaptiveActionMode.HALT.value,
+            }:
+                payload["selected_route"] = AdaptiveRoute.BLOCK.value
+                payload["live_effective_route"] = AdaptiveRoute.BLOCK.value
+                payload["selected_action"] = None
+                payload["live_effective_action"] = None
+                payload["enforcement_applied"] = True
+                payload["live_gate_reason"] = v1460_policy.get("matrix_rule_id")
+                payload["live_gate_source"] = "v1460_lane_matrix"
+                payload["shadow_only"] = True
+        if v1461_policy is not None:
+            payload["v1461_adaptive_gate"] = dict(v1461_policy)
+            payload["incumbent_eligible"] = incumbent_accepted
+            action_mode = str(v1461_policy.get("action_mode") or "")
+            enforced = str(v1461_policy.get("mode") or "") == "enforcement"
+            permits = bool(v1461_policy.get("permits_order"))
+            payload["v1461_enforcement_applied"] = enforced
+            if enforced and action_mode in {
+                V1461ActionMode.SHADOW_BLOCK.value,
+                V1461ActionMode.HARD_BLOCK.value,
+                V1461ActionMode.HALT.value,
+            }:
+                payload["selected_route"] = AdaptiveRoute.BLOCK.value
+                payload["live_effective_route"] = AdaptiveRoute.BLOCK.value
+                payload["selected_action"] = None
+                payload["live_effective_action"] = None
+                payload["enforcement_applied"] = True
+                payload["live_gate_reason"] = v1461_policy.get("matrix_rule_id")
+                payload["live_gate_source"] = "v1461_bidirectional_regime_gate"
+                payload["shadow_only"] = True
+            elif enforced and permits:
+                # v1.4.61 is the reviewed authority for a promoted legacy
+                # reject.  The old route controller must not turn the paid
+                # token back into OBSERVE_ONLY merely because the incumbent
+                # strategy gate originally rejected it.
+                payload["selected_route"] = AdaptiveRoute.NORMAL.value
+                payload["live_effective_route"] = AdaptiveRoute.NORMAL.value
+                payload["selected_action"] = action_payload
+                payload["live_effective_action"] = action_payload
+                payload["enforcement_applied"] = True
+                payload["live_gate_reason"] = v1461_policy.get("matrix_rule_id")
+                payload["live_gate_source"] = "v1461_bidirectional_regime_gate"
+                payload["shadow_only"] = False
+        return payload
+
+    async def _adaptive_gate_before_submit(
+        self,
+        run: Mapping[str, Any],
+        decision_payload: Mapping[str, Any] | None,
+    ) -> bool:
+        if not await self._adaptive_record_opportunity(decision_payload):
+            return True
+        if not isinstance(decision_payload, Mapping):
+            return False
+        v1461_policy = (
+            decision_payload.get("v1461_adaptive_gate")
+            if isinstance(
+                decision_payload.get("v1461_adaptive_gate"), Mapping
+            )
+            else None
+        )
+        if (
+            v1461_policy is not None
+            and str(v1461_policy.get("mode") or "") == "enforcement"
+            and bool(v1461_policy.get("permits_order"))
+        ):
+            try:
+                active_hash = self._v1461_gate_config().policy_hash
+                if str(v1461_policy.get("policy_hash") or "") != active_hash:
+                    raise RuntimeError("policy_hash_changed_before_submit")
+                if not bool(v1461_policy.get("incumbent_accepted")):
+                    gate_family = str(v1461_policy.get("gate_family_id") or "UNKNOWN")
+                    lane = str(v1461_policy.get("lane") or "UNKNOWN")
+                    market_state = str(v1461_policy.get("market_state") or "UNKNOWN")
+                    episode_id = str(v1461_policy.get("episode_id") or "")
+                    base_key = "|".join((gate_family, lane)).upper()
+                    episode_states = (
+                        (self._adaptive_session or {}).get("v1461_episode_states")
+                        or {}
+                    )
+                    current = (
+                        episode_states.get(base_key, {})
+                        if isinstance(episode_states, Mapping)
+                        else {}
+                    )
+                    if (
+                        str(current.get("current_state") or "") != market_state
+                        or str(current.get("current_episode_id") or "") != episode_id
+                    ):
+                        raise RuntimeError("promotion_state_or_episode_changed")
+                    evidence_gate = (
+                        v1461_policy.get("evidence_gate")
+                        if isinstance(v1461_policy.get("evidence_gate"), Mapping)
+                        else {}
+                    )
+                    last_outcome_at_ms = int(
+                        evidence_gate.get("last_outcome_at_ms") or 0
+                    )
+                    max_age_ms = (
+                        self._v1461_gate_config().evidence_max_age_seconds * 1000
+                    )
+                    if (
+                        last_outcome_at_ms <= 0
+                        or int(time.time() * 1000) - last_outcome_at_ms > max_age_ms
+                    ):
+                        raise RuntimeError("promotion_evidence_stale_before_submit")
+                if (
+                    str(v1461_policy.get("action_mode") or "")
+                    == V1461ActionMode.FAST_PROBE_0_5.value
+                ):
+                    token_id = str(v1461_policy.get("token_id") or "")
+                    if not token_id or not self._adaptive_session:
+                        raise RuntimeError("promotion_token_missing")
+                    async with self._v1461_token_lock:
+                        consumed = self._adaptive_session.setdefault(
+                            "v1461_consumed_tokens", set()
+                        )
+                        if token_id in consumed:
+                            raise RuntimeError("promotion_token_already_consumed")
+                        consumed.add(token_id)
+                        self._adaptive_session["route_stats"] = (
+                            self._adaptive_route_stats_snapshot(
+                                self._adaptive_session
+                            )
+                        )
+                        durable = await self._v1459_guard.checkpoint(
+                            self._adaptive_session,
+                            checkpoint_at_ms=int(time.time() * 1000),
+                        )
+                        if (
+                            not durable.continue_live
+                            or str(durable.status or "") == "DISABLED"
+                        ):
+                            consumed.discard(token_id)
+                            raise RuntimeError(
+                                "promotion_token_checkpoint_failed"
+                            )
+                        # A same-revision idempotent retry means another
+                        # process already persisted this exact token claim.
+                        # It is safe for the database winner to proceed, but
+                        # this process must not submit a duplicate order.
+                        if str(durable.reason or "") == "IDEMPOTENT_RETRY":
+                            raise RuntimeError(
+                                "promotion_token_claim_conflict"
+                            )
+            except Exception as exc:  # noqa: BLE001 - admission fails closed
+                if self._adaptive_session is not None:
+                    self._adaptive_session["safety_halt_reason"] = str(exc)[:160]
+                    if any(
+                        token in str(exc)
+                        for token in ("checkpoint_failed", "claim_conflict")
+                    ):
+                        self._adaptive_session["stop_requested"] = True
+                        self._adaptive_session["rearm_enabled"] = False
+                logger.error(
+                    "v1461_pre_submit_gate_failed",
+                    run_id=run.get("run_id"),
+                    error=str(exc)[:200],
+                )
+                return True
+        gate = bool(
+            decision_payload.get("enforcement_applied")
+            and decision_payload.get("live_effective_route")
+            in {AdaptiveRoute.BLOCK.value, AdaptiveRoute.OBSERVE_ONLY.value}
+        )
+        if not gate:
+            return False
+        opportunity_id = str(decision_payload.get("opportunity_id") or "")
+        if opportunity_id not in self._adaptive_gate_notified_opportunities:
+            self._adaptive_gate_notified_opportunities.add(opportunity_id)
+            counters = self._adaptive_counters()
+            if counters is not None:
+                counters["gate_skips"] = int(counters.get("gate_skips") or 0) + 1
+            action = decision_payload.get("incumbent_action")
+            details = {
+                "session_id": (self._adaptive_session or {}).get("session_id"),
+                "version": CODEX_V1_VERSION,
+                "opportunity_id": opportunity_id,
+                "lane_code": decision_payload.get("lane_code"),
+                "market_state": decision_payload.get("market_state"),
+                "incumbent_route": decision_payload.get("incumbent_route"),
+                "live_effective_route": decision_payload.get("live_effective_route"),
+                "action": action.get("action_id") if isinstance(action, Mapping) else None,
+                "reason": decision_payload.get("live_gate_reason"),
+                "promotion_source": decision_payload.get("promotion_source"),
+                "raw_classifier_reason": decision_payload.get("raw_classifier_reason"),
+                "order_api_calls": 0,
+                "run_status_after_gate": "ARMED",
+            }
+            await self._repo.log_event(
+                str(run.get("run_id") or ""),
+                "adaptive_live_gate_skipped",
+                details,
+            )
+            logger.info("adaptive_live_gate_skipped", run_id=run.get("run_id"), **details)
+        return True
+
+    async def _maybe_start_adaptive_stup_fill_shadow(
+        self,
+        run: Mapping[str, Any],
+        decision: WildcatLiveDecision,
+        codex_decision: CodexV1Decision | None,
+        decision_payload: Mapping[str, Any] | None,
+    ) -> None:
+        if (
+            not self._adaptive_session
+            or codex_decision is None
+            or not isinstance(decision_payload, Mapping)
+            or not bool(
+                getattr(self._settings, "mainnet_codex_v1458_stup_fill_shadow_enabled", True)
+            )
+        ):
+            return
+        metrics = codex_decision.metrics if isinstance(codex_decision.metrics, Mapping) else {}
+        state = self._codex_v1_market_state_from_decision(codex_decision)
+        action_id = str(
+            metrics.get("v1455_action")
+            or metrics.get("v1427_action")
+            or metrics.get("v1421_action")
+            or ""
+        )
+        if (
+            str(codex_decision.lane_code or "").upper() != "STUP-S"
+            or state != "STUP-S:clean_extension"
+            or "_E2_" not in action_id.upper()
+        ):
+            return
+        try:
+            await self._adaptive_stup_fill_shadow_tracker.start(
+                run_id=str(run.get("run_id") or ""),
+                session_id=str(self._adaptive_session.get("session_id") or ""),
+                opportunity_id=str(decision_payload.get("opportunity_id") or ""),
+                symbol=str(run.get("symbol") or ADAPTIVE_SYMBOL),
+                side=str(decision.side or ""),
+                signal_price=float(decision.signal.price),
+                notional_usdc=float(decision.signal.planned_notional_usdc),
+                tp_pct=float(decision.tp_pct),
+                sl_pct=float(self._entry_sl_pct_for_decision(decision, codex_decision)),
+                partial_exit_pct=float(decision.partial_exit_pct),
+                action_id=action_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - shadow telemetry cannot block live entry
+            logger.warning(
+                "adaptive_stup_fill_shadow_start_failed",
+                run_id=run.get("run_id"),
+                error=str(exc)[:200],
+            )
+
+    async def _v1460_on_weak_shadow_outcome(
+        self,
+        payload: Mapping[str, Any],
+    ) -> None:
+        """Fold one complete read-only outcome into the durable evidence gate."""
+
+        session = self._adaptive_session
+        if not session or str(payload.get("session_id") or "") != str(
+            session.get("session_id") or ""
+        ):
+            logger.warning(
+                "v1460_weak_shadow_outcome_without_active_session",
+                opportunity_key=payload.get("opportunity_key"),
+            )
+            return
+        evidence = session.setdefault("v1460_weak_evidence", {})
+        seen = evidence.setdefault("opportunity_keys", [])
+        opportunity_key = str(payload.get("opportunity_key") or "")
+        if not opportunity_key or opportunity_key in seen:
+            return
+        seen.append(opportunity_key)
+        # Keep the complete cohort key set.  Truncating this list would allow
+        # an old callback to be counted twice after enough shadow traffic,
+        # corrupting both the 8-opportunity promotion gate and EV/opportunity.
+
+        evidence["opportunities"] = int(evidence.get("opportunities") or 0) + 1
+        label = str(payload.get("first_touch_result") or "").upper()
+        data_quality = (
+            payload.get("data_quality")
+            if isinstance(payload.get("data_quality"), Mapping)
+            else {}
+        )
+        data_complete = bool(data_quality.get("complete"))
+        evaluable = bool(payload.get("evaluable"))
+        net_value = payload.get("ev_contribution_usdc")
+        try:
+            net_pnl = float(net_value) if net_value is not None else None
+        except (TypeError, ValueError, OverflowError):
+            net_pnl = None
+        if net_pnl is not None and not math.isfinite(net_pnl):
+            net_pnl = None
+
+        if label == WeakShadowLabel.DATA_INCOMPLETE.value or not data_complete:
+            evidence["incomplete"] = int(evidence.get("incomplete") or 0) + 1
+        elif label == WeakShadowLabel.AMBIGUOUS.value or not evaluable:
+            evidence["ambiguous"] = int(evidence.get("ambiguous") or 0) + 1
+        elif net_pnl is None:
+            evidence["incomplete"] = int(evidence.get("incomplete") or 0) + 1
+        else:
+            evidence["evaluable"] = int(evidence.get("evaluable") or 0) + 1
+            result_key = {
+                WeakShadowLabel.TP_FIRST.value: "tp_first",
+                WeakShadowLabel.SL_FIRST.value: "sl_first",
+                WeakShadowLabel.MAX_HOLD.value: "max_hold",
+                WeakShadowLabel.NO_FILL.value: "no_fill",
+            }.get(label)
+            if result_key is None:
+                evidence["incomplete"] = int(evidence.get("incomplete") or 0) + 1
+                evidence["evaluable"] = max(
+                    0, int(evidence.get("evaluable") or 0) - 1
+                )
+            else:
+                evidence[result_key] = int(evidence.get(result_key) or 0) + 1
+                evidence["net_pnl_usdc"] = float(
+                    evidence.get("net_pnl_usdc") or 0.0
+                ) + net_pnl
+
+        evaluated = int(evidence.get("evaluable") or 0)
+        evidence["cost_adjusted_ev_per_opportunity_usdc"] = (
+            float(evidence.get("net_pnl_usdc") or 0.0) / evaluated
+            if evaluated
+            else 0.0
+        )
+        evidence["data_complete"] = bool(
+            int(evidence.get("opportunities") or 0) == evaluated
+            and int(evidence.get("ambiguous") or 0) == 0
+            and int(evidence.get("incomplete") or 0) == 0
+        )
+        evidence["last_outcome_at_ms"] = int(time.time() * 1000)
+        session["route_stats"] = self._adaptive_route_stats_snapshot(session)
+        durable = await self._v1459_guard.checkpoint(
+            session,
+            checkpoint_at_ms=int(evidence["last_outcome_at_ms"]),
+        )
+        if not durable.continue_live:
+            session["stop_requested"] = True
+            session["rearm_enabled"] = False
+            session["safety_halt_reason"] = "v1460_weak_evidence_checkpoint_failed"
+            logger.error(
+                "v1460_weak_evidence_checkpoint_failed",
+                status=durable.status,
+                reason=durable.reason,
+            )
+
+    async def _maybe_start_v1460_weak_shadow(
+        self,
+        run: Mapping[str, Any],
+        decision: WildcatLiveDecision,
+        incumbent_decision: CodexV1Decision,
+        effective_decision: CodexV1Decision,
+        decision_payload: Mapping[str, Any] | None,
+    ) -> None:
+        if (
+            not self._adaptive_session
+            or not self._v1460_candidate_active(run)
+            or not bool(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1460_shadow_evidence_enabled",
+                    False,
+                )
+            )
+            or not isinstance(decision_payload, Mapping)
+        ):
+            return
+        effective_metrics = (
+            effective_decision.metrics
+            if isinstance(effective_decision.metrics, Mapping)
+            else {}
+        )
+        adaptive = effective_metrics.get("v1460_lane_adaptive")
+        if not isinstance(adaptive, Mapping):
+            return
+        shadow_candidates = adaptive.get("shadow_candidates") or ()
+        if "stup_weak_state_first_touch_outcome" not in shadow_candidates:
+            return
+
+        metrics = (
+            incumbent_decision.metrics
+            if isinstance(incumbent_decision.metrics, Mapping)
+            else {}
+        )
+        entry_bp = self._codex_v143_metric_float(metrics, "entry_bp")
+        if entry_bp is None:
+            entry_bp = float(incumbent_decision.entry_offset_bp or 0.0)
+        entry_price = self._codex_v1_entry_reference_price(
+            float(decision.signal.price),
+            str(decision.side),
+            max(0.0, float(entry_bp)),
+        )
+        if not decision.signal.take_profits:
+            return
+        tp_price = float(decision.signal.take_profits[0])
+        sl_pct = float(
+            self._entry_sl_pct_for_decision(decision, incumbent_decision)
+        )
+        sl_price = self._sl_price_from_pct(
+            entry_price,
+            str(decision.side),
+            sl_pct,
+        )
+
+        ttl_s = self._codex_v143_metric_float(metrics, "ttl_s")
+        if ttl_s is None or ttl_s <= 0:
+            ttl_s = float(
+                self._codex_v1_entry_ttl_overrides().get(
+                    "STUP-S",
+                    max(
+                        1,
+                        int(
+                            getattr(
+                                self._settings,
+                                "mainnet_entry_order_ttl_seconds",
+                                45,
+                            )
+                            or 45
+                        ),
+                    ),
+                )
+            )
+        hold_s = self._codex_v143_metric_float(metrics, "hold_s")
+        if hold_s is None or hold_s <= 0:
+            hold_s = max(1.0, float(decision.max_holding_bars) * 60.0)
+        now_ms = int(time.time() * 1000)
+        entry_deadline_ms = now_ms + max(1, int(ttl_s)) * 1000
+        outcome_deadline_ms = entry_deadline_ms + max(1, int(hold_s)) * 1000
+        notional = min(
+            float(decision.signal.planned_notional_usdc),
+            float(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1460_probation_notional_usdc",
+                    25.0,
+                )
+            ),
+        )
+        try:
+            await self._v1460_weak_shadow_tracker.start(
+                run_id=str(run.get("run_id") or ""),
+                session_id=str(self._adaptive_session.get("session_id") or ""),
+                opportunity_id=str(decision_payload.get("opportunity_id") or ""),
+                symbol=str(run.get("symbol") or ADAPTIVE_SYMBOL),
+                side=str(decision.side),
+                market_state=self._codex_v1_market_state_from_decision(
+                    incumbent_decision
+                ),
+                entry_limit_price=entry_price,
+                notional_usdc=notional,
+                tp_price=tp_price,
+                sl_price=sl_price,
+                entry_submitted_at_ms=now_ms,
+                entry_deadline_ms=entry_deadline_ms,
+                outcome_deadline_ms=outcome_deadline_ms,
+            )
+        except Exception as exc:  # noqa: BLE001 - shadow cannot block incumbent
+            logger.warning(
+                "v1460_weak_shadow_start_failed",
+                run_id=run.get("run_id"),
+                error=str(exc)[:200],
+            )
+
+    async def start_adaptive_session(self, actor: str = "telegram") -> str:
+        async with self._adaptive_lifecycle_lock:
+            return await self._start_adaptive_session_unlocked(actor)
+
+    async def _start_adaptive_session_unlocked(self, actor: str = "telegram") -> str:
+        await self._ensure_runtime_config_loaded()
+        if not self._settings.mainnet_one_run_enabled:
+            return "❌ Mainnet one-run 尚未啟用。"
+        if not self._settings.mainnet_api_key or not self._settings.mainnet_api_secret:
+            return "❌ 尚未設定 MAINNET_API_KEY / MAINNET_API_SECRET。"
+        if str(self._settings.mainnet_symbol or "").upper() != ADAPTIVE_SYMBOL:
+            return f"❌ Adaptive session 僅支援 {ADAPTIVE_SYMBOL}。"
+        profile_readiness = self._v1459_profile_enforcement_readiness()
+        if profile_readiness.enforcement_requested and not profile_readiness.ready:
+            missing = ", ".join(profile_readiness.missing) or "unknown"
+            return (
+                "❌ v1.4.59 profile enforcement 未就緒："
+                f"<code>{escape(missing)}</code>"
+            )
+        v1460_requested, v1460_missing = self._v1460_enforcement_readiness()
+        if v1460_requested and v1460_missing:
+            return (
+                "❌ v1.4.60B lane-adaptive enforcement 未就緒："
+                f"<code>{escape(', '.join(v1460_missing))}</code>"
+            )
+        v1461_requested, v1461_missing = self._v1461_enforcement_readiness()
+        if v1461_requested and v1461_missing:
+            return (
+                "❌ v1.4.61 bidirectional adaptive enforcement 未就緒："
+                f"<code>{escape(', '.join(v1461_missing))}</code>"
+            )
+        active = await self._repo.get_active_run()
+        if active:
+            return f"⚠️ 已有 active run：<code>{escape(active['run_id'])}</code>。"
+        if self._adaptive_session:
+            return "⚠️ Adaptive session 已在進行中。"
+        now_ms = int(time.time() * 1000)
+        durable_close = await self._v1459_guard.retire_durable_session(
+            checkpoint_at_ms=now_ms,
+            stop_reason="restart_orphaned_no_active_run",
+        )
+        if not durable_close.continue_live:
+            return (
+                "❌ v1.4.59 舊 session 無法安全封存："
+                f"<code>{escape(str(durable_close.reason or durable_close.status))}</code>"
+            )
+        self._adaptive_session = {
+            "session_id": f"adaptive_{now_ms}",
+            "actor": actor,
+            "started_at_ms": now_ms,
+            "deadline_at_ms": now_ms
+            + self._adaptive_max_duration_seconds() * 1000,
+            "last_checkpoint_at_ms": now_ms,
+            "terminal_runs": 0,
+            "net_pnl_usdc": 0.0,
+            "high_water_net_pnl_usdc": 0.0,
+            "run_ids": [],
+            "disabled_states": set(),
+            "state_net_pnl_usdc": {},
+            "state_throttle_count": {},
+            "state_throttle_deadlines": {},
+            "prior_runtime": self._adaptive_runtime_snapshot(),
+            "config_sha": self._adaptive_config_sha(),
+            "rearm_enabled": True,
+            "stop_requested": False,
+            "counters": self._new_adaptive_counters(),
+            "route_loss_streaks": {},
+            "route_stats": {},
+            "v1460_lane_state_loss_streaks": {},
+            "v1460_lane_state_net_pnl_usdc": {},
+            "v1460_isolated_keys": set(),
+            "v1460_weak_evidence": {},
+            "v1461_gate_evidence": {},
+            "v1461_episode_states": {},
+            "v1461_consumed_tokens": set(),
+            "v1461_gate_loss_streaks": {},
+            "v1461_gate_net_pnl_usdc": {},
+            "v1461_quarantined_keys": set(),
+            "v1461_paid_results": [],
+        }
+        initial_write = await self._v1459_guard.checkpoint(
+            self._adaptive_session,
+            checkpoint_at_ms=now_ms,
+        )
+        if not initial_write.continue_live:
+            self._adaptive_session["stop_requested"] = True
+            self._adaptive_session["rearm_enabled"] = False
+            self._adaptive_last_review = dict(self._adaptive_session)
+            self._adaptive_session = None
+            return (
+                "❌ v1.4.59 identity/evidence 未通過："
+                f"<code>{escape(str(initial_write.reason or initial_write.status))}</code>"
+            )
+        self._adaptive_handled_terminal_run_ids.clear()
+        self._adaptive_gate_notified_opportunities.clear()
+        self._adaptive_opportunity_ids.clear()
+        self._adaptive_stup_fill_shadow_started.clear()
+        self._adaptive_stup_fill_shadow_samples.clear()
+        self._adaptive_stup_fill_shadow_unavailable_notified.clear()
+        self._v1459_profile_last_transition.clear()
+        self._v1459_runner_extension_used.clear()
+        self._v1459_regime_runtimes.clear()
+        self._v1459_regime_last_transition.clear()
+        self._v1460_policy_last_transition.clear()
+        self._v1461_policy_last_transition.clear()
+        self._v1460_weak_shadow_samples.clear()
+        self._v1460_weak_shadow_started.clear()
+        await self._ensure_v1459_cohort_tracking(self._adaptive_session)
+        self._apply_adaptive_runtime()
+        return await self._arm_adaptive_run(initial=True)
+
+    def _v1461_status_line(self, session: Mapping[str, Any]) -> str | None:
+        """Expose the effective v1.4.61 switches and durable gate state."""
+
+        requested, missing = self._v1461_enforcement_readiness()
+        configured = self._v1461_config_selected()
+        if not configured and not requested:
+            return None
+        enforcement = "ON" if requested and not missing else (
+            "NOT_READY" if requested else "OFF"
+        )
+        evidence = session.get("v1461_gate_evidence")
+        consumed = session.get("v1461_consumed_tokens") or ()
+        quarantined = session.get("v1461_quarantined_keys") or ()
+        evidence_count = len(evidence) if isinstance(evidence, Mapping) else 0
+        quarantine_text = ", ".join(sorted(str(item) for item in quarantined)) or "-"
+        suffix = (
+            f" / missing={','.join(missing)}"
+            if missing
+            else ""
+        )
+        return (
+            "v1.4.61 Gate："
+            f"candidate={'ON' if configured else 'OFF'} / enforcement={enforcement} / "
+            f"shadow-all={'ON' if bool(getattr(self._settings, 'mainnet_codex_v1461_shadow_all_strategy_rejects_enabled', False)) else 'OFF'} / "
+            f"evidence keys={evidence_count} / used tokens={len(consumed)} / "
+            f"quarantine={quarantine_text}{suffix}"
+        )
+
+    async def adaptive_status(self) -> str:
+        session = self._adaptive_session
+        if not session:
+            cohort = await self._v1459_cohort_tracking_status(None)
+            return "♾ Adaptive session 未啟動。" + (f"\n\n{cohort}" if cohort else "")
+        disabled = sorted(session.get("disabled_states") or [])
+        status = (
+            "♾ <b>Adaptive continuous session</b>\n"
+            f"Session：<code>{escape(str(session['session_id']))}</code>\n"
+            f"Canary：<code>{self._adaptive_canary_contract()}</code>\n"
+            f"版本：<code>{escape(CODEX_V1_VERSION)}</code> | cfg=<code>{escape(str(session['config_sha']))}</code>\n"
+            f"Paid closed fills：<b>{self._adaptive_paid_closed_fills(session)}</b> / {self._adaptive_target_paid_closed_fills()} | "
+            f"Attempts：<b>{int(session['terminal_runs'])}</b> | 淨損益：<b>{float(session['net_pnl_usdc']):+.4f} USDC</b>\n"
+            f"High-water：<b>{float(session['high_water_net_pnl_usdc']):+.4f} USDC</b>\n"
+            f"Counters：<code>{escape(self._adaptive_counter_summary(session))}</code>\n"
+            f"風險：$50 / cap −${self._adaptive_net_loss_cap_usdc():.2f} / "
+            f"DCA off / 目標 {self._adaptive_target_paid_closed_fills()} paid closed fills / "
+            f"{self._adaptive_max_duration_seconds() // 3600}h\n"
+            f"State 停用：<code>{escape(', '.join(disabled) or '-')}</code>\n"
+            f"v1.4.60B 執行安全 lane 隔離：<code>{escape(', '.join(sorted(session.get('v1460_isolated_keys') or ())) or '-')}</code>\n"
+            + ("狀態：<b>停止後不再 re-arm</b>" if session.get("stop_requested") else "狀態：<b>連續執行中</b>")
+        )
+        v1461_line = self._v1461_status_line(session)
+        if v1461_line:
+            status += f"\n{escape(v1461_line)}"
+        canary_line = self._v1460_canary_status_line(session)
+        if canary_line:
+            status += f"\n{canary_line}"
+        cohort = await self._v1459_cohort_tracking_status(session)
+        return status + (f"\n\n{cohort}" if cohort else "")
+
+    async def adaptive_review(self) -> str:
+        session = self._adaptive_session or self._adaptive_last_review
+        if not session:
+            cohort = await self._v1459_cohort_tracking_status(None)
+            return "♾ Adaptive session 尚無可回顧資料。" + (f"\n\n{cohort}" if cohort else "")
+        run_ids = list(session.get("run_ids") or [])
+        stats = "尚無 terminal run。"
+        if run_ids:
+            try:
+                stats = self._build_loop_stats(await self._repo.get_runs_by_ids(run_ids))
+            except Exception as exc:  # noqa: BLE001 - review must remain available
+                logger.warning("adaptive_review_load_failed", error=str(exc)[:200])
+        review = (
+            "📊 <b>Adaptive session review</b>\n"
+            f"Session：<code>{escape(str(session.get('session_id') or '-'))}</code>\n"
+            f"Paid closed fills：<b>{self._adaptive_paid_closed_fills(session)}</b> / {self._adaptive_target_paid_closed_fills()} | "
+            f"Attempts：<b>{int(session.get('terminal_runs') or 0)}</b> | 淨損益：<b>{float(session.get('net_pnl_usdc') or 0.0):+.4f} USDC</b>\n"
+            f"停止原因：<code>{escape(str(session.get('stop_reason') or 'active'))}</code>\n"
+            f"Counters：<code>{escape(self._adaptive_counter_summary(session))}</code>\n"
+            f"{stats}"
+        )
+        canary_line = self._v1460_canary_status_line(session)
+        if canary_line:
+            review += f"\n{canary_line}"
+        v1461_line = self._v1461_status_line(session)
+        if v1461_line:
+            review += f"\n{escape(v1461_line)}"
+        cohort = await self._v1459_cohort_tracking_status(session)
+        return review + (f"\n\n{cohort}" if cohort else "")
+
+    async def _arm_adaptive_run(self, initial: bool = False) -> str:
+        session = self._adaptive_session
+        if not session:
+            return "❌ Adaptive session 不存在。"
+        if self._v1459_entry_paused():
+            session["stop_requested"] = True
+            session["rearm_enabled"] = False
+            return "⏹ v1.4.59 evidence/identity gate 已暫停新進場。"
+        if session.get("stop_requested") or not session.get("rearm_enabled"):
+            return "⏹ Adaptive session 已停止 re-arm。"
+        now_ms = int(time.time() * 1000)
+        if self._adaptive_paid_closed_fills(session) >= self._adaptive_target_paid_closed_fills():
+            await self._stop_adaptive_session(None, "paid_closed_fill_target", unexpected=False)
+            return "⏹ Adaptive session 已達 20 paid closed fills。"
+        if now_ms >= int(session.get("deadline_at_ms") or 0):
+            await self._stop_adaptive_session(None, "wall_clock_cap", unexpected=False)
+            return "⏹ Adaptive session 已達 72 小時上限。"
+        active = await self._repo.get_active_run()
+        if active:
+            return f"⚠️ 已有 active run：<code>{escape(active['run_id'])}</code>。"
+        try:
+            preflight_error = await self._preflight()
+        except Exception as exc:  # noqa: BLE001
+            await self._stop_adaptive_session(None, "unexpected_preflight_exception", unexpected=True)
+            return f"❌ Adaptive preflight 失敗：<code>{escape(str(exc)[:300])}</code>"
+        if preflight_error:
+            await self._stop_adaptive_session(None, "unexpected_preflight_rejected", unexpected=True)
+            return preflight_error
+        if session.get("stop_requested") or not session.get("rearm_enabled"):
+            return "⏹ Adaptive session 已停止 re-arm。"
+        run_id = f"{self._settings.mainnet_client_order_prefix}_{int(time.time() * 1000)}"
+        params = {
+            "actor": session["actor"] if initial else "adaptive_continuous",
+            "mode": ADAPTIVE_CONTINUOUS,
+            "symbol": ADAPTIVE_SYMBOL,
+            "strategy": self._settings.mainnet_strategy_label,
+            "equity_cap_usdc": ADAPTIVE_NOTIONAL_USDC,
+            "initial_notional_usdc": ADAPTIVE_NOTIONAL_USDC,
+            "max_cumulative_notional_usdc": ADAPTIVE_NOTIONAL_USDC,
+            "leverage": self._settings.mainnet_leverage,
+            "maker_first": True,
+            "adaptive": self._adaptive_metadata(session),
+        }
+        created = False
+        try:
+            await self._repo.create_run({
+                "run_id": run_id,
+                "symbol": ADAPTIVE_SYMBOL,
+                "strategy_label": self._settings.mainnet_strategy_label,
+                "status": "ARMED",
+                "params": params,
+            })
+            created = True
+            session["run_ids"].append(run_id)
+            await self._repo.log_event(run_id, "adaptive_session_armed", params["adaptive"])
+        except Exception as exc:  # noqa: BLE001 - fail closed around session persistence
+            logger.error("adaptive_session_arm_persistence_failed", run_id=run_id, created=created, error=str(exc)[:300])
+            if created:
+                try:
+                    await self._repo.complete_run(run_id, "FAILED", "adaptive_arm_persistence_failed", str(exc)[:300])
+                except Exception as cleanup_exc:  # noqa: BLE001
+                    logger.error("adaptive_session_arm_cleanup_failed", run_id=run_id, error=str(cleanup_exc)[:300])
+                await self._stop_adaptive_session({"run_id": run_id}, "adaptive_arm_persistence_failed", unexpected=True)
+            else:
+                await self._stop_adaptive_session(None, "adaptive_arm_create_failed", unexpected=False)
+            return f"❌ Adaptive run 建立失敗：<code>{escape(str(exc)[:300])}</code>"
+        return (
+            "♾ <b>Adaptive continuous session 已啟動</b>\n"
+            f"Run：<code>{escape(run_id)}</code>\n"
+            "ETHUSDC / $50 / DCA off / 目標 20 paid closed fills 或 72 小時。"
+        )
+
+    async def _maybe_rehydrate_adaptive_session(
+        self, active: Mapping[str, Any]
+    ) -> bool:
+        if self._adaptive_session or not self._is_adaptive_run(active):
+            return True
+        metadata = self._adaptive_metadata_for_run(active) or {}
+        self._adaptive_session = self._v1459_restored_adaptive_session(active, metadata) or {
+            "session_id": metadata.get("session_id") or f"restart_{active.get('run_id')}",
+            "actor": metadata.get("actor") or "restart",
+            "started_at_ms": int(metadata.get("started_at_ms") or time.time() * 1000),
+            "deadline_at_ms": int(
+                metadata.get("deadline_at_ms")
+                or (
+                    time.time() * 1000
+                    + self._adaptive_max_duration_seconds() * 1000
+                )
+            ),
+            "last_checkpoint_at_ms": int(time.time() * 1000),
+            "terminal_runs": 0,
+            "net_pnl_usdc": 0.0,
+            "high_water_net_pnl_usdc": 0.0,
+            "run_ids": [str(active.get("run_id") or "")],
+            "disabled_states": set(),
+            "state_net_pnl_usdc": {},
+            "state_throttle_count": {},
+            "state_throttle_deadlines": {},
+            "prior_runtime": metadata.get("prior_runtime") or {},
+            "config_sha": metadata.get("config_sha") or self._adaptive_config_sha(),
+            "rearm_enabled": False,
+            "stop_requested": True,
+            "restart_recovered": True,
+            "counters": self._new_adaptive_counters(),
+            "route_loss_streaks": {},
+            "route_stats": {},
+            "v1460_lane_state_loss_streaks": {},
+            "v1460_lane_state_net_pnl_usdc": {},
+            "v1460_isolated_keys": set(),
+            "v1460_weak_evidence": {},
+            "v1461_gate_evidence": {},
+            "v1461_episode_states": {},
+            "v1461_consumed_tokens": set(),
+            "v1461_gate_loss_streaks": {},
+            "v1461_gate_net_pnl_usdc": {},
+            "v1461_quarantined_keys": set(),
+            "v1461_paid_results": [],
+        }
+        identity_write = await self._v1459_guard.checkpoint(
+            self._adaptive_session,
+            checkpoint_at_ms=int(time.time() * 1000),
+        )
+        if not identity_write.continue_live:
+            self._adaptive_session["rearm_enabled"] = False
+            self._adaptive_session["stop_requested"] = True
+            await self._v1459_note_cycle_pause(active, self._v1459_cycle_mode(active))
+            if self._v1459_guard.identity_unsafe:
+                return False
+        await self._ensure_v1459_cohort_tracking(self._adaptive_session)
+        self._apply_adaptive_runtime()
+        try:
+            await self._repo.log_event(
+                active["run_id"],
+                "adaptive_session_restart_recovered",
+                {
+                    "session_id": self._adaptive_session["session_id"],
+                    "rearm_enabled": bool(
+                        self._adaptive_session.get("rearm_enabled")
+                    ),
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - active lifecycle must continue
+            logger.error(
+                "adaptive_session_restart_event_failed",
+                run_id=active.get("run_id"),
+                error=str(exc)[:200],
+            )
+        return True
+
+    async def _adaptive_after_terminal(
+        self,
+        run: Mapping[str, Any],
+        net_pnl: float,
+        reason: str,
+        *,
+        gross_pnl: float | None = None,
+        commission: float | None = None,
+        funding: float | None = None,
+        paid_closed_fill: bool = True,
+    ) -> bool:
+        async with self._adaptive_lifecycle_lock:
+            return await self._adaptive_after_terminal_unlocked(
+                run,
+                net_pnl,
+                reason,
+                gross_pnl=gross_pnl,
+                commission=commission,
+                funding=funding,
+                paid_closed_fill=paid_closed_fill,
+            )
+
+    async def _adaptive_after_terminal_unlocked(
+        self,
+        run: Mapping[str, Any],
+        net_pnl: float,
+        reason: str,
+        *,
+        gross_pnl: float | None = None,
+        commission: float | None = None,
+        funding: float | None = None,
+        paid_closed_fill: bool = True,
+    ) -> bool:
+        if not self._is_adaptive_run(run):
+            return False
+        terminal_run_id = str(run.get("run_id") or "")
+        if terminal_run_id and terminal_run_id in self._adaptive_handled_terminal_run_ids:
+            return True
+        if terminal_run_id:
+            self._adaptive_handled_terminal_run_ids.add(terminal_run_id)
+        if not self._adaptive_session:
+            if not await self._maybe_rehydrate_adaptive_session(run):
+                return True
+        session = self._adaptive_session
+        if not session:
+            return False
+        run_id = str(run.get("run_id") or "")
+        if run_id and run_id not in session["run_ids"]:
+            session["run_ids"].append(run_id)
+        session["terminal_runs"] += 1
+        counters = self._adaptive_counters()
+        if counters is not None and paid_closed_fill:
+            counters["paid_closed_fills"] = int(counters.get("paid_closed_fills") or 0) + 1
+            if float(net_pnl) > 0.0:
+                counters["wins"] = int(counters.get("wins") or 0) + 1
+            elif float(net_pnl) < 0.0:
+                counters["losses"] = int(counters.get("losses") or 0) + 1
+            else:
+                counters["flats"] = int(counters.get("flats") or 0) + 1
+        paid_closed_fills = self._adaptive_paid_closed_fills(session)
+        route_key = ""
+        streaks = session.setdefault("route_loss_streaks", {})
+        if paid_closed_fill:
+            session["net_pnl_usdc"] += float(net_pnl)
+            lane, market_state, action, route = self._adaptive_terminal_route(run)
+            route_key = "|".join((lane, market_state, action, route))
+        if counters is not None and paid_closed_fill:
+            gross_value = float(gross_pnl if gross_pnl is not None else net_pnl)
+            commission_value = float(commission or 0.0)
+            funding_value = float(funding or 0.0)
+            counters["gross_pnl_usdc"] = float(counters.get("gross_pnl_usdc") or 0.0) + gross_value
+            counters["commission_usdc"] = float(counters.get("commission_usdc") or 0.0) + commission_value
+            counters["funding_usdc"] = float(counters.get("funding_usdc") or 0.0) + funding_value
+            counters["net_pnl_usdc"] = float(counters.get("net_pnl_usdc") or 0.0) + float(net_pnl)
+            slice_key = "|".join((lane, market_state, action))
+            slices = counters.setdefault("route_state_action_pnl", {})
+            bucket = slices.setdefault(
+                slice_key,
+                {
+                    "runs": 0,
+                    "gross_pnl_usdc": 0.0,
+                    "commission_usdc": 0.0,
+                    "funding_usdc": 0.0,
+                    "net_pnl_usdc": 0.0,
+                },
+            )
+            bucket["runs"] = int(bucket.get("runs") or 0) + 1
+            bucket["gross_pnl_usdc"] = float(bucket.get("gross_pnl_usdc") or 0.0) + gross_value
+            bucket["commission_usdc"] = float(bucket.get("commission_usdc") or 0.0) + commission_value
+            bucket["funding_usdc"] = float(bucket.get("funding_usdc") or 0.0) + funding_value
+            bucket["net_pnl_usdc"] = float(bucket.get("net_pnl_usdc") or 0.0) + float(net_pnl)
+        if paid_closed_fill:
+            if float(net_pnl) < 0:
+                if session.get("last_loss_route") == route_key:
+                    streaks[route_key] = int(streaks.get(route_key) or 0) + 1
+                else:
+                    streaks.clear()
+                    streaks[route_key] = 1
+                session["last_loss_route"] = route_key
+            else:
+                streaks.clear()
+                session["last_loss_route"] = None
+            session["high_water_net_pnl_usdc"] = max(
+                float(session["high_water_net_pnl_usdc"]), float(session["net_pnl_usdc"])
+            )
+            state = self._codex_state_throttle_norm(self._codex_v1_market_state_from_run(run))
+            if state:
+                state_net = session["state_net_pnl_usdc"].get(state, 0.0) + float(net_pnl)
+                session["state_net_pnl_usdc"][state] = state_net
+                deadline = float(self._codex_state_throttle_until.get(state, 0.0))
+                if deadline and session["state_throttle_deadlines"].get(state) != deadline:
+                    session["state_throttle_deadlines"][state] = deadline
+                    session["state_throttle_count"][state] = session["state_throttle_count"].get(state, 0) + 1
+                if state_net <= -1.0 or session["state_throttle_count"].get(state, 0) >= 2:
+                    session["disabled_states"].add(state)
+                    await self._repo.log_event(
+                        run_id,
+                        "adaptive_state_disabled",
+                        {"state": state, "state_net_pnl_usdc": state_net, "throttle_count": session["state_throttle_count"].get(state, 0)},
+                    )
+            if self._v1460_config_selected():
+                lane_state_key = "|".join((lane, market_state))
+                lane_net = session.setdefault(
+                    "v1460_lane_state_net_pnl_usdc", {}
+                )
+                lane_streaks = session.setdefault(
+                    "v1460_lane_state_loss_streaks", {}
+                )
+                isolated = session.setdefault("v1460_isolated_keys", set())
+                lane_net[lane_state_key] = float(
+                    lane_net.get(lane_state_key) or 0.0
+                ) + float(net_pnl)
+                if float(net_pnl) < 0:
+                    lane_streaks[lane_state_key] = int(
+                        lane_streaks.get(lane_state_key) or 0
+                    ) + 1
+                else:
+                    lane_streaks[lane_state_key] = 0
+                loss_limit = max(
+                    1,
+                    int(
+                        getattr(
+                            self._settings,
+                            "mainnet_codex_v1460_lane_consecutive_loss_limit",
+                            2,
+                        )
+                    ),
+                )
+                lane_net_cap = max(
+                    0.0,
+                    float(
+                        getattr(
+                            self._settings,
+                            "mainnet_codex_v1460_lane_net_loss_cap_usdc",
+                            0.12,
+                        )
+                    ),
+                )
+                isolate_reason = None
+                if int(lane_streaks[lane_state_key]) >= loss_limit:
+                    isolate_reason = "consecutive_net_losses"
+                elif float(lane_net[lane_state_key]) <= -lane_net_cap:
+                    isolate_reason = "lane_net_loss_cap"
+                if isolate_reason and lane_state_key not in isolated:
+                    isolated.add(lane_state_key)
+                    await self._repo.log_event(
+                        run_id,
+                        "v1460_lane_state_isolated",
+                        {
+                            "lane_state_key": lane_state_key,
+                            "lane_code": lane,
+                            "market_state": market_state,
+                            "reason": isolate_reason,
+                            "loss_streak": lane_streaks[lane_state_key],
+                            "lane_net_pnl_usdc": lane_net[lane_state_key],
+                            "lane_net_loss_cap_usdc": lane_net_cap,
+                        },
+                    )
+            if self._v1461_config_selected():
+                policy = self._v1461_terminal_policy(run)
+                if isinstance(policy, Mapping):
+                    active_hash = self._v1461_gate_config().policy_hash
+                    if str(policy.get("policy_hash") or "") != active_hash:
+                        session["stop_requested"] = True
+                        session["rearm_enabled"] = False
+                        session["safety_halt_reason"] = (
+                            "v1461_terminal_policy_hash_mismatch"
+                        )
+                    gate_family = str(policy.get("gate_family_id") or "UNKNOWN")
+                    policy_lane = str(policy.get("lane") or lane or "UNKNOWN")
+                    coarse_state = str(
+                        policy.get("market_state") or market_state or "UNKNOWN"
+                    )
+                    key = v1461_promotion_key(
+                        gate_family, policy_lane, coarse_state
+                    )
+                    gate_net = session.setdefault(
+                        "v1461_gate_net_pnl_usdc", {}
+                    )
+                    gate_streaks = session.setdefault(
+                        "v1461_gate_loss_streaks", {}
+                    )
+                    quarantined = session.setdefault(
+                        "v1461_quarantined_keys", set()
+                    )
+                    gate_net[key] = float(gate_net.get(key) or 0.0) + float(
+                        net_pnl
+                    )
+                    if float(net_pnl) < 0.0:
+                        gate_streaks[key] = int(gate_streaks.get(key) or 0) + 1
+                    else:
+                        gate_streaks[key] = 0
+                    config = self._v1461_gate_config()
+                    quarantine_reason = None
+                    if int(gate_streaks[key]) >= config.lane_loss_streak_limit:
+                        quarantine_reason = "consecutive_paid_losses"
+                    elif float(gate_net[key]) <= -config.lane_net_loss_cap_usdc:
+                        quarantine_reason = "gate_net_loss_cap"
+                    if quarantine_reason and key not in quarantined:
+                        quarantined.add(key)
+                        await self._repo.log_event(
+                            run_id,
+                            "v1461_gate_quarantined",
+                            {
+                                "promotion_key": key,
+                                "reason": quarantine_reason,
+                                "loss_streak": gate_streaks[key],
+                                "gate_net_pnl_usdc": gate_net[key],
+                                "policy_hash": active_hash,
+                            },
+                        )
+                    action_mode = str(policy.get("action_mode") or "")
+                    promoted = not bool(policy.get("incumbent_accepted"))
+                    if promoted and action_mode in {
+                        V1461ActionMode.FAST_PROBE_0_5.value,
+                        V1461ActionMode.PROBATION_0_5.value,
+                        V1461ActionMode.CONTROL.value,
+                    }:
+                        all_evidence = session.setdefault(
+                            "v1461_gate_evidence", {}
+                        )
+                        evidence = all_evidence.setdefault(
+                            key,
+                            {
+                                "opportunity_ids": [],
+                                "episode_ids": [],
+                                "opportunities": 0,
+                                "evaluable": 0,
+                                "tp_first": 0,
+                                "sl_first": 0,
+                                "no_fill": 0,
+                                "ambiguous": 0,
+                                "incomplete": 0,
+                                "net_pnl_usdc": 0.0,
+                                "policy_hash": active_hash,
+                            },
+                        )
+                        policy_episode_id = str(
+                            policy.get("episode_id") or "UNKNOWN"
+                        )
+                        prior_probe_pnl = evidence.get(
+                            "first_probe_net_pnl_usdc"
+                        )
+                        prior_probe_episode_id = str(
+                            evidence.get("first_probe_episode_id") or ""
+                        )
+                        retrying_failed_probe = False
+                        if (
+                            action_mode
+                            == V1461ActionMode.FAST_PROBE_0_5.value
+                            and prior_probe_pnl is not None
+                            and prior_probe_episode_id
+                            and prior_probe_episode_id != policy_episode_id
+                        ):
+                            try:
+                                retrying_failed_probe = (
+                                    math.isfinite(float(prior_probe_pnl))
+                                    and float(prior_probe_pnl) < 0.0
+                                )
+                            except (TypeError, ValueError, OverflowError):
+                                retrying_failed_probe = False
+                        if retrying_failed_probe:
+                            evidence["paid_complete"] = 0
+                            evidence["paid_wins"] = 0
+                            evidence["paid_net_pnl_usdc"] = 0.0
+                            evidence["paid_integrity_complete"] = True
+                            evidence["first_probe_net_pnl_usdc"] = None
+                            evidence["first_probe_episode_id"] = None
+                        evidence["paid_complete"] = int(
+                            evidence.get("paid_complete") or 0
+                        ) + 1
+                        if float(net_pnl) > 0.0:
+                            evidence["paid_wins"] = int(
+                                evidence.get("paid_wins") or 0
+                            ) + 1
+                        evidence["paid_net_pnl_usdc"] = float(
+                            evidence.get("paid_net_pnl_usdc") or 0.0
+                        ) + float(net_pnl)
+                        evidence["paid_integrity_complete"] = True
+                        if (
+                            action_mode
+                            == V1461ActionMode.FAST_PROBE_0_5.value
+                            and evidence.get("first_probe_net_pnl_usdc") is None
+                        ):
+                            evidence["first_probe_net_pnl_usdc"] = float(net_pnl)
+                            evidence["first_probe_episode_id"] = policy_episode_id
+                    results = session.setdefault("v1461_paid_results", [])
+                    results.append(
+                        {
+                            "run_id": run_id,
+                            "promotion_key": key,
+                            "action_mode": action_mode,
+                            "incumbent_accepted": bool(
+                                policy.get("incumbent_accepted")
+                            ),
+                            "net_pnl_usdc": float(net_pnl),
+                            "reason": reason,
+                            "completed_at_ms": int(time.time() * 1000),
+                            "policy_hash": active_hash,
+                        }
+                    )
+                    if len(results) > 200:
+                        del results[:-200]
+        now_ms = int(time.time() * 1000)
+        if (
+            (
+                paid_closed_fill
+                and paid_closed_fills % self._adaptive_checkpoint_fills() == 0
+            )
+            or now_ms - int(session["last_checkpoint_at_ms"]) >= ADAPTIVE_CHECKPOINT_SECONDS * 1000
+        ):
+            session["last_checkpoint_at_ms"] = now_ms
+            checkpoint = {
+                "session_id": session["session_id"],
+                "terminal_runs": session["terminal_runs"],
+                "paid_closed_fills": paid_closed_fills,
+                "net_pnl_usdc": session["net_pnl_usdc"],
+                "high_water_net_pnl_usdc": session["high_water_net_pnl_usdc"],
+                "disabled_states": sorted(session["disabled_states"]),
+                "state_net_pnl_usdc": dict(session["state_net_pnl_usdc"]),
+                "config_sha": session["config_sha"],
+                "counters": counters,
+                "route_loss_streaks": dict(streaks),
+                "v1460_lane_state_loss_streaks": dict(
+                    session.get("v1460_lane_state_loss_streaks") or {}
+                ),
+                "v1460_lane_state_net_pnl_usdc": dict(
+                    session.get("v1460_lane_state_net_pnl_usdc") or {}
+                ),
+                "v1460_isolated_keys": sorted(
+                    session.get("v1460_isolated_keys") or ()
+                ),
+                "v1460_weak_evidence": dict(
+                    session.get("v1460_weak_evidence") or {}
+                ),
+                "v1461_gate_evidence": dict(
+                    session.get("v1461_gate_evidence") or {}
+                ),
+                "v1461_gate_loss_streaks": dict(
+                    session.get("v1461_gate_loss_streaks") or {}
+                ),
+                "v1461_gate_net_pnl_usdc": dict(
+                    session.get("v1461_gate_net_pnl_usdc") or {}
+                ),
+                "v1461_quarantined_keys": sorted(
+                    session.get("v1461_quarantined_keys") or ()
+                ),
+            }
+            await self._repo.log_event(run_id, "adaptive_session_checkpoint", checkpoint)
+            await self._notify(
+                f"♾ <b>Adaptive checkpoint</b>：{checkpoint['paid_closed_fills']} paid fills / "
+                f"{checkpoint['terminal_runs']} attempts，"
+                f"淨損益 <b>{checkpoint['net_pnl_usdc']:+.4f} USDC</b>。"
+            )
+        stop_reason = None
+        if session.get("stop_requested"):
+            stop_reason = str(
+                session.get("safety_halt_reason")
+                or (
+                    "manual_stop"
+                    if not session.get("restart_recovered")
+                    else "restart_recovered_terminal"
+                )
+            )
+        elif paid_closed_fill and reason == "ENTRY_LATE_FILL_TTL":
+            stop_reason = "entry_late_fill_ttl"
+        elif (
+            not self._v1460_config_selected()
+            and paid_closed_fill
+            and int(streaks.get(route_key) or 0) >= 2
+        ):
+            stop_reason = "same_live_route_two_net_losses"
+        elif paid_closed_fill and float(session["net_pnl_usdc"]) <= -self._adaptive_net_loss_cap_usdc():
+            stop_reason = "net_loss_cap"
+        elif (
+            not self._v1460_config_selected()
+            and paid_closed_fill
+            and float(session["high_water_net_pnl_usdc"]) > 0
+            and float(session["high_water_net_pnl_usdc"])
+            - float(session["net_pnl_usdc"])
+            >= ADAPTIVE_HIGH_WATER_GIVEBACK_USDC
+        ):
+            stop_reason = "high_water_giveback"
+        elif paid_closed_fills >= self._adaptive_target_paid_closed_fills():
+            stop_reason = "paid_closed_fill_target"
+        elif now_ms >= int(session.get("deadline_at_ms") or 0):
+            stop_reason = "wall_clock_cap"
+        if stop_reason:
+            await self._stop_adaptive_session(run, stop_reason, unexpected=False)
+            return True
+        session["last_checkpoint_at_ms"] = now_ms
+        session["route_stats"] = self._adaptive_route_stats_snapshot(session)
+        durable_write = await self._v1459_guard.checkpoint(
+            session,
+            checkpoint_at_ms=now_ms,
+        )
+        if not durable_write.continue_live:
+            session["stop_requested"] = True
+            session["rearm_enabled"] = False
+            self._adaptive_last_review = dict(session)
+            await self._v1459_note_cycle_pause(
+                run, self._v1459_cycle_mode(run)
+            )
+            return True
+        await self._arm_adaptive_run()
+        return True
+
+    async def _maybe_resume_idle_adaptive_session(self) -> bool:
+        """Recover an interrupted terminal-to-arm handoff exactly once."""
+
+        async with self._adaptive_lifecycle_lock:
+            session = self._adaptive_session
+            if (
+                not session
+                or session.get("stop_requested")
+                or not session.get("rearm_enabled")
+                or self._v1459_entry_paused()
+            ):
+                return False
+            if await self._repo.get_active_run():
+                return False
+            logger.warning(
+                "adaptive_idle_rearm_recovery",
+                session_id=session.get("session_id"),
+                terminal_runs=session.get("terminal_runs"),
+            )
+            await self._arm_adaptive_run()
+            return True
+
+    async def _stop_adaptive_session(
+        self,
+        run: Mapping[str, Any] | None,
+        reason: str,
+        *,
+        unexpected: bool,
+    ) -> None:
+        session = self._adaptive_session
+        if not session:
+            return
+        session["stop_reason"] = reason
+        session["stop_requested"] = True
+        session["rearm_enabled"] = False
+        session["stopped_at_ms"] = int(time.time() * 1000)
+        session["last_checkpoint_at_ms"] = session["stopped_at_ms"]
+        canary_evaluation = self._v1460_canary_evaluation_payload(session)
+        if canary_evaluation is not None:
+            session["v1460_canary_evaluation"] = canary_evaluation
+        session["route_stats"] = self._adaptive_route_stats_snapshot(session)
+        final_write = await self._v1459_guard.checkpoint(
+            session,
+            checkpoint_at_ms=session["stopped_at_ms"],
+        )
+        if not final_write.continue_live:
+            self._adaptive_last_review = dict(session)
+            self._apply_adaptive_runtime()
+            logger.error(
+                "v1459_final_checkpoint_failed",
+                status=final_write.status,
+                reason=final_write.reason,
+            )
+            await self._v1459_note_cycle_pause(
+                run, self._v1459_cycle_mode(run)
+            )
+            return
+        event_run_id = str((run or {}).get("run_id") or (session.get("run_ids") or [None])[-1] or "")
+        if event_run_id:
+            details = {
+                "session_id": session.get("session_id"),
+                "reason": reason,
+                "terminal_runs": session.get("terminal_runs"),
+                "paid_closed_fills": self._adaptive_paid_closed_fills(session),
+                "net_pnl_usdc": session.get("net_pnl_usdc"),
+            }
+            try:
+                await self._repo.log_event(event_run_id, "adaptive_session_stopped", details)
+                if unexpected:
+                    await self._repo.log_event(event_run_id, "adaptive_session_unexpected_stop_reason", details)
+            except Exception as exc:  # noqa: BLE001 - stopping must not depend on telemetry persistence
+                logger.error("adaptive_session_stop_event_failed", run_id=event_run_id, error=str(exc)[:300])
+        if unexpected:
+            self._apply_adaptive_runtime()
+        else:
+            self._restore_adaptive_runtime(session.get("prior_runtime"))
+        self._adaptive_last_review = dict(session)
+        self._adaptive_session = None
+
+    def _adaptive_disabled_state_for_decision(self, decision: CodexV1Decision | None) -> str | None:
+        if not self._adaptive_session or not decision:
+            return None
+        state = self._codex_state_throttle_norm(self._codex_v1_market_state_from_decision(decision))
+        return state if state and state in self._adaptive_session.get("disabled_states", set()) else None
 
     async def run_cycle(self) -> None:
         if not self._settings.mainnet_one_run_enabled:
             return
         await self._ensure_runtime_config_loaded()
+        await self._observe_db_capacity()
+        # Obtain the active row before starting any historical reconciliation.
+        # A paid run is never delayed by a large idle evidence backlog.
         active = await self._repo.get_active_run()
+        if not active:
+            self._kick_idle_recovery()
+            self._kick_idle_maintenance()
+        try:
+            await self._v1460_weak_shadow_tracker.update()
+        except Exception as exc:  # noqa: BLE001 - read-only evidence is non-blocking
+            logger.warning(
+                "v1460_weak_shadow_update_failed",
+                error=str(exc)[:200],
+            )
+        try:
+            await self._adaptive_stup_fill_shadow_tracker.update()
+        except Exception as exc:  # noqa: BLE001 - read-only shadow telemetry is non-blocking
+            logger.warning(
+                "adaptive_stup_fill_shadow_update_failed",
+                error=str(exc)[:200],
+            )
+        if active and self._is_adaptive_run(active):
+            await self._maybe_rehydrate_adaptive_session(active)
+        cycle_mode = self._v1459_cycle_mode(active)
+        if cycle_mode in {"IDENTITY_UNSAFE", "ENTRY_PAUSED"}:
+            await self._v1459_note_cycle_pause(active, cycle_mode)
+            return
+        if cycle_mode == "RISK_REDUCTION_ONLY":
+            await self._v1459_note_cycle_pause(active, cycle_mode)
         if active:
+            await self._maybe_rehydrate_loop_state_from_active_run(active)
+            try:
+                await self._rehydrate_v1463_shadow_samples(active)
+            except Exception as exc:  # noqa: BLE001 - restore retries next cycle
+                logger.warning(
+                    "v1463_shadow_rehydrate_unhandled",
+                    run_id=active.get("run_id"),
+                    error=str(exc)[:200],
+                )
             try:
                 await self._rehydrate_codex_v132_tp_policy_samples(active)
             except Exception as exc:  # noqa: BLE001 - restore must never interrupt live run management
@@ -498,10 +7132,16 @@ class MainnetOneRunManager:
                     run_id=active.get("run_id"),
                     error=str(exc)[:200],
                 )
+            if str(active.get("status") or "").upper() in {
+                "ENTRY_PENDING",
+                "RUNNING",
+                "CLOSING",
+            }:
+                await self._expire_codex_v1_shadow_samples(
+                    active,
+                    "live_entry_submitted",
+                )
         if not active:
-            # No active run: if a loop arm was deferred by a cooldown, resume
-            # it once the cooldown expires.
-            await self._maybe_resume_pending_loop()
             return
         try:
             status = active["status"]
@@ -513,12 +7153,695 @@ class MainnetOneRunManager:
                 await self._run_running(active)
         except Exception as exc:  # noqa: BLE001
             logger.error("mainnet_one_run_cycle_failed", run_id=active.get("run_id"), error=str(exc))
+            try:
+                await self._expire_codex_v1_shadow_samples(
+                    active,
+                    "unexpected_cycle_exception",
+                )
+            except Exception as shadow_exc:  # noqa: BLE001 - safety first
+                self._v1463_terminal_reconcile_needed = True
+                logger.warning(
+                    "v1463_cycle_failure_terminal_intent_failed",
+                    run_id=active.get("run_id"),
+                    error=str(shadow_exc)[:200],
+                )
+            try:
+                await self._drop_codex_v132_tp_policy_samples(
+                    str(active.get("run_id") or ""),
+                    "unexpected_cycle_exception",
+                )
+            except Exception as tp_exc:  # noqa: BLE001 - safety first
+                logger.warning(
+                    "codex_v132_cycle_failure_drop_failed",
+                    run_id=active.get("run_id"),
+                    error=str(tp_exc)[:200],
+                )
             await self._repo.complete_run(active["run_id"], "FAILED", "exception", str(exc)[:500])
+            if self._is_adaptive_run(active):
+                await self._stop_adaptive_session(active, "unexpected_cycle_exception", unexpected=True)
             await self._notify(
                 "❌ <b>Mainnet one-run 失敗</b>\n"
                 f"Run：<code>{escape(active['run_id'])}</code>\n"
                 f"錯誤：<code>{escape(str(exc)[:500])}</code>"
             )
+
+    @staticmethod
+    def _run_params(row: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        params = row.get("params")
+        if isinstance(params, Mapping):
+            return params
+        params_raw = row.get("params_json")
+        if isinstance(params_raw, str) and params_raw.strip():
+            try:
+                parsed = json.loads(params_raw)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, Mapping):
+                return parsed
+        return None
+
+    @staticmethod
+    def _loop_total_from_params(params: Mapping[str, Any] | None) -> int:
+        if not isinstance(params, Mapping):
+            return 0
+        try:
+            return int(params.get("loop_count") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _loop_index_from_params(params: Mapping[str, Any] | None, loop_total: int) -> int:
+        if not isinstance(params, Mapping):
+            return 1
+        try:
+            loop_index = int(params.get("loop_index") or 1)
+        except (TypeError, ValueError):
+            loop_index = 1
+        return max(1, min(loop_index, max(1, loop_total)))
+
+    @staticmethod
+    def _run_net_pnl(run: Mapping[str, Any]) -> float:
+        try:
+            realized = float(run.get("realized_pnl_usdc") or 0.0)
+            commission = float(run.get("commission_usdc") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+        return realized - commission
+
+    @staticmethod
+    def _event_details(event: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        details = event.get("details")
+        if isinstance(details, Mapping):
+            return details
+        details_raw = event.get("details_json")
+        if isinstance(details_raw, str) and details_raw.strip():
+            try:
+                parsed = json.loads(details_raw)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, Mapping):
+                return parsed
+        return None
+
+    async def _rehydrate_v1463_shadow_samples(
+        self,
+        run: Mapping[str, Any],
+    ) -> None:
+        """Restore non-terminal frozen samples from the durable event ledger."""
+
+        if not self._v1462_observation_selected():
+            return
+        run_id = str(run.get("run_id") or "")
+        if not run_id or run_id in self._v1463_shadow_rehydrated_runs:
+            return
+        event_types = (
+            "entry_codex_v1_shadow_sample_started",
+            "entry_codex_v1_shadow_outcome",
+            "entry_codex_v1_shadow_sample_dropped",
+        )
+        get_events_by_types = getattr(self._repo, "get_events_by_types", None)
+        if not callable(get_events_by_types):
+            logger.warning(
+                "v1463_shadow_rehydrate_unbounded_reader_missing",
+                run_id=run_id,
+            )
+            return
+        try:
+            try:
+                events = await get_events_by_types(
+                    run_id,
+                    event_types,
+                    limit=None,
+                )
+            except TypeError:
+                events = await get_events_by_types(
+                    run_id,
+                    event_types,
+                    limit=2_147_483_647,
+                )
+        except Exception as exc:  # noqa: BLE001 - retry on the next cycle
+            logger.warning(
+                "v1463_shadow_rehydrate_events_failed",
+                run_id=run_id,
+                error=str(exc)[:200],
+            )
+            return
+
+        terminal_ids: set[str] = set()
+        started: dict[str, dict[str, Any]] = {}
+        for event in events or []:
+            if not isinstance(event, Mapping):
+                continue
+            event_type = str(event.get("event_type") or "")
+            details = self._event_details(event)
+            if not isinstance(details, Mapping):
+                continue
+            sample_id = str(details.get("sample_id") or "")
+            if not sample_id:
+                continue
+            if event_type in {
+                "entry_codex_v1_shadow_outcome",
+                "entry_codex_v1_shadow_sample_dropped",
+            }:
+                terminal_ids.add(sample_id)
+                durable_opportunity_id = str(
+                    details.get("v1462_opportunity_id") or ""
+                )
+                if durable_opportunity_id:
+                    self._v1464_terminal_opportunity_ids.add(
+                        durable_opportunity_id
+                    )
+            elif event_type == "entry_codex_v1_shadow_sample_started":
+                started.setdefault(sample_id, dict(details))
+
+        restored: list[str] = []
+        for sample_id, sample in started.items():
+            if sample_id in terminal_ids or sample_id in self._codex_v1_shadow_samples:
+                continue
+            plan = sample.get("frozen_execution_plan")
+            invalid_reason = self._v1463_frozen_plan_invalid_reason(
+                plan if isinstance(plan, Mapping) else None
+            )
+            if str(sample.get("registry_version") or "") != V1462_REGISTRY_VERSION:
+                invalid_reason = "registry_version_mismatch"
+            if invalid_reason:
+                invalid_drop = {
+                    **dict(sample),
+                    "event_type": "shadow_sample_dropped",
+                    "drop_reason": f"data_incomplete:{invalid_reason}",
+                    "data_quality_status": "DATA_INCOMPLETE",
+                    "order_api_calls": 0,
+                }
+                try:
+                    await self._repo.log_event(
+                        run_id,
+                        "entry_codex_v1_shadow_sample_dropped",
+                        invalid_drop,
+                    )
+                except Exception as exc:  # noqa: BLE001 - retry whole ledger
+                    logger.warning(
+                        "v1463_shadow_invalid_started_terminal_failed",
+                        run_id=run_id,
+                        sample_id=sample_id,
+                        reason=invalid_reason,
+                        error=str(exc)[:200],
+                    )
+                    return
+                if invalid_drop.get("v1465_profile_evidence") is not True:
+                    await self._v1464_project_shadow_drop(invalid_drop)
+                terminal_ids.add(sample_id)
+                continue
+            sample["rehydrated_from_event_log"] = True
+            self._codex_v1_shadow_samples[sample_id] = sample
+            restored.append(sample_id)
+
+        self._codex_v1_shadow_outcomes_logged.update(terminal_ids)
+        active_for_run = [
+            sample
+            for sample in self._codex_v1_shadow_samples.values()
+            if str(sample.get("run_id") or "") == run_id
+            and not bool(sample.get("diagnostic_only"))
+            and sample.get("v1465_profile_evidence") is not True
+        ]
+        self._codex_v1_shadow_sample_counts_by_run[run_id] = len(active_for_run)
+        for sample in active_for_run:
+            scope = str(sample.get("sample_scope_key") or "")
+            if not scope:
+                continue
+            previous = self._codex_v1_shadow_last_sample_by_scope.get(scope)
+            if previous and int(previous.get("start_ms") or 0) >= int(
+                sample.get("start_ms") or 0
+            ):
+                continue
+            self._codex_v1_shadow_last_sample_by_scope[scope] = {
+                key: sample.get(key)
+                for key in (
+                    "start_ms",
+                    "entry_price",
+                    "entry_price_bucket",
+                    "sample_id",
+                    "opportunity_id",
+                    "shadow_lane",
+                    "side",
+                    "sampling_family",
+                )
+            }
+        self._v1463_shadow_rehydrated_runs.add(run_id)
+        if restored:
+            logger.info(
+                "v1463_shadow_samples_rehydrated",
+                run_id=run_id,
+                samples=len(restored),
+            )
+
+    async def _reconcile_v1465_w6a_profile_ledger(self) -> None:
+        """Repair bounded profile start/projection gaps from the event ledger."""
+
+        if (
+            self._v1465_w6a_profile_repo is None
+            or not bool(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1465_w6a_profile_shadow_enabled",
+                    False,
+                )
+            )
+        ):
+            return
+        if (
+            self._v1465_profile_ledger_checked_once
+            and not self._v1465_profile_ledger_unsafe
+        ):
+            return
+
+        self._v1465_profile_ledger_unsafe = True
+        get_incomplete_starts = getattr(
+            self._repo,
+            "get_incomplete_v1465_w6a_profile_start_groups",
+            None,
+        )
+        get_profile_events = getattr(
+            self._repo,
+            "get_v1465_w6a_profile_events",
+            None,
+        )
+        starts_repaired = 0
+        if callable(get_incomplete_starts) and callable(get_profile_events):
+            incomplete = await get_incomplete_starts(
+                version=CODEX_V1_VERSION,
+                expected_profile_count=len(W6A_PROFILES),
+                limit=500,
+            )
+            for event in incomplete or []:
+                if not isinstance(event, Mapping):
+                    continue
+                base_sample = self._event_details(event)
+                if not isinstance(base_sample, Mapping):
+                    continue
+                expected_samples = self._v1465_build_w6a_profile_samples(
+                    base_sample
+                )
+                if len(expected_samples) != len(W6A_PROFILES):
+                    continue
+                run_id = str(
+                    event.get("run_id")
+                    or base_sample.get("run_id")
+                    or ""
+                )
+                opportunity_id = str(
+                    base_sample.get("v1462_opportunity_id") or ""
+                )
+                if not run_id or not opportunity_id:
+                    continue
+                group_events = await get_profile_events(
+                    run_id,
+                    opportunity_id,
+                    limit=50,
+                )
+                started_ids: set[str] = set()
+                terminal_ids: set[str] = set()
+                for group_event in group_events or []:
+                    if not isinstance(group_event, Mapping):
+                        continue
+                    event_type = str(group_event.get("event_type") or "")
+                    group_details = self._event_details(group_event)
+                    sample_id = str(group_details.get("sample_id") or "")
+                    if not sample_id:
+                        continue
+                    if (
+                        event_type
+                        == "entry_codex_v1_shadow_sample_started"
+                    ):
+                        started_ids.add(sample_id)
+                    elif event_type in {
+                        "entry_codex_v1_shadow_outcome",
+                        "entry_codex_v1_shadow_sample_dropped",
+                    }:
+                        terminal_ids.add(sample_id)
+                for profile_sample in expected_samples:
+                    sample_id = str(profile_sample.get("sample_id") or "")
+                    if not sample_id or sample_id in started_ids:
+                        continue
+                    await self._repo.log_event(
+                        run_id,
+                        "entry_codex_v1_shadow_sample_started",
+                        profile_sample,
+                    )
+                    started_ids.add(sample_id)
+                    starts_repaired += 1
+                    if sample_id not in terminal_ids:
+                        restored = dict(profile_sample)
+                        restored["rehydrated_from_event_log"] = True
+                        self._codex_v1_shadow_samples.setdefault(
+                            sample_id,
+                            restored,
+                        )
+
+        get_unacked = getattr(
+            self._repo,
+            "get_unacked_v1465_w6a_profile_outcomes",
+            None,
+        )
+        outcomes_repaired = 0
+        outcomes_failed = 0
+        if callable(get_unacked):
+            unacked = await get_unacked(limit=500)
+            for event in unacked or []:
+                if not isinstance(event, Mapping):
+                    continue
+                details = self._event_details(event)
+                if not isinstance(details, Mapping):
+                    outcomes_failed += 1
+                    continue
+                if await self._v1465_project_w6a_profile_outcome(details):
+                    outcomes_repaired += 1
+                else:
+                    outcomes_failed += 1
+
+        if starts_repaired or outcomes_repaired:
+            logger.info(
+                "v1465_w6a_profile_ledger_reconciled",
+                starts_repaired=starts_repaired,
+                outcomes_repaired=outcomes_repaired,
+            )
+        if outcomes_failed:
+            raise RuntimeError(
+                "v1465 W6A outcome projection remains incomplete: "
+                f"{outcomes_failed}"
+            )
+        if not (
+            callable(get_incomplete_starts)
+            and callable(get_profile_events)
+            and callable(get_unacked)
+        ):
+            raise RuntimeError(
+                "v1465 W6A ledger reconciliation reader unavailable"
+            )
+        remaining_starts = await get_incomplete_starts(
+            version=CODEX_V1_VERSION,
+            expected_profile_count=len(W6A_PROFILES),
+            limit=1,
+        )
+        remaining_outcomes = await get_unacked(limit=1)
+        if remaining_starts or remaining_outcomes:
+            raise RuntimeError(
+                "v1465 W6A ledger reconciliation remains pending"
+            )
+        self._v1465_profile_ledger_unsafe = False
+        self._v1465_profile_ledger_checked_once = True
+
+    async def _reconcile_recent_terminal_v1463_shadow_samples(self) -> None:
+        """Retry unresolved terminal samples even when there is no active run."""
+
+        if not self._v1462_observation_selected():
+            return
+        # Same-process failures retain their terminal intent in memory.
+        pending_rows: dict[str, dict[str, Any]] = {}
+        for sample in self._codex_v1_shadow_samples.values():
+            terminal_reason = str(sample.get("terminal_pending_reason") or "")
+            run_id = str(sample.get("run_id") or "")
+            if terminal_reason and run_id:
+                pending_rows[run_id] = {
+                    "run_id": run_id,
+                    "status": "FAILED",
+                    "exit_reason": terminal_reason,
+                }
+
+        if (
+            self._v1463_terminal_startup_reconciled
+            and not self._v1463_terminal_reconcile_needed
+            and not pending_rows
+        ):
+            return
+
+        get_unresolved = getattr(
+            self._repo,
+            "get_terminal_runs_with_unresolved_v1463_shadow_samples",
+            None,
+        )
+        if not callable(get_unresolved):
+            rows = list(pending_rows.values())
+        else:
+            rows = list(await get_unresolved())
+            for run_id, row in pending_rows.items():
+                if not any(str(item.get("run_id") or "") == run_id for item in rows):
+                    rows.append(row)
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            status = str(row.get("status") or "").upper()
+            await self._rehydrate_v1463_shadow_samples(row)
+            run_id = str(row.get("run_id") or "")
+            if run_id not in self._v1463_shadow_rehydrated_runs:
+                self._v1463_terminal_reconcile_needed = True
+                raise RuntimeError(
+                    f"v1463 shadow ledger rehydrate incomplete for {run_id}"
+                )
+            if not any(
+                str(sample.get("run_id") or "") == run_id
+                for sample in self._codex_v1_shadow_samples.values()
+            ):
+                continue
+            in_memory_reason = next(
+                (
+                    str(sample.get("terminal_pending_reason") or "")
+                    for sample in self._codex_v1_shadow_samples.values()
+                    if str(sample.get("run_id") or "") == run_id
+                    and sample.get("terminal_pending_reason")
+                ),
+                "",
+            )
+            terminal_reason = in_memory_reason or (
+                "live_entry_submitted"
+                if status == "COMPLETED"
+                else str(row.get("exit_reason") or status.lower())
+            )
+            await self._expire_codex_v1_shadow_samples(row, terminal_reason)
+        self._v1463_terminal_startup_reconciled = True
+        self._v1463_terminal_reconcile_needed = any(
+            bool(sample.get("terminal_pending_reason"))
+            for sample in self._codex_v1_shadow_samples.values()
+        )
+
+    async def _reconcile_unresolved_v1462_shadow_opportunities(self) -> None:
+        """Close durable opportunities that never acquired a started sample."""
+
+        if not self._v1462_observation_selected():
+            return
+        if (
+            self._v1463_opportunity_startup_reconciled
+            and not self._v1463_opportunity_reconcile_needed
+        ):
+            return
+        get_unresolved = getattr(
+            self._repo,
+            "get_unresolved_v1462_shadow_opportunity_events",
+            None,
+        )
+        if not callable(get_unresolved):
+            return
+        for event in await get_unresolved():
+            if not isinstance(event, Mapping):
+                continue
+            details = self._event_details(event)
+            if not isinstance(details, Mapping):
+                continue
+            opportunity_id = str(
+                details.get("v1462_opportunity_id")
+                or details.get("opportunity_id")
+                or ""
+            )
+            run_id = str(event.get("run_id") or details.get("run_id") or "")
+            if not opportunity_id or not run_id:
+                continue
+            await self._log_v1463_shadow_data_incomplete(
+                run_id,
+                opportunity_id,
+                reason="unresolved_collector_after_durable_opportunity",
+                source=details,
+            )
+        self._v1463_opportunity_startup_reconciled = True
+        self._v1463_opportunity_reconcile_needed = False
+
+    async def _load_loop_runs_through(
+        self,
+        anchor: Mapping[str, Any],
+        loop_total: int,
+        loop_index: int,
+    ) -> list[Mapping[str, Any]]:
+        run_id = str(anchor.get("run_id") or "")
+        get_recent_runs = getattr(self._repo, "get_recent_runs", None)
+        if not callable(get_recent_runs):
+            return [anchor]
+        try:
+            recent = await get_recent_runs(max(80, loop_total + 25, loop_index + 25))
+        except Exception as exc:  # noqa: BLE001 - rehydrate must not block live management
+            logger.warning("mainnet_one_run_loop_recent_runs_load_failed", run_id=run_id or None, error=str(exc)[:200])
+            return [anchor]
+        rows: list[Mapping[str, Any]] = [row for row in recent if isinstance(row, Mapping)]
+        if run_id and not any(str(row.get("run_id") or "") == run_id for row in rows):
+            rows.append(anchor)
+        rows.sort(key=lambda row: (int(row.get("armed_at_ms") or 0), str(row.get("run_id") or "")))
+        anchor_pos = next(
+            (idx for idx, row in enumerate(rows) if run_id and str(row.get("run_id") or "") == run_id),
+            len(rows) - 1,
+        )
+        expected_index = loop_index
+        selected_rev: list[Mapping[str, Any]] = []
+        for row in reversed(rows[: anchor_pos + 1]):
+            params = self._run_params(row)
+            if self._loop_total_from_params(params) != loop_total:
+                if selected_rev:
+                    break
+                continue
+            row_index = self._loop_index_from_params(params, loop_total)
+            if row_index == expected_index:
+                selected_rev.append(row)
+                expected_index -= 1
+                if expected_index <= 0:
+                    break
+                continue
+            if selected_rev:
+                break
+        if not selected_rev:
+            return [anchor]
+        return list(reversed(selected_rev))
+
+    def _apply_rehydrated_loop_state(
+        self,
+        loop_total: int,
+        loop_completed: int,
+        loop_runs: Sequence[Mapping[str, Any]],
+    ) -> None:
+        self._loop_total = loop_total
+        self._loop_completed = max(0, min(loop_completed, loop_total))
+        self._loop_run_ids = [str(run.get("run_id") or "") for run in loop_runs if str(run.get("run_id") or "")]
+        self._loop_net_pnl = 0.0
+        self._loop_cooldowns.clear()
+        now_ms = int(time.time() * 1000)
+        loss_streak = 0
+        for run in loop_runs:
+            if str(run.get("status") or "").upper() != "COMPLETED":
+                continue
+            net_pnl = self._run_net_pnl(run)
+            self._loop_net_pnl += net_pnl
+            if net_pnl < 0:
+                loss_streak += 1
+                side = str((self._run_params(run) or {}).get("side") or run.get("side") or "").upper()
+                strategy = str(run.get("strategy_label") or (self._run_params(run) or {}).get("strategy") or "")
+                try:
+                    completed_at_ms = int(run.get("completed_at_ms") or run.get("updated_at_ms") or 0)
+                except (TypeError, ValueError):
+                    completed_at_ms = 0
+                cooldown_minutes = (
+                    self._loop_cooldown_minutes
+                    + self._settings.mainnet_loop_cooldown_step_minutes * (loss_streak - 1)
+                )
+                cooldown_until = completed_at_ms + int(cooldown_minutes * 60_000)
+                if side and strategy and cooldown_until > now_ms:
+                    self._loop_cooldowns[(side, strategy)] = max(
+                        self._loop_cooldowns.get((side, strategy), 0), cooldown_until
+                    )
+            else:
+                loss_streak = 0
+        self._loss_streak = loss_streak
+
+    async def _maybe_rehydrate_loop_state_from_active_run(self, active: Mapping[str, Any]) -> None:
+        if self._loop_total > 0 or not isinstance(active, Mapping):
+            return
+        params = self._run_params(active)
+        if not await self._loop_rearm_allowed_for_row(active):
+            self._loop_resume = None
+            return
+        loop_total = self._loop_total_from_params(params)
+        if loop_total <= 1:
+            return
+        loop_index = self._loop_index_from_params(params, loop_total)
+        loop_runs = await self._load_loop_runs_through(active, loop_total, loop_index)
+        self._loop_authority_id = str(params.get("loop_authority_id") or "") or None
+        self._apply_rehydrated_loop_state(loop_total, loop_index - 1, loop_runs)
+        run_id = str(active.get("run_id") or "")
+        logger.info(
+            "mainnet_one_run_loop_state_rehydrated",
+            run_id=run_id or None,
+            loop_completed=self._loop_completed,
+            loop_total=self._loop_total,
+            loop_net_pnl=self._loop_net_pnl,
+            run_count=len(self._loop_run_ids),
+            actor=params.get("actor") if isinstance(params, Mapping) else None,
+        )
+
+    async def _maybe_rehydrate_pending_loop_from_latest_run(self) -> None:
+        if self._loop_total > 0 or self._loop_resume is not None:
+            return
+        latest = await self._repo.get_latest_run()
+        if not isinstance(latest, Mapping):
+            return
+        # A pending re-arm is only valid after the normal COMPLETED path that
+        # emitted loop_cooldown_pending.  Manual cancel/emergency/failed rows
+        # must never resurrect a chain even if an older pending event exists.
+        if str(latest.get("status") or "").upper() != "COMPLETED":
+            self._loop_resume = None
+            return
+        params = self._run_params(latest)
+        if not await self._loop_rearm_allowed_for_row(latest):
+            self._loop_resume = None
+            return
+        loop_total = self._loop_total_from_params(params)
+        if loop_total <= 1:
+            return
+        loop_index = self._loop_index_from_params(params, loop_total)
+        if loop_index >= loop_total:
+            return
+        get_events = getattr(self._repo, "get_events", None)
+        if not callable(get_events):
+            return
+        run_id = str(latest.get("run_id") or "")
+        events = await get_events(run_id, limit=20)
+        pending: Mapping[str, Any] | None = None
+        for event in events:
+            if isinstance(event, Mapping) and event.get("event_type") == LOOP_COOLDOWN_PENDING_EVENT:
+                pending = self._event_details(event)
+                break
+        if not isinstance(pending, Mapping):
+            return
+        try:
+            resume_at_ms = int(pending.get("resume_at_ms") or 0)
+        except (TypeError, ValueError):
+            resume_at_ms = 0
+        now_ms = int(time.time() * 1000)
+        if resume_at_ms > 0 and now_ms - resume_at_ms > 30 * 60_000:
+            logger.info(
+                "mainnet_one_run_loop_pending_rehydrate_stale",
+                run_id=run_id or None,
+                resume_at_ms=resume_at_ms,
+            )
+            return
+        side = str(pending.get("side") or "").upper()
+        strategy = str(pending.get("strategy") or "")
+        prev_run_id = str(pending.get("prev_run_id") or run_id)
+        if not side or not strategy or not prev_run_id:
+            return
+        try:
+            loop_completed = int(pending.get("completed") or loop_index)
+        except (TypeError, ValueError):
+            loop_completed = loop_index
+        loop_runs = await self._load_loop_runs_through(latest, loop_total, loop_index)
+        self._loop_authority_id = str(params.get("loop_authority_id") or "") or None
+        self._apply_rehydrated_loop_state(loop_total, loop_completed, loop_runs)
+        self._loop_resume = {
+            "side": side,
+            "strategy": strategy,
+            "prev_run_id": prev_run_id,
+            "resume_at_ms": resume_at_ms or now_ms,
+        }
+        logger.info(
+            "mainnet_one_run_loop_pending_rehydrated",
+            run_id=prev_run_id,
+            loop_completed=self._loop_completed,
+            loop_total=self._loop_total,
+            resume_at_ms=self._loop_resume["resume_at_ms"],
+        )
 
     async def _is_rescue_enabled(self) -> bool:
         """Return the catch-up/rescue toggle, defaulting to enabled.
@@ -593,6 +7916,8 @@ class MainnetOneRunManager:
     async def set_notional(self, usdc: float) -> str:
         """Telegram 💰 buttons: set the one-run ticket notional (USDC)."""
         await self._ensure_runtime_config_loaded()
+        if self._adaptive_session:
+            return "Adaptive session active: notional locked at 50 USDC."
         if int(usdc) not in NOTIONAL_CHOICES:
             choices = "/".join(str(c) for c in NOTIONAL_CHOICES)
             return f"❌ 金額僅支援 {choices} USDC。"
@@ -615,6 +7940,8 @@ class MainnetOneRunManager:
     async def set_loop_loss_cap(self, cap: float) -> str:
         """Telegram 🛡 buttons: set the loop cumulative-loss break cap (USDC)."""
         await self._ensure_runtime_config_loaded()
+        if self._adaptive_session:
+            return "Adaptive session active: loss cap locked at -1 USDC."
         cap = max(0.0, float(cap))
         self._loop_loss_cap = cap
         if self._config_repo is not None:
@@ -631,6 +7958,8 @@ class MainnetOneRunManager:
     async def set_dca_enabled(self, enabled: bool) -> str:
         """Telegram DCA 開/關按鈕：即時切換，重啟後仍有效。"""
         await self._ensure_runtime_config_loaded()
+        if self._adaptive_session:
+            return "Adaptive session active: DCA/recovery locked off."
         self._dca_enabled = enabled
         if self._config_repo is not None:
             await self._config_repo.set(DCA_ENABLED_CONFIG_KEY, "true" if enabled else "false")
@@ -752,11 +8081,20 @@ class MainnetOneRunManager:
 
         try:
             open_orders = await self._client.get_open_orders(run["symbol"])
+            run_order_prefix = str(self._settings.mainnet_client_order_prefix or "")
+            own_orders = [
+                row
+                for row in open_orders
+                if str(row.get("clientOrderId") or "").startswith(run_order_prefix)
+            ]
+            features["open_order_count"] = len(open_orders)
+            features["open_run_order_count"] = len(own_orders)
+            features["ignored_foreign_open_order_count"] = max(0, len(open_orders) - len(own_orders))
             features["open_entry_order"] = any(
-                not self._truthy_order_flag(row.get("reduceOnly")) for row in open_orders
+                not self._truthy_order_flag(row.get("reduceOnly")) for row in own_orders
             )
             features["open_reduce_order"] = any(
-                self._truthy_order_flag(row.get("reduceOnly")) for row in open_orders
+                self._truthy_order_flag(row.get("reduceOnly")) for row in own_orders
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("codex_v1_open_orders_preflight_failed", run_id=run["run_id"], error=str(exc)[:200])
@@ -849,6 +8187,557 @@ class MainnetOneRunManager:
             adverse_bp=features["reprice_adverse_bp"],
         )
 
+    async def _codex_v1436_guard_late_stups_after_veto_edge(
+        self,
+        run: dict,
+        decision: WildcatLiveDecision,
+        raw_codex_decision: CodexV1Decision,
+        codex_decision: CodexV1Decision,
+        features: Mapping[str, Any],
+    ) -> CodexV1Decision:
+        if not bool(getattr(self._settings, "mainnet_codex_v1436_late_stups_after_veto_enabled", True)):
+            return codex_decision
+        if not codex_decision.accepted:
+            return codex_decision
+        lane_code = str(codex_decision.lane_code or "").upper()
+        side = str(codex_decision.side or raw_codex_decision.side or decision.side or "").upper()
+        metrics = codex_decision.metrics if isinstance(codex_decision.metrics, Mapping) else {}
+        market_state = str(
+            metrics.get("market_state")
+            or metrics.get("v143_market_state")
+            or codex_decision.regime
+            or ""
+        )
+        allowed_states_raw = str(
+            getattr(
+                self._settings,
+                "mainnet_codex_v1437_late_stups_after_veto_states",
+                "STUP-S:mixed,STUP-S:clean_extension",
+            )
+            or ""
+        )
+        allowed_states = {item.strip() for item in allowed_states_raw.split(",") if item.strip()}
+        if lane_code != "STUP-S" or market_state not in allowed_states or side != "SHORT":
+            return codex_decision
+
+        signal_price = self._codex_v1_shadow_price(getattr(decision.signal, "price", None))
+        if signal_price is None:
+            return codex_decision
+        entry_offset_bp = codex_decision.entry_offset_bp
+        if entry_offset_bp is None:
+            entry_offset_bp = raw_codex_decision.entry_offset_bp or 0.0
+        proposed_entry = self._codex_v1_entry_reference_price(signal_price, side, float(entry_offset_bp or 0.0))
+        if proposed_entry <= 0:
+            return codex_decision
+
+        event_types = ["entry_codex_v1_shadow_sample_started", "entry_codex_v1_shadow_sample_dropped"]
+        get_events_by_types = getattr(self._repo, "get_events_by_types", None)
+        get_events = getattr(self._repo, "get_events", None)
+        if callable(get_events_by_types):
+            rows = await get_events_by_types(run["run_id"], event_types, limit=500)
+        elif callable(get_events):
+            rows = [row for row in await get_events(run["run_id"], limit=500) if row.get("event_type") in event_types]
+        else:
+            return codex_decision
+
+        veto_reasons = {
+            "hot_up_extension_short_blocked",
+            "mid_up_extension_short_blocked",
+            "stale_short_after_upmove_blocked",
+        }
+        best_veto_entry: float | None = None
+        best_veto_reason: str | None = None
+        for row in rows:
+            details = row.get("details") if isinstance(row.get("details"), Mapping) else None
+            if details is None:
+                try:
+                    details = json.loads(str(row.get("details_json") or "{}"))
+                except (TypeError, json.JSONDecodeError):
+                    details = {}
+            if not isinstance(details, Mapping):
+                continue
+            if str(details.get("side") or "").upper() != "SHORT":
+                continue
+            tokens = {
+                str(details.get("candidate_lane") or ""),
+                str(details.get("mapping_reason") or ""),
+                str(details.get("reason") or ""),
+                str(details.get("shadow_lane_reason") or ""),
+            }
+            secondary = details.get("secondary_reasons")
+            if isinstance(secondary, Sequence) and not isinstance(secondary, (str, bytes)):
+                tokens.update(str(item) for item in secondary)
+            matched = sorted(token for token in tokens if token in veto_reasons)
+            if not matched:
+                continue
+            veto_entry = self._codex_v1_shadow_price(details.get("entry_price"))
+            if veto_entry is None:
+                continue
+            if best_veto_entry is None or veto_entry > best_veto_entry:
+                best_veto_entry = veto_entry
+                best_veto_reason = matched[0]
+
+        if best_veto_entry is None or proposed_entry >= best_veto_entry:
+            return codex_decision
+        edge_spent_bp = (best_veto_entry - proposed_entry) / best_veto_entry * 10_000.0
+        try:
+            threshold_bp = max(
+                0.0,
+                float(getattr(self._settings, "mainnet_codex_v1436_late_stups_after_veto_edge_spent_bp", 10.0) or 0.0),
+            )
+        except (TypeError, ValueError):
+            threshold_bp = 10.0
+        if edge_spent_bp < threshold_bp:
+            return codex_decision
+
+        block_metrics = dict(metrics)
+        block_metrics.update(
+            {
+                "policy_note": "v1436_late_stups_after_veto_edge_block",
+                "policy_tag": "v1436_late_stups_after_veto_edge_block",
+                "v1436_block_reason": "late_stups_short_after_veto_edge_spent",
+                "v1436_veto_reason": best_veto_reason,
+                "v1436_veto_entry": round(best_veto_entry, 8),
+                "v1436_proposed_entry": round(proposed_entry, 8),
+                "v1436_edge_spent_bp": round(edge_spent_bp, 4),
+                "v1436_edge_spent_threshold_bp": threshold_bp,
+                "v1437_late_veto_state_expanded": market_state == "STUP-S:clean_extension",
+            }
+        )
+
+        return replace(
+            codex_decision,
+            accepted=False,
+            reason="v1436_late_stups_after_veto_edge_block",
+            size_mult=0.0,
+            notional_mult=0.0,
+            requested_notional_usdc=0.0,
+            risk_tags=tuple(dict.fromkeys((*codex_decision.risk_tags, "v1436_late_stups_after_veto_edge_block"))),
+            metrics=block_metrics,
+            policy_tag="v1436_late_stups_after_veto_edge_block",
+            shadow_lane="SH_V1436_LATE_STUPS_AFTER_VETO",
+        )
+    def _codex_v1439_metric_float_from_sources(
+        self,
+        sources: Sequence[Mapping[str, Any] | None],
+        *keys: str,
+    ) -> float | None:
+        for source in sources:
+            if not isinstance(source, Mapping):
+                continue
+            for key in keys:
+                value = self._codex_v143_metric_float(source, key)
+                if value is not None:
+                    return value
+        return None
+
+    def _codex_v1439_apply_shadow_score(
+        self,
+        features: Mapping[str, Any],
+        raw_codex_decision: CodexV1Decision,
+        codex_decision: CodexV1Decision,
+    ) -> CodexV1Decision:
+        """Attach selector telemetry without changing live admission.
+
+        The research selector is intentionally shadow-only here: it marks entry
+        quality and exit-capture risk so the next loop can be analyzed by score,
+        while entry acceptance, side, size, TP and SL remain exactly as the live
+        profile chose them.
+        """
+        v1439_enabled = bool(getattr(self._settings, "mainnet_codex_v1439_shadow_score_enabled", True))
+        v1441_enabled = bool(getattr(self._settings, "mainnet_codex_v1441_research_selector_enabled", True))
+        if not (v1439_enabled or v1441_enabled):
+            return codex_decision
+        if not codex_decision.accepted:
+            return codex_decision
+
+        metrics_raw = codex_decision.metrics if isinstance(codex_decision.metrics, Mapping) else {}
+        metrics = dict(metrics_raw)
+        nested_features = metrics.get("v1427_features") if isinstance(metrics.get("v1427_features"), Mapping) else None
+        sources: list[Mapping[str, Any] | None] = [metrics, nested_features, features]
+        lane_code = str(codex_decision.lane_code or raw_codex_decision.lane_code or "").upper()
+        state = str(
+            metrics.get("market_state")
+            or metrics.get("v143_market_state")
+            or codex_decision.regime
+            or raw_codex_decision.regime
+            or lane_code
+            or ""
+        ).strip()
+        side = str(codex_decision.side or raw_codex_decision.side or features.get("side") or "").upper()
+        previous_side = str(
+            metrics.get("v1427_previous_side")
+            or metrics.get("previous_side")
+            or features.get("side")
+            or raw_codex_decision.side
+            or ""
+        ).upper()
+        rng15 = self._codex_v1439_metric_float_from_sources(sources, "rng15")
+        vwap_dist_bp = self._codex_v1439_metric_float_from_sources(sources, "vwap_dist_bp", "vwap_dist")
+        range_pos_15 = self._codex_v1439_metric_float_from_sources(sources, "range_pos_15", "range_pos")
+        time_lock_min_bp = self._codex_v1439_metric_float_from_sources(sources, "time_lock_min_bp")
+        d30 = self._codex_v1439_metric_float_from_sources(sources, "d30", "drift30", "drift30_bp")
+        adv3 = self._codex_v1439_metric_float_from_sources(sources, "adv3", "adv3_bp")
+        rsi = self._codex_v1439_metric_float_from_sources(sources, "rsi", "rsi14")
+        slope30 = self._codex_v1439_metric_float_from_sources(sources, "slope30", "slope30_bp")
+        pullback = self._codex_v1439_metric_float_from_sources(
+            sources,
+            "pullback_from_recent_high_bp",
+            "pullback_bp",
+            "pullback",
+        )
+        wait_s = self._codex_v1439_metric_float_from_sources(
+            sources,
+            "reprice_wait_elapsed_seconds",
+            "setup_age_sec",
+            "wait_s",
+        )
+
+        score = 0
+        reasons: list[str] = []
+        thin_lock_candidate = False
+        block_candidate = False
+
+        def add(points: int, reason: str) -> None:
+            nonlocal score
+            score += max(0, int(points))
+            if reason not in reasons:
+                reasons.append(reason)
+
+        if lane_code == "STUP-S":
+            if state in {"STUP-S:mixed", "STUP-S:weak_chop"}:
+                add(35, "stups_state_mfe_capture_candidate")
+                thin_lock_candidate = True
+                if state == "STUP-S:mixed":
+                    add(10, "selector_holdout_mixed_exit_gap")
+            if state == "STUP-S:clean_extension" and side == "SHORT":
+                if rng15 is not None and rng15 >= 28.91:
+                    add(55, "selector_clean_extension_short_rng15_gte_28_91")
+                    block_candidate = True
+                else:
+                    add(15, "clean_extension_short_review")
+                    thin_lock_candidate = True
+            if state == "STUP-S:counter_recoil":
+                add(25, "counter_recoil_5bp_capture_watch")
+                thin_lock_candidate = True
+            if previous_side in {"LONG", "SHORT"} and side in {"LONG", "SHORT"} and previous_side != side and state in {"STUP-S:mixed", "STUP-S:counter_recoil"}:
+                add(10, "side_override_reversal_capture_watch")
+                thin_lock_candidate = True
+            if rng15 is not None and rng15 >= 28.91:
+                add(8, "rng15_high_for_recent_selector")
+            if range_pos_15 is not None and range_pos_15 >= 0.90:
+                add(5, "high_range_position_review")
+            if vwap_dist_bp is not None and abs(vwap_dist_bp) >= 50.0:
+                add(5, "vwap_extension_review")
+            if time_lock_min_bp is not None and time_lock_min_bp >= 6.0 and thin_lock_candidate:
+                add(5, "generic_time_lock_may_be_too_far")
+        elif lane_code == "CNL-WPR-L":
+            if state in {
+                "CNL-WPR-L:falling_discount_trap",
+                "CNL-WPR-L:falling_continuation_probe",
+                "CNL-WPR-L:deep_discount_stable",
+                "CNL-WPR-L:discount_mixed",
+            }:
+                add(25, "cnl_wpr_train_negative_shadow_review")
+            if state in {"CNL-WPR-L:falling_discount_trap", "CNL-WPR-L:discount_mixed"}:
+                add(10, "cnl_wpr_entry_quality_or_scratch_review")
+        elif lane_code == "W1D":
+            add(20, "w1d_shadow_observe_only")
+
+        score = min(score, 100)
+        try:
+            review_threshold = int(getattr(self._settings, "mainnet_codex_v1439_shadow_score_review_threshold", 35) or 35)
+        except (TypeError, ValueError):
+            review_threshold = 35
+        try:
+            thin_threshold = int(getattr(self._settings, "mainnet_codex_v1439_shadow_score_thin_lock_threshold", 40) or 40)
+        except (TypeError, ValueError):
+            thin_threshold = 40
+        try:
+            block_threshold = int(getattr(self._settings, "mainnet_codex_v1439_shadow_score_block_candidate_threshold", 55) or 55)
+        except (TypeError, ValueError):
+            block_threshold = 55
+
+        if block_candidate and score >= block_threshold:
+            action = "SHADOW_BLOCK_CANDIDATE"
+        elif thin_lock_candidate and score >= thin_threshold:
+            action = "SHADOW_THIN_LOCK_CANDIDATE"
+        elif score >= review_threshold:
+            action = "SHADOW_REVIEW"
+        else:
+            action = "OBSERVE"
+
+        v1441_action = "OBSERVE"
+        v1441_reasons: list[str] = []
+        v1441_live_effect = "telemetry_only"
+        v1441_block_reason: str | None = None
+        v1442_chase_thresholds: dict[str, float] = {}
+        v1447_chase_quality_thresholds: dict[str, float] = {}
+        v1447_chase_quality_reasons: list[str] = []
+        v1447_chase_quality_matched = False
+        v1445_quality_enabled = bool(
+            getattr(self._settings, "mainnet_codex_v1445_stups_clean_short_quality_block_enabled", True)
+        )
+        v1445_quality_thresholds: dict[str, float] = {}
+        v1445_quality_matched = False
+        if v1441_enabled:
+            if lane_code == "STUP-S" and state == "STUP-S:mixed":
+                if bool(getattr(self._settings, "mainnet_codex_v1443_stups_mixed_live_block_enabled", True)):
+                    v1441_action = "BLOCK_ENTRY_QUALITY"
+                    v1441_live_effect = "hard_block"
+                    v1441_block_reason = "v1443_stups_mixed_live_block"
+                    v1441_reasons.append("v1442_live_new_method_stups_mixed_0_for_5")
+                    v1441_reasons.append("mixed_state_avg_mfe_too_low_for_thin_lock")
+                else:
+                    v1441_action = "ALLOW_THIN_LOCK_PROFILE"
+                    v1441_live_effect = "mixed_maker_thin_lock_canary"
+                    v1441_reasons.append("refresh_holdout_stups_mixed_exit_gap")
+                    v1441_reasons.append("mixed_state_missed_5bp_capture_cluster")
+            elif lane_code == "STUP-S" and state == "STUP-S:clean_extension" and side == "LONG" and previous_side == "SHORT":
+                block_enabled = bool(getattr(self._settings, "mainnet_codex_v1442_stups_chase_block_enabled", True))
+                chase_rng15_min = float(getattr(self._settings, "mainnet_codex_v1442_stups_chase_rng15_min_bp", 50.0) or 50.0)
+                chase_d30_min = float(getattr(self._settings, "mainnet_codex_v1442_stups_chase_d30_min_bp", 25.0) or 25.0)
+                chase_adv3_min = float(getattr(self._settings, "mainnet_codex_v1442_stups_chase_adv3_min_bp", 10.0) or 10.0)
+                chase_vwap_min = float(getattr(self._settings, "mainnet_codex_v1442_stups_chase_vwap_min_bp", 8.0) or 8.0)
+                v1442_chase_thresholds = {
+                    "rng15_min_bp": chase_rng15_min,
+                    "d30_min_bp": chase_d30_min,
+                    "adv3_min_bp": chase_adv3_min,
+                    "vwap_min_bp": chase_vwap_min,
+                }
+                chase_block = bool(
+                    block_enabled
+                    and rng15 is not None and rng15 >= chase_rng15_min
+                    and d30 is not None and d30 >= chase_d30_min
+                    and adv3 is not None and adv3 >= chase_adv3_min
+                    and vwap_dist_bp is not None and vwap_dist_bp >= chase_vwap_min
+                )
+                quality_enabled = bool(
+                    getattr(self._settings, "mainnet_codex_v1447_stups_long_chase_quality_block_enabled", True)
+                )
+                quality_vwap_min = float(
+                    getattr(self._settings, "mainnet_codex_v1447_stups_long_chase_vwap_min_bp", 30.0) or 30.0
+                )
+                quality_rng15_min = float(
+                    getattr(self._settings, "mainnet_codex_v1447_stups_long_chase_rng15_min_bp", 35.0) or 35.0
+                )
+                quality_d30_min = float(
+                    getattr(self._settings, "mainnet_codex_v1447_stups_long_chase_d30_min_bp", 20.0) or 20.0
+                )
+                quality_wait_min = float(
+                    getattr(self._settings, "mainnet_codex_v1447_stups_long_chase_wait_min_seconds", 300.0) or 300.0
+                )
+                quality_slope30_max = float(
+                    getattr(self._settings, "mainnet_codex_v1447_stups_long_chase_slope30_max_bp", 0.0) or 0.0
+                )
+                v1447_chase_quality_thresholds = {
+                    "vwap_min_bp": quality_vwap_min,
+                    "rng15_min_bp": quality_rng15_min,
+                    "d30_min_bp": quality_d30_min,
+                    "wait_min_seconds": quality_wait_min,
+                    "slope30_max_bp": quality_slope30_max,
+                }
+                premium_high = bool(vwap_dist_bp is not None and vwap_dist_bp >= quality_vwap_min)
+                rng_high = bool(rng15 is not None and rng15 >= quality_rng15_min)
+                d30_extended = bool(d30 is not None and d30 >= quality_d30_min)
+                wait_stale = bool(wait_s is not None and wait_s >= quality_wait_min)
+                slope_weak = bool(slope30 is not None and slope30 <= quality_slope30_max)
+                if premium_high and (rng_high or d30_extended):
+                    v1447_chase_quality_reasons.append("high_vwap_premium_with_rng_or_d30_extension")
+                if d30_extended and slope_weak:
+                    v1447_chase_quality_reasons.append("d30_extended_but_slope30_turned_down")
+                if wait_stale and slope_weak:
+                    v1447_chase_quality_reasons.append("stale_wait_with_slope30_nonpositive")
+                v1447_chase_quality_matched = bool(quality_enabled and v1447_chase_quality_reasons)
+                if chase_block:
+                    v1441_action = "BLOCK_ENTRY_QUALITY"
+                    v1441_live_effect = "hard_block"
+                    v1441_block_reason = "v1442_stups_clean_extension_chase_block"
+                    v1441_reasons.extend(
+                        [
+                            "live_loss_replay_stups_clean_extension_long_chase",
+                            "side_override_short_to_long_high_rng_d30_adv3_vwap",
+                        ]
+                    )
+                elif v1447_chase_quality_matched:
+                    v1441_action = "BLOCK_ENTRY_QUALITY"
+                    v1441_live_effect = "hard_block"
+                    v1441_block_reason = "v1447_stups_clean_extension_long_chase_quality_block"
+                    v1441_reasons.extend(
+                        [
+                            "live_sl_stups_side_override_long_high_premium_weak_slope",
+                            *v1447_chase_quality_reasons,
+                        ]
+                    )
+                else:
+                    v1441_action = "SHADOW_REVIEW"
+                    v1441_reasons.append("stups_clean_extension_long_chase_watch")
+            elif lane_code == "STUP-S" and state == "STUP-S:clean_extension" and side == "SHORT":
+                quality_rsi_max = float(
+                    getattr(self._settings, "mainnet_codex_v1445_stups_clean_short_quality_rsi_max", 60.8432)
+                    or 60.8432
+                )
+                quality_slope30_min = float(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v1445_stups_clean_short_quality_slope30_min_bp",
+                        1.26926,
+                    )
+                    or 1.26926
+                )
+                v1445_quality_thresholds = {
+                    "rsi_max": quality_rsi_max,
+                    "slope30_min_bp": quality_slope30_min,
+                }
+                v1445_quality_matched = bool(
+                    v1445_quality_enabled
+                    and rsi is not None
+                    and slope30 is not None
+                    and rsi <= quality_rsi_max
+                    and slope30 >= quality_slope30_min
+                )
+                if v1445_quality_matched:
+                    v1441_action = "BLOCK_ENTRY_QUALITY"
+                    v1441_live_effect = "hard_block"
+                    v1441_block_reason = "v1445_stups_clean_extension_short_quality_block"
+                    v1441_reasons.extend(
+                        [
+                            "live_vm_stups_clean_extension_low_mfe_sl_gate",
+                            "rsi_lte_60p8432_slope30_gte_1p26926",
+                        ]
+                    )
+                else:
+                    clean_review = False
+                    if rng15 is not None and rng15 >= 28.91:
+                        clean_review = True
+                        v1441_reasons.append("day_holdout_clean_extension_short_rng15_gte_28_91")
+                    if vwap_dist_bp is not None and vwap_dist_bp <= 24.8172:
+                        clean_review = True
+                        v1441_reasons.append("day_holdout_clean_extension_short_vwap_dist_lte_24_8172")
+                    if rsi is not None and rsi >= 65.0708:
+                        clean_review = True
+                        v1441_reasons.append("day_holdout_clean_extension_short_rsi_gte_65_0708")
+                    if clean_review:
+                        v1441_action = "SHADOW_REVIEW"
+                    else:
+                        v1441_action = "OBSERVE"
+            elif lane_code == "CNL-WPR-L" and state in {
+                "CNL-WPR-L:deep_discount_stable",
+                "CNL-WPR-L:falling_discount_trap",
+                "CNL-WPR-L:falling_continuation_probe",
+                "CNL-WPR-L:discount_mixed",
+            }:
+                v1441_action = "STRICT_TTL_OR_FILL_POLICY"
+                v1441_live_effect = "strict_entry_ttl_and_thin_lock"
+                v1441_reasons.append("cnl_wpr_refresh_dataset_ttl_or_fill_review")
+
+        metrics.update(
+            {
+                "v1439_shadow_score_enabled": v1439_enabled,
+                "v1439_shadow_score_version": "v1439_selector_shadow_v1",
+                "v1439_shadow_selector_source": "reports/CODEX_RESEARCH_SELECTOR_BACKTEST_VM_2026-07-03.md",
+                "v1439_shadow_live_effect": "telemetry_only",
+                "v1439_shadow_score": score,
+                "v1439_shadow_action": action,
+                "v1439_shadow_reasons": reasons,
+                "v1439_shadow_would_block": action == "SHADOW_BLOCK_CANDIDATE",
+                "v1439_shadow_would_thin_lock": action == "SHADOW_THIN_LOCK_CANDIDATE",
+                "v1439_shadow_lane_code": lane_code or None,
+                "v1439_shadow_market_state": state or None,
+                "v1439_shadow_side": side or None,
+                "v1439_shadow_previous_side": previous_side or None,
+                "v1439_shadow_thresholds": {
+                    "review": review_threshold,
+                    "thin_lock": thin_threshold,
+                    "block_candidate": block_threshold,
+                },
+                "v1439_shadow_features": {
+                    "rng15": round(rng15, 4) if rng15 is not None else None,
+                    "vwap_dist_bp": round(vwap_dist_bp, 4) if vwap_dist_bp is not None else None,
+                    "range_pos_15": round(range_pos_15, 4) if range_pos_15 is not None else None,
+                    "time_lock_min_bp": round(time_lock_min_bp, 4) if time_lock_min_bp is not None else None,
+                },
+                "v1441_research_selector_enabled": v1441_enabled,
+                "v1441_research_selector_version": "v1441_selector_refresh_20260703_133008",
+                "v1441_research_selector_source": "reports/CODEX_V1_4_40_NEW_METHOD_SELECTOR_ANALYSIS_2026-07-03.md",
+                "v1441_research_selector_dataset": "reports/codex_research_dataset_v14_refresh_20260703_133008.md",
+                "v1441_research_selector_action": v1441_action,
+                "v1441_research_selector_reasons": v1441_reasons,
+                "v1441_live_effect": v1441_live_effect,
+                "v1442_live_block_reason": v1441_block_reason if v1441_block_reason and v1441_block_reason.startswith("v1442_") else None,
+                "v1443_live_block_reason": v1441_block_reason if v1441_block_reason and v1441_block_reason.startswith("v1443_") else None,
+                "v1445_live_block_reason": v1441_block_reason if v1441_block_reason and v1441_block_reason.startswith("v1445_") else None,
+                "v1447_live_block_reason": v1441_block_reason if v1441_block_reason and v1441_block_reason.startswith("v1447_") else None,
+                "v1442_stups_chase_thresholds": v1442_chase_thresholds or None,
+                "v1447_stups_long_chase_quality_enabled": bool(getattr(self._settings, "mainnet_codex_v1447_stups_long_chase_quality_block_enabled", True)) if v1447_chase_quality_thresholds else None,
+                "v1447_stups_long_chase_quality_matched": v1447_chase_quality_matched if v1447_chase_quality_thresholds else None,
+                "v1447_stups_long_chase_quality_reasons": v1447_chase_quality_reasons or None,
+                "v1447_stups_long_chase_quality_thresholds": v1447_chase_quality_thresholds or None,
+                "v1445_stups_clean_short_quality_enabled": v1445_quality_enabled if v1445_quality_thresholds else None,
+                "v1445_stups_clean_short_quality_matched": v1445_quality_matched if v1445_quality_thresholds else None,
+                "v1445_stups_clean_short_quality_thresholds": v1445_quality_thresholds or None,
+                "v1441_features": {
+                    "rng15": round(rng15, 4) if rng15 is not None else None,
+                    "d30": round(d30, 4) if d30 is not None else None,
+                    "adv3": round(adv3, 4) if adv3 is not None else None,
+                    "rsi": round(rsi, 4) if rsi is not None else None,
+                    "slope30": round(slope30, 4) if slope30 is not None else None,
+                    "vwap_dist_bp": round(vwap_dist_bp, 4) if vwap_dist_bp is not None else None,
+                    "pullback_from_recent_high_bp": round(pullback, 4) if pullback is not None else None,
+                    "time_lock_min_bp": round(time_lock_min_bp, 4) if time_lock_min_bp is not None else None,
+                },
+                "v1441_mixed_thin_lock_trigger": {
+                    "after_seconds": float(getattr(self._settings, "mainnet_codex_v1441_mixed_thin_lock_after_seconds", 45) or 45),
+                    "mfe_bp": float(getattr(self._settings, "mainnet_codex_v1441_mixed_thin_lock_mfe_bp", 3.0) or 3.0),
+                    "floor_bp": float(getattr(self._settings, "mainnet_codex_v1441_mixed_thin_lock_floor_bp", 2.5) or 2.5),
+                    "slope_max_bp": float(getattr(self._settings, "mainnet_codex_v1441_mixed_thin_lock_slope_max_bp", 0.75) or 0.75),
+                } if v1441_action == "ALLOW_THIN_LOCK_PROFILE" else None,
+            }
+        )
+        tags = tuple(
+            dict.fromkeys(
+                (
+                    *codex_decision.risk_tags,
+                    "v1439_shadow_score" if v1439_enabled and score > 0 else None,
+                    f"v1439_{action.lower()}" if v1439_enabled and score > 0 else None,
+                    "v1441_research_selector" if v1441_enabled and v1441_action != "OBSERVE" else None,
+                    f"v1441_{v1441_action.lower()}" if v1441_enabled and v1441_action != "OBSERVE" else None,
+                )
+            )
+        )
+        final_tags = tuple(tag for tag in tags if tag)
+        if v1441_block_reason:
+            if v1441_block_reason.startswith("v1443_"):
+                block_shadow_lane = "SH_STUPS_MIXED_LIVE_BLOCK"
+                block_risk_tag = "v1443_live_block"
+            elif v1441_block_reason.startswith("v1445_"):
+                block_shadow_lane = "SH_STUPS_CLEAN_EXTENSION_SHORT_QUALITY_BLOCK"
+                block_risk_tag = "v1445_live_block"
+            elif v1441_block_reason.startswith("v1447_"):
+                block_shadow_lane = "SH_STUPS_CLEAN_EXTENSION_LONG_CHASE_QUALITY_BLOCK"
+                block_risk_tag = "v1447_live_block"
+            else:
+                block_shadow_lane = "SH_STUPS_CLEAN_EXTENSION_CHASE_BLOCK"
+                block_risk_tag = "v1442_live_block"
+            block_metrics = {
+                **metrics,
+                "policy_note": v1441_block_reason,
+                "policy_tag": v1441_block_reason,
+                "shadow_lane": block_shadow_lane,
+            }
+            return replace(
+                codex_decision,
+                accepted=False,
+                reason=v1441_block_reason,
+                size_mult=0.0,
+                notional_mult=0.0,
+                requested_notional_usdc=0.0,
+                metrics=block_metrics,
+                risk_tags=tuple(dict.fromkeys((*final_tags, block_risk_tag))),
+                policy_tag=v1441_block_reason,
+                shadow_lane=block_shadow_lane,
+            )
+        return replace(codex_decision, metrics=metrics, risk_tags=final_tags)
     async def _apply_codex_v1_gate(
         self,
         run: dict,
@@ -876,6 +8765,15 @@ class MainnetOneRunManager:
             codex_decision,
             features,
         )
+        # Freeze legacy selector ownership before later safety/research gates
+        # mutate admission.  v1.4.69 records both ownership and the resulting
+        # safety status, but it never replaces this decision.
+        v1469_selector_decision = codex_decision
+        codex_decision = apply_v1427_five_window_decision(features, codex_decision)
+        codex_decision = apply_v1430_loss_prune_decision(features, codex_decision)
+        codex_decision = apply_v1436_live_hotfix_decision(features, codex_decision)
+        codex_decision = await self._codex_v1436_guard_late_stups_after_veto_edge(run, decision, raw_codex_decision, codex_decision, features)
+        codex_decision = self._codex_v1433_guard_clean_high_side_override(features, codex_decision, decision.side)
         disabled_lanes = {
             item.strip()
             for item in str(self._settings.mainnet_codex_v1_disabled_lanes or "").split(",")
@@ -913,6 +8811,16 @@ class MainnetOneRunManager:
                     "policy_tag": "v130_w2a_shadow_only",
                     "shadow_lane": shadow_lane,
                 }
+            elif research_block_reason == "v143_w6a_shadow_only":
+                shadow_lane = "SH_W6A_V143_SHADOW_ONLY"
+                metrics = {
+                    **(metrics or {}),
+                    "policy_note": research_block_reason,
+                    "policy_tag": research_block_reason,
+                    "shadow_lane": shadow_lane,
+                    "live_action": "shadow_only",
+                    "source": "v143_strategy_market_profile_sweep",
+                }
             elif research_block_reason in {"codex_v1_w6_weak_drift_block", "codex_v1_w6_deep_pullback_block"}:
                 shadow_lane = (
                     "SH_W6A_WEAK_DRIFT_BLOCK"
@@ -938,6 +8846,15 @@ class MainnetOneRunManager:
                 shadow_lane=shadow_lane,
             )
 
+        await self._v1469_record_lane_observation(
+            run,
+            features,
+            selector_decision=v1469_selector_decision,
+            effective_decision=codex_decision,
+            reference_price=decision.signal.price,
+            regime_market_state=self._v1469_symbol_market_state(candles),
+        )
+
         if codex_decision.accepted and (codex_decision.lane_code == "W6A" or codex_decision.lane == "w6_lane_s1long_rng38_86_range9_15_e0"):
             entry = self._codex_v1_entry_reference_price(
                 decision.signal.price,
@@ -949,9 +8866,9 @@ class MainnetOneRunManager:
 
             base_notional = self._settings.mainnet_effective_entry_notional_usdc
             requested_notional = max(0.0, base_notional * max(0.0, codex_decision.notional_mult))
+            # Size W6A risk guards from the pre-Codex-cap ticket so the gross-loss
+            # cap ratio remains meaningful; final execution caps are applied later.
             max_notional = self._settings.mainnet_effective_max_cumulative_notional_usdc
-            if self._settings.mainnet_codex_v1_max_notional_usdc > 0:
-                max_notional = min(max_notional, self._settings.mainnet_codex_v1_max_notional_usdc)
             applied_notional = min(requested_notional, max_notional)
             original_qty = applied_notional / entry if entry > 0 else 0.0
 
@@ -1064,6 +8981,19 @@ class MainnetOneRunManager:
                 }
                 risk_score = sum(1 for enabled in risk_flags.values() if enabled)
                 stale_hard = setup_age_sec >= 600.0 and no_reclaim and vwap_dist_bp <= -30.0
+                v1461_w6a_market_state = None
+                if self._v1461_config_selected():
+                    if stale_hard or risk_score >= 4:
+                        v1461_w6a_market_state = "W6A:falling_discount_trap"
+                    elif (
+                        not no_reclaim
+                        and d30 > -30.0
+                        and pullback < 25.0
+                        and setup_age_sec <= 300.0
+                    ):
+                        v1461_w6a_market_state = "W6A:ordinary_pullback_pre_vwap"
+                    else:
+                        v1461_w6a_market_state = "W6A:mixed"
                 missing_required = tuple(
                     name
                     for name, value in {
@@ -1186,6 +9116,8 @@ class MainnetOneRunManager:
                         "applied_notional_cap_usdc": round(v137_applied_cap, 4) if v137_applied_cap is not None else None,
                     }
                 )
+                if v1461_w6a_market_state is not None:
+                    w6a_metrics["market_state"] = v1461_w6a_market_state
                 if skip_reason is None and v137_applied_cap is not None and entry > 0:
                     cap_qty = max(0.0, v137_applied_cap) / entry
                     if 0.0 < cap_qty < final_qty:
@@ -1292,10 +9224,67 @@ class MainnetOneRunManager:
                 else:
                     codex_decision = replace(codex_decision, metrics=metrics)
 
+        codex_decision = self._codex_v1439_apply_shadow_score(features, raw_codex_decision, codex_decision)
+
+        pre_gate_accepted = bool(codex_decision.accepted)
+        candidate_ticket = self._v1462_candidate_ticket(
+            raw_codex_decision,
+            codex_decision,
+        )
         gaps = codex_decision.missing_features if codex_decision.accepted else codex_v1_feature_gaps(features)
         preflight = live_preflight_rejections(features)
         raw_snapshot = self._codex_v1_decision_snapshot(raw_codex_decision, features)
         effective_status = "accepted"
+        if (
+            self._v1461_candidate_active(run)
+            and raw_codex_decision.accepted
+            and not codex_decision.accepted
+            and not gaps
+            and not preflight
+        ):
+            incumbent_reject_reason = str(codex_decision.reason or "legacy_gate_reject")
+            gate_family_id, gate_class, promotion_eligible = self._v1461_gate_taxonomy(
+                incumbent_reject_reason,
+                str(raw_codex_decision.lane_code or codex_decision.lane_code or ""),
+            )
+            rejected_metrics = (
+                dict(codex_decision.metrics)
+                if isinstance(codex_decision.metrics, Mapping)
+                else {}
+            )
+            rejected_metrics["v1461_incumbent_reject"] = {
+                "reason": incumbent_reject_reason,
+                "gate_family_id": gate_family_id,
+                "gate_class": gate_class,
+                "promotion_eligible": promotion_eligible,
+            }
+            policy_base = replace(codex_decision, metrics=rejected_metrics)
+            if self._v1461_enforcement_active(run) and promotion_eligible:
+                # Only a classifier-accepted raw candidate may be restored.
+                # Strategy exits/TTL remain those already computed by the
+                # incumbent; the adaptive overlay can only cap admission size.
+                # Do not evaluate v1.4.61 here: the restored decision first
+                # passes through the shared v1.4.59 regime FSM exactly once,
+                # then the final adaptive gate consumes that same state.
+                policy_base = replace(
+                    policy_base,
+                    accepted=True,
+                    entry_offset_bp=raw_codex_decision.entry_offset_bp,
+                    size_mult=raw_codex_decision.size_mult,
+                    notional_mult=raw_codex_decision.notional_mult,
+                    requested_notional_usdc=raw_codex_decision.requested_notional_usdc,
+                )
+                codex_decision = policy_base
+            else:
+                # Candidate-only and non-promotable rejects still receive a
+                # complete Shadow annotation, but cannot enter the paid path.
+                codex_decision = await self._v1461_apply_gate_policy(
+                    run,
+                    policy_base,
+                    incumbent_accepted=False,
+                    gate_family_id=gate_family_id,
+                    promotion_eligible=promotion_eligible,
+                )
         if not codex_decision.accepted or gaps or preflight:
             reason = codex_decision.reason if not codex_decision.accepted else "codex_v1_preflight_blocked"
             if not codex_decision.accepted:
@@ -1335,6 +9324,7 @@ class MainnetOneRunManager:
                 effective_status=effective_status,
                 gaps=gaps,
                 preflight=preflight,
+                candidate_ticket=candidate_ticket,
             )
             if run["run_id"] not in self._codex_v1_guard_notified:
                 self._codex_v1_guard_notified.add(run["run_id"])
@@ -1358,6 +9348,372 @@ class MainnetOneRunManager:
                 )
             return None, raw_codex_decision, codex_decision, features
 
+        adaptive_disabled_state = self._adaptive_disabled_state_for_decision(codex_decision)
+        if adaptive_disabled_state:
+            effective_snapshot = self._codex_v1_decision_snapshot(
+                codex_decision,
+                features,
+                status="adaptive_state_disabled",
+                effective_reason="adaptive_session_state_disabled",
+            )
+            await self._repo.log_event(
+                run["run_id"],
+                "entry_adaptive_state_disabled",
+                {
+                    "reason": "adaptive_session_state_disabled",
+                    "market_state": adaptive_disabled_state,
+                    "decision": asdict(codex_decision),
+                    "raw_classifier": raw_snapshot,
+                    "effective_execution": effective_snapshot,
+                    "features": self._codex_v1_payload_features(features),
+                },
+            )
+            if self._v1462_shadow_all_active(run):
+                await self._start_codex_v1_shadow_sample(
+                    run,
+                    decision,
+                    raw_codex_decision,
+                    codex_decision,
+                    features,
+                    reason="adaptive_session_state_disabled",
+                    effective_status="adaptive_state_disabled",
+                    candidate_ticket=candidate_ticket,
+                )
+            return None, raw_codex_decision, codex_decision, features
+        state_block = await self._codex_state_throttle_block(codex_decision, int(time.time() * 1000))
+        if state_block:
+            reason = "codex_state_throttle"
+            effective_status = "state_throttled"
+            effective_snapshot = self._codex_v1_decision_snapshot(
+                codex_decision,
+                features,
+                status=effective_status,
+                effective_reason=reason,
+            )
+            state = str(state_block.get("market_state") or state_block.get("state") or "")
+            remaining_s = int(float(state_block.get("remaining_ms") or 0) / 1000)
+            event_details = {
+                "reason": reason,
+                "market_state": state,
+                "state": state,
+                "source": state_block.get("source"),
+                "remaining_s": remaining_s,
+                "block_until_ms": state_block.get("block_until_ms"),
+                "loss_count": state_block.get("loss_count"),
+                "required_loss_count": state_block.get("required_loss_count"),
+                "window_seconds": state_block.get("window_seconds"),
+                "block_minutes": state_block.get("block_minutes"),
+                "loss_run_ids": state_block.get("loss_run_ids") or [],
+                "raw_classifier": raw_snapshot,
+                "effective_execution": effective_snapshot,
+                "decision": asdict(codex_decision),
+                "features": self._codex_v1_payload_features(features),
+            }
+            await self._repo.log_event(run["run_id"], "entry_codex_state_throttled", event_details)
+            notified_key = f"{run['run_id']}:{self._codex_state_throttle_norm(state)}"
+            if notified_key not in self._codex_state_throttle_notified:
+                self._codex_state_throttle_notified.add(notified_key)
+                count = state_block.get("required_loss_count") or "?"
+                window_min = float(state_block.get("window_seconds") or 0) / 60.0
+                await self._notify(
+                    "⛔ <b>Codex state 暫緩：暫不進場</b>\n"
+                    f"Run：<code>{escape(run['run_id'])}</code>\n"
+                    f"State：<code>{escape(state or 'UNKNOWN')}</code>\n"
+                    f"原因：<code>{window_min:g}m 內同 state 淨虧 ≥{escape(str(count))} 筆</code>\n"
+                    f"剩餘：<b>{remaining_s // 60}m{remaining_s % 60:02d}s</b>\n"
+                    "同 lane 其他未被鎖的 market_state 仍可進場。"
+                )
+            else:
+                logger.info(
+                    "entry_codex_state_throttle_skip",
+                    run_id=run["run_id"],
+                    state=state,
+                    remaining_s=remaining_s,
+                )
+            if self._v1462_shadow_all_active(run):
+                await self._start_codex_v1_shadow_sample(
+                    run,
+                    decision,
+                    raw_codex_decision,
+                    codex_decision,
+                    features,
+                    reason=reason,
+                    effective_status=effective_status,
+                    candidate_ticket=candidate_ticket,
+                )
+            return None, raw_codex_decision, codex_decision, features
+
+        codex_decision = await self._v1459_apply_regime_profile(
+            run,
+            codex_decision,
+            features=features,
+        )
+        if not codex_decision.accepted:
+            reason = str(
+                codex_decision.reason
+                or "v1459_regime_overlay_rejected"
+            )
+            effective_status = "blocked_v1459_regime"
+            effective_snapshot = self._codex_v1_decision_snapshot(
+                codex_decision,
+                features,
+                status=effective_status,
+                effective_reason=reason,
+            )
+            try:
+                await self._repo.log_event(
+                    run["run_id"],
+                    "entry_codex_v1459_regime_skipped",
+                    {
+                        "reason": reason,
+                        "raw_classifier": raw_snapshot,
+                        "effective_execution": effective_snapshot,
+                        "decision": asdict(codex_decision),
+                        "features": self._codex_v1_payload_features(
+                            features
+                        ),
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001 - rejection must remain closed
+                logger.error(
+                    "entry_codex_v1459_regime_skip_persistence_failed",
+                    run_id=run["run_id"],
+                    reason=reason,
+                    error=str(exc)[:200],
+                )
+            if self._v1462_shadow_all_active(run):
+                candidate_ticket = self._v1462_candidate_ticket(
+                    raw_codex_decision,
+                    codex_decision,
+                )
+                await self._start_codex_v1_shadow_sample(
+                    run,
+                    decision,
+                    raw_codex_decision,
+                    codex_decision,
+                    features,
+                    reason=reason,
+                    effective_status=effective_status,
+                    candidate_ticket=candidate_ticket,
+                )
+            return None, raw_codex_decision, codex_decision, features
+
+        incumbent_codex_decision = codex_decision
+        if self._v1462_strict_live_allowlist_active(run):
+            codex_decision = await self._v1460_apply_lane_policy(
+                run,
+                incumbent_codex_decision,
+            )
+            incumbent_metrics = (
+                incumbent_codex_decision.metrics
+                if isinstance(incumbent_codex_decision.metrics, Mapping)
+                else {}
+            )
+            prior_reject = (
+                incumbent_metrics.get("v1461_incumbent_reject")
+                if isinstance(
+                    incumbent_metrics.get("v1461_incumbent_reject"), Mapping
+                )
+                else None
+            )
+            reject_lineage = tuple(
+                item
+                for item in dict.fromkeys(
+                    (
+                        *self._v1462_reject_reopen_lineage(
+                            raw_codex_decision,
+                            incumbent_codex_decision,
+                            codex_decision,
+                        ),
+                        (
+                            f"pre_gate_reject:{candidate_ticket.reason}"
+                            if not pre_gate_accepted
+                            else None
+                        ),
+                        (
+                            f"v1461_reopen:{prior_reject.get('reason')}"
+                            if prior_reject is not None
+                            else None
+                        ),
+                    )
+                )
+                if item
+            )
+            candidate_ticket = self._v1462_candidate_ticket(
+                raw_codex_decision,
+                incumbent_codex_decision,
+            )
+            codex_decision = await self._v1462_apply_strict_admission(
+                run,
+                raw_codex_decision,
+                pre_gate_accepted,
+                incumbent_codex_decision,
+                codex_decision,
+                wildcat_decision=decision,
+                reject_lineage=reject_lineage,
+                candidate_ticket=candidate_ticket,
+                features=features,
+            )
+        elif self._v1461_candidate_active(run):
+            incumbent_metrics = (
+                incumbent_codex_decision.metrics
+                if isinstance(incumbent_codex_decision.metrics, Mapping)
+                else {}
+            )
+            prior_reject = (
+                incumbent_metrics.get("v1461_incumbent_reject")
+                if isinstance(
+                    incumbent_metrics.get("v1461_incumbent_reject"), Mapping
+                )
+                else None
+            )
+            gate_family_id = str(
+                (prior_reject or {}).get("gate_family_id")
+                or f"INCUMBENT_{str(incumbent_codex_decision.lane_code or incumbent_codex_decision.lane or 'UNKNOWN').upper()}"
+            )
+            codex_decision = await self._v1461_apply_gate_policy(
+                run,
+                incumbent_codex_decision,
+                incumbent_accepted=prior_reject is None,
+                gate_family_id=gate_family_id,
+                promotion_eligible=bool(
+                    (prior_reject or {}).get("promotion_eligible", False)
+                ),
+            )
+            if prior_reject is not None and codex_decision.accepted:
+                effective_status = "accepted_v1461_reprobation"
+                await self._repo.log_event(
+                    run["run_id"],
+                    "entry_codex_v1461_legacy_gate_released",
+                    {
+                        "incumbent_reject_reason": prior_reject.get("reason"),
+                        "gate_family_id": gate_family_id,
+                        "gate_class": prior_reject.get("gate_class"),
+                        "decision": asdict(codex_decision),
+                        "raw_classifier": raw_snapshot,
+                    },
+                )
+        else:
+            codex_decision = await self._v1460_apply_lane_policy(
+                run,
+                incumbent_codex_decision,
+            )
+        adaptive_decision_payload = self._adaptive_decision_payload(
+            run,
+            codex_decision,
+            raw_decision=raw_codex_decision,
+            features=features,
+        )
+        incumbent_adjusted = self._apply_codex_v1_decision(
+            decision,
+            incumbent_codex_decision,
+        )
+        if not self._v1461_candidate_active(run):
+            await self._maybe_start_v1460_weak_shadow(
+                run,
+                incumbent_adjusted,
+                incumbent_codex_decision,
+                codex_decision,
+                adaptive_decision_payload,
+            )
+        if not codex_decision.accepted:
+            metrics = (
+                codex_decision.metrics
+                if isinstance(codex_decision.metrics, Mapping)
+                else {}
+            )
+            v1462_policy = (
+                metrics.get("v1462_admission")
+                if isinstance(metrics.get("v1462_admission"), Mapping)
+                else None
+            )
+            v1461_policy = (
+                metrics.get("v1461_adaptive_gate")
+                if isinstance(metrics.get("v1461_adaptive_gate"), Mapping)
+                else None
+            )
+            policy = v1462_policy or v1461_policy or (
+                metrics.get("v1460_lane_adaptive")
+                if isinstance(metrics.get("v1460_lane_adaptive"), Mapping)
+                else {}
+            )
+            reason = str(
+                policy.get("reason")
+                if v1462_policy is not None
+                else policy.get("matrix_rule_id")
+                or codex_decision.reason
+                or (
+                    "v1461_adaptive_gate_blocked"
+                    if v1461_policy is not None
+                    else "v1460_lane_matrix_blocked"
+                )
+            )
+            await self._adaptive_gate_before_submit(
+                run,
+                adaptive_decision_payload,
+            )
+            effective_status = (
+                "blocked_v1462_strict_allowlist"
+                if v1462_policy is not None
+                else "blocked_v1461_adaptive_gate"
+                if v1461_policy is not None
+                else "blocked_v1460_lane_matrix"
+            )
+            effective_snapshot = self._codex_v1_decision_snapshot(
+                codex_decision,
+                features,
+                status=effective_status,
+                effective_reason=reason,
+            )
+            try:
+                await self._repo.log_event(
+                    run["run_id"],
+                    (
+                        "entry_codex_v1462_admission_skipped"
+                        if v1462_policy is not None
+                        else "entry_codex_v1461_gate_skipped"
+                        if v1461_policy is not None
+                        else "entry_codex_v1460_lane_skipped"
+                    ),
+                    {
+                        "reason": reason,
+                        "action_mode": policy.get("action_mode"),
+                        "matrix_rule_id": policy.get("matrix_rule_id"),
+                        "risk_scale": policy.get("risk_scale"),
+                        "evidence_gate": policy.get("evidence_gate"),
+                        "policy_hash": policy.get("policy_hash"),
+                        "raw_classifier": raw_snapshot,
+                        "effective_execution": effective_snapshot,
+                        "decision": asdict(codex_decision),
+                        "adaptive_decision": adaptive_decision_payload,
+                        "features": self._codex_v1_payload_features(features),
+                        "order_api_calls": 0,
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001 - admission stays blocked
+                logger.error(
+                    "entry_codex_adaptive_gate_skip_persistence_failed",
+                    run_id=run.get("run_id"),
+                    reason=reason,
+                    error=str(exc)[:200],
+                )
+            if (
+                v1462_policy is not None
+                or v1461_policy is not None
+                or self._v1462_shadow_all_active(run)
+            ):
+                await self._start_codex_v1_shadow_sample(
+                    run,
+                    decision,
+                    raw_codex_decision,
+                    codex_decision,
+                    features,
+                    reason=reason,
+                    effective_status=effective_status,
+                    candidate_ticket=candidate_ticket,
+                )
+            return None, raw_codex_decision, codex_decision, features
+
         adjusted = self._apply_codex_v1_decision(decision, codex_decision)
         effective_snapshot = self._codex_v1_decision_snapshot(
             codex_decision,
@@ -1375,8 +9731,92 @@ class MainnetOneRunManager:
                 "features": self._codex_v1_payload_features(features),
             },
         )
+        shadow_metrics = codex_decision.metrics if isinstance(codex_decision.metrics, Mapping) else {}
+        if shadow_metrics.get("v1439_shadow_score") is not None:
+            await self._repo.log_event(
+                run["run_id"],
+                "entry_codex_v1439_shadow_score",
+                {
+                    "score": shadow_metrics.get("v1439_shadow_score"),
+                    "action": shadow_metrics.get("v1439_shadow_action"),
+                    "reasons": shadow_metrics.get("v1439_shadow_reasons") or [],
+                    "live_effect": shadow_metrics.get("v1439_shadow_live_effect"),
+                    "lane_code": shadow_metrics.get("v1439_shadow_lane_code"),
+                    "market_state": shadow_metrics.get("v1439_shadow_market_state"),
+                    "side": shadow_metrics.get("v1439_shadow_side"),
+                    "would_block": bool(shadow_metrics.get("v1439_shadow_would_block")),
+                    "would_thin_lock": bool(shadow_metrics.get("v1439_shadow_would_thin_lock")),
+                },
+            )
         return adjusted, raw_codex_decision, codex_decision, features
 
+
+    def _codex_v1433_guard_clean_high_side_override(
+        self,
+        features: Mapping[str, Any],
+        codex_decision: CodexV1Decision,
+        raw_side: str | None,
+    ) -> CodexV1Decision:
+        if not codex_decision.accepted or str(codex_decision.lane_code or "").upper() != "STUP-S":
+            return codex_decision
+        metrics_raw = codex_decision.metrics if isinstance(codex_decision.metrics, Mapping) else {}
+        metrics = dict(metrics_raw)
+        state = str(metrics.get("market_state") or metrics.get("v143_market_state") or codex_decision.regime or "").strip()
+        previous_side = str(raw_side or features.get("side") or "").upper()
+        target_side = str(codex_decision.side or "").upper()
+        if state != "STUP-S:clean_extension" or previous_side != "SHORT" or target_side != "LONG":
+            return codex_decision
+
+        def _metric_float(*keys: str) -> float | None:
+            sources: list[Mapping[str, Any]] = [metrics, features]
+            nested = metrics.get("v1427_features")
+            if isinstance(nested, Mapping):
+                sources.insert(1, nested)
+            for source in sources:
+                for key in keys:
+                    value = source.get(key)
+                    try:
+                        parsed = float(value) if value is not None else None
+                    except (TypeError, ValueError):
+                        parsed = None
+                    if parsed is not None and math.isfinite(parsed):
+                        return parsed
+            return None
+
+        range_pos = _metric_float("range_pos_15", "range_pos")
+        vwap_dist_bp = _metric_float("vwap_dist_bp", "vwap_dist")
+        if range_pos is None or vwap_dist_bp is None:
+            return codex_decision
+        if range_pos < 0.95 or vwap_dist_bp < 50.0:
+            return codex_decision
+        guarded_metrics = {
+            **metrics,
+            "target_side": previous_side,
+            "v1433_side_override_guarded": True,
+            "v1433_side_override_guard_reason": "clean_extension_high_range_keep_raw_short",
+            "v1433_previous_side": previous_side,
+            "v1433_original_target_side": target_side,
+            "v1433_target_side": previous_side,
+            "v1433_guarded_side": previous_side,
+            "v1433_range_pos_15": round(range_pos, 4),
+            "v1433_vwap_dist_bp": round(vwap_dist_bp, 4),
+            "v1427_side_override_suppressed": True,
+        }
+        cleaned_tags = tuple(
+            tag
+            for tag in codex_decision.risk_tags
+            if not str(tag).startswith(("v1427_side_override_", "v1421_side_override_"))
+        )
+        guarded_tags = tuple(
+            dict.fromkeys(
+                (
+                    *cleaned_tags,
+                    "v1433_clean_high_side_override_guard",
+                    "v1433_keep_raw_short",
+                )
+            )
+        )
+        return replace(codex_decision, side=previous_side, metrics=guarded_metrics, risk_tags=guarded_tags)
 
     async def _codex_v136_nl_near_w1d_live200_count_24h(self) -> int:
         counter = getattr(self._repo, "count_events_since", None)
@@ -1469,27 +9909,12 @@ class MainnetOneRunManager:
             return raw_codex_decision
 
         lane_code = "SH_NL_NEAR_W1D_LONG_LIVE200"
-        fixed_notional = 200.0
-        daily_limit = 3
         d30 = MainnetOneRunManager._codex_v1_shadow_feature_float(features, "d30")
         adv3 = MainnetOneRunManager._codex_v1_shadow_feature_float(features, "adv3")
         vwap_dist_bp = MainnetOneRunManager._codex_v1_shadow_feature_float(features, "vwap_dist_bp")
         reclaimed = MainnetOneRunManager._codex_v1_shadow_feature_float(features, "price_above_or_reclaimed_vwap")
-        lacks_vwap_reclaim = reclaimed != 1.0 or (vwap_dist_bp is not None and vwap_dist_bp < 0.0)
-        strict_live200_ok = (
-            not lacks_vwap_reclaim
-            and (d30 is None or d30 > -10.0)
-            and (adv3 is None or adv3 <= 8.0)
-        )
-        count_24h = await self._codex_v136_nl_near_w1d_live200_count_24h()
-        loss_guard = await self._codex_v136_nl_near_w1d_live200_loss_guard_24h()
-        try:
-            base_notional = float(getattr(self._settings, "mainnet_effective_entry_notional_usdc", fixed_notional) or fixed_notional)
-        except (TypeError, ValueError):
-            base_notional = fixed_notional
-        notional_mult = fixed_notional / base_notional if base_notional > 0 else 1.0
         metrics = {
-            "promotion_version": "v1.3.6",
+            "promotion_version": "v1.4.2",
             "promotion_source": "no_lane_candidate",
             "candidate_bucket": candidate.get("candidate_bucket"),
             "nearest_lane_code": candidate.get("nearest_lane_code"),
@@ -1502,91 +9927,46 @@ class MainnetOneRunManager:
             "adv3": adv3,
             "vwap_dist_bp": vwap_dist_bp,
             "price_above_or_reclaimed_vwap": reclaimed,
-            "live200_strict_gate_pass": strict_live200_ok,
-            "fixed_notional_usdc": fixed_notional,
-            "applied_notional_cap_usdc": fixed_notional,
-            "entry_ttl_s": 120,
-            "entry_model": "post_only_maker_0bp",
-            "max_fills_per_day_for_lane": daily_limit,
-            "accepted_count_24h": count_24h,
-            "loss_guard_completed_count_24h": int(loss_guard.get("completed_count") or 0),
-            "loss_guard_sl_count_24h": int(loss_guard.get("sl_count") or 0),
-            "loss_guard_net_pnl_24h_usdc": float(loss_guard.get("net_pnl_usdc") or 0.0),
-            "loss_guard_net_stop_usdc": -0.45,
+            "policy_note": "v142_ambiguous_shadow_only",
+            "policy_tag": "v142_ambiguous_shadow_only",
+            "fixed_notional_usdc": 50.0,
+            "applied_notional_cap_usdc": 0.0,
+            "would_live_notional_usdc": 50.0,
+            "entry_model": "post_only_maker_shadow_only",
+            "source": "v141_2026_06_27_regime_replay",
         }
-        risk_tags = tuple(raw_codex_decision.risk_tags) + (
-            "nl_near_w1d_live200",
-            "fixed_200_usdc",
-            "post_only_maker",
-            "no_taker_fallback",
-            "no_sizeup",
-            "no_dca",
-        )
-        guard_reason = None
-        guard_risk_tag = None
-        if lacks_vwap_reclaim:
-            guard_reason = "nl_near_w1d_reclaim_guard_shadow"
-            guard_risk_tag = "reclaim_guard_shadow"
-        elif metrics["loss_guard_sl_count_24h"] >= 1:
-            guard_reason = "nl_near_w1d_live200_sl_guard_block"
-            guard_risk_tag = "sl_guard_block"
-        elif metrics["loss_guard_net_pnl_24h_usdc"] <= -0.45:
-            guard_reason = "nl_near_w1d_live200_net_loss_guard_block"
-            guard_risk_tag = "net_loss_guard_block"
-        elif count_24h >= daily_limit:
-            guard_reason = "nl_near_w1d_live200_daily_limit_block"
-            guard_risk_tag = "daily_limit_block"
-        if guard_reason:
-            metrics = {
-                **metrics,
-                "policy_note": guard_reason,
-                "policy_tag": guard_reason,
-            }
-            return replace(
-                raw_codex_decision,
-                lane=lane_code,
-                lane_code=lane_code,
-                strategy=strategy,
-                side=side,
-                entry_offset_bp=0.0,
-                reason=guard_reason,
-                regime="nl_near_w1d_live200",
-                metrics=metrics,
-                policy_tag=guard_reason,
-                risk_tags=risk_tags + (guard_risk_tag,),
+        risk_tags = tuple(
+            dict.fromkeys(
+                tuple(raw_codex_decision.risk_tags)
+                + (
+                    "nl_near_w1d_ambiguous_shadow_only",
+                    "v142_ambiguous_shadow_only",
+                    "fixed_50_usdc",
+                    "no_live_promotion",
+                    "no_sizeup",
+                    "no_dca",
+                )
             )
-
-        metrics = {
-            **metrics,
-            "policy_note": lane_code if strict_live200_ok else "nl_near_w1d_cap50_reclaim_guard",
-            "policy_tag": lane_code if strict_live200_ok else "nl_near_w1d_cap50_reclaim_guard",
-            "fixed_notional_usdc": fixed_notional if strict_live200_ok else 50.0,
-            "applied_notional_cap_usdc": fixed_notional if strict_live200_ok else 50.0,
-        }
-        if not strict_live200_ok:
-            fixed_notional = 50.0
-            notional_mult = fixed_notional / base_notional if base_notional > 0 else 1.0
-            risk_tags = tuple(tag for tag in risk_tags if tag != "fixed_200_usdc") + ("fixed_50_usdc", "v139c_reclaim_guard_cap50")
+        )
         return replace(
             raw_codex_decision,
-            accepted=True,
+            accepted=False,
             lane=lane_code,
             lane_code=lane_code,
             strategy=strategy,
             side=side,
-            entry_offset_bp=0.0,
-            size_mult=1.0,
-            notional_mult=notional_mult,
-            requested_notional_usdc=fixed_notional,
-            reason="nl_near_w1d_live200_promoted" if strict_live200_ok else "nl_near_w1d_cap50_reclaim_guard_promoted",
-            regime="nl_near_w1d_live200" if strict_live200_ok else "nl_near_w1d_cap50_reclaim_guard",
+            entry_offset_bp=None,
+            size_mult=0.0,
+            notional_mult=0.0,
+            requested_notional_usdc=0.0,
+            reason="v142_ambiguous_shadow_only",
+            regime="ambiguous_shadow_only",
             missing_features=(),
             risk_tags=risk_tags,
             metrics=metrics,
-            policy_tag=lane_code,
-            shadow_lane=None,
+            policy_tag="v142_ambiguous_shadow_only",
+            shadow_lane=lane_code,
         )
-
     async def _codex_v139_reprice_canary_count_24h(self) -> int:
         counter = getattr(self._repo, "count_events_since", None)
         if not callable(counter):
@@ -1603,6 +9983,471 @@ class MainnetOneRunManager:
         except Exception as exc:  # noqa: BLE001 - fail open; canary remains tiny and preflight guarded.
             logger.warning("v139_reprice_canary_count_failed", error=str(exc)[:200])
             return 0
+
+    def _codex_v143_wpr_market_state(self, features: Mapping[str, Any]) -> str:
+        rng15 = self._codex_v1_shadow_feature_float(features, "rng15")
+        d30 = self._codex_v1_shadow_feature_float(features, "d30")
+        rsi = self._codex_v1_shadow_feature_float(features, "rsi")
+        vwap_dist_bp = self._codex_v1_shadow_feature_float(features, "vwap_dist_bp")
+        if any(value is None for value in (rng15, d30, rsi, vwap_dist_bp)):
+            return "CNL-WPR-L:missing_features"
+        if d30 >= 20.0 and vwap_dist_bp <= -18.0 and rsi <= 42.0:
+            return "CNL-WPR-L:discount_delayed_reclaim"
+        falling_core = d30 < -30.0 or (vwap_dist_bp <= -45.0 and rsi < 48.0) or rng15 >= 70.0
+        if falling_core:
+            if rng15 >= 90.0 and d30 > -55.0 and vwap_dist_bp > -45.0:
+                return "CNL-WPR-L:falling_continuation_probe"
+            return "CNL-WPR-L:falling_discount_trap"
+        if vwap_dist_bp <= -20.0 and d30 >= -20.0 and 40.0 <= rsi <= 62.0:
+            return "CNL-WPR-L:deep_discount_stable"
+        if vwap_dist_bp <= -10.0 and d30 >= 5.0 and rsi >= 50.0:
+            return "CNL-WPR-L:fast_reclaim"
+        return "CNL-WPR-L:discount_mixed"
+
+    def _codex_v1415_wpr_profile_for_state(
+        self,
+        state: str,
+        profile: Mapping[str, Any],
+        features: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        if not bool(getattr(self._settings, "mainnet_codex_v1415_wpr_strong_fall_deep_entry_enabled", True)):
+            return profile
+        if state != "CNL-WPR-L:falling_discount_trap":
+            return profile
+
+        def _setting_float(name: str, default: float) -> float:
+            try:
+                return float(getattr(self._settings, name, default) or default)
+            except (TypeError, ValueError):
+                return default
+
+        rng15 = self._codex_v1_shadow_feature_float(features, "rng15")
+        d30 = self._codex_v1_shadow_feature_float(features, "d30")
+        rsi = self._codex_v1_shadow_feature_float(features, "rsi")
+        vwap_dist_bp = self._codex_v1_shadow_feature_float(features, "vwap_dist_bp")
+        if any(value is None for value in (rng15, d30, rsi, vwap_dist_bp)):
+            return profile
+
+        d30_max = _setting_float("mainnet_codex_v1415_wpr_strong_fall_d30_max_bp", -60.0)
+        rsi_max = _setting_float("mainnet_codex_v1415_wpr_strong_fall_rsi_max", 32.0)
+        vwap_max = _setting_float("mainnet_codex_v1415_wpr_strong_fall_vwap_max_bp", -12.0)
+        rng15_min = _setting_float("mainnet_codex_v1415_wpr_strong_fall_rng15_min_bp", 50.0)
+        if not (d30 <= d30_max and rsi <= rsi_max and vwap_dist_bp <= vwap_max and rng15 >= rng15_min):
+            return profile
+
+        base_entry_bp = self._codex_v143_metric_float(profile, "entry_bp") or 0.0
+        entry_bp = max(
+            base_entry_bp,
+            _setting_float("mainnet_codex_v1415_wpr_strong_fall_entry_bp", 8.0),
+        )
+        adjusted = dict(profile)
+        adjusted.update(
+            {
+                "entry_bp": entry_bp,
+                "profile_patch": WPR_V1415_STRONG_FALL_POLICY_TAG,
+                "strong_fall_deep_entry": True,
+                "strong_fall_entry_bp": entry_bp,
+                "strong_fall_d30_max_bp": d30_max,
+                "strong_fall_rsi_max": rsi_max,
+                "strong_fall_vwap_max_bp": vwap_max,
+                "strong_fall_rng15_min_bp": rng15_min,
+                "strong_fall_observed_d30": d30,
+                "strong_fall_observed_rsi": rsi,
+                "strong_fall_observed_vwap_dist_bp": vwap_dist_bp,
+                "strong_fall_observed_rng15": rng15,
+            }
+        )
+        return adjusted
+
+    def _codex_v1419_wpr_block_reason(self, state: str, features: Mapping[str, Any]) -> str | None:
+        rng15 = self._codex_v1_shadow_feature_float(features, "rng15")
+        d30 = self._codex_v1_shadow_feature_float(features, "d30")
+        rsi = self._codex_v1_shadow_feature_float(features, "rsi")
+        vwap_dist_bp = self._codex_v1_shadow_feature_float(features, "vwap_dist_bp")
+        range_bp = self._codex_v1_shadow_feature_float(features, "range_bp")
+        range_pos = self._codex_v1_shadow_feature_float(features, "range_pos_15")
+        if range_pos is None:
+            range_pos = self._codex_v1_shadow_feature_float(features, "range_pos")
+        pullback = self._codex_v1_shadow_feature_float(features, "pullback_from_recent_high_bp")
+        if pullback is None:
+            pullback = self._codex_v1_shadow_feature_float(features, "pullback")
+
+        if state == "CNL-WPR-L:discount_mixed":
+            if range_pos is not None and range_pos >= 0.55:
+                return WPR_V1419_DISCOUNT_MIXED_BLOCK_REASON
+            if pullback is not None and pullback <= 16.0:
+                return WPR_V1419_DISCOUNT_MIXED_BLOCK_REASON
+            if rsi is not None and rsi >= 53.0:
+                return WPR_V1419_DISCOUNT_MIXED_BLOCK_REASON
+            if rng15 is not None and d30 is not None and rng15 >= 60.0 and d30 >= 12.0:
+                return WPR_V1419_DISCOUNT_MIXED_BLOCK_REASON
+            return None
+
+        if state == "CNL-WPR-L:falling_continuation_probe":
+            if range_bp is not None and d30 is not None and range_bp >= 23.0 and d30 <= -45.0:
+                return WPR_V1420_CONTINUATION_HIGH_RANGE_BLOCK_REASON
+            return None
+
+        if state != "CNL-WPR-L:falling_discount_trap":
+            return None
+        if any(value is None for value in (rng15, d30, rsi, vwap_dist_bp)):
+            return None
+        if rsi >= 50.0:
+            return WPR_V1419_FALLING_BAD_BLOCK_REASON
+        if vwap_dist_bp > -5.0 and rsi <= 32.0:
+            return WPR_V1419_FALLING_BAD_BLOCK_REASON
+        if d30 <= -100.0 and rng15 < 105.0 and 35.0 <= rsi <= 42.0:
+            return WPR_V1419_FALLING_BAD_BLOCK_REASON
+        return None
+
+    def _codex_v1419_wpr_profile_for_state(
+        self,
+        state: str,
+        profile: Mapping[str, Any],
+        features: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        del features
+        adjusted = dict(profile)
+        if state == "CNL-WPR-L:discount_mixed":
+            adjusted.update(
+                {
+                    "entry_bp": 0.0,
+                    "tp1_bp": 5.0,
+                    "full_tp_bp": 16.0,
+                    "sl_bp": 15.0,
+                    "be_bp": 2.0,
+                    "partial_exit_pct": 0.45,
+                    "ttl_s": 150,
+                    "profit_lock_mfe_bp": 10.0,
+                    "profit_lock_floor_bp": 6.0,
+                    "profit_lock_giveback_bp": 4.0,
+                    "pre_tp_profit_lock_enabled": False,
+                    "adaptive_tp_engine": "v1420_wpr_discount_mixed_runner",
+                    "profile_patch": WPR_V1420_DISCOUNT_MIXED_RUNNER_POLICY_TAG,
+                    "live_observation": "v1420_discount_mixed_selective_runner_tp5_full16",
+                    "replay_n": 26,
+                    "replay_wr": 0.9230769230769231,
+                    "replay_net_usdc": 0.245,
+                    "small_n_forward_watch": True,
+                }
+            )
+        elif state == "CNL-WPR-L:falling_discount_trap":
+            adjusted.update(
+                {
+                    "entry_bp": 2.0,
+                    "tp1_bp": 6.0,
+                    "full_tp_bp": 20.0,
+                    "sl_bp": 8.0,
+                    "be_bp": 2.0,
+                    "partial_exit_pct": 0.70,
+                    "ttl_s": 60,
+                    "profit_lock_mfe_bp": 10.0,
+                    "profit_lock_floor_bp": 6.0,
+                    "profit_lock_giveback_bp": 4.0,
+                    "adaptive_tp_engine": "v1420_wpr_falling_discount_runner",
+                    "profile_patch": WPR_V1419_FALLING_RUNNER_POLICY_TAG,
+                    "live_observation": "v1420_current_market_falling_discount_runner_entry2_tp6_full20_sl8",
+                    "replay_n": 21,
+                    "replay_wr": 0.7619047619047619,
+                    "replay_net_usdc": 0.186,
+                    "small_n_forward_watch": True,
+                }
+            )
+        elif state == "CNL-WPR-L:discount_delayed_reclaim":
+            adjusted.update(
+                {
+                    "entry_bp": 3.0,
+                    "tp1_bp": 5.0,
+                    "full_tp_bp": 8.0,
+                    "sl_bp": 8.0,
+                    "be_bp": 2.0,
+                    "partial_exit_pct": 0.70,
+                    "ttl_s": 75,
+                    "profit_lock_mfe_bp": 10.0,
+                    "profit_lock_floor_bp": 6.0,
+                    "profit_lock_giveback_bp": 4.0,
+                    "adaptive_tp_engine": "v1420_wpr_discount_delayed_reclaim_tight",
+                    "profile_patch": WPR_V1420_DELAYED_RECLAIM_TIGHT_POLICY_TAG,
+                    "live_observation": "v1420_discount_delayed_reclaim_single_loss_tight_profile",
+                    "replay_n": 1,
+                    "replay_wr": 1.0,
+                    "replay_net_usdc": 0.0145,
+                    "small_n_forward_watch": True,
+                }
+            )
+        elif state == "CNL-WPR-L:deep_discount_stable":
+            adjusted.update(
+                {
+                    "entry_bp": 2.0,
+                    "tp1_bp": 6.0,
+                    "full_tp_bp": 6.0,
+                    "sl_bp": 8.0,
+                    "be_bp": 0.0,
+                    "partial_exit_pct": 1.0,
+                    "ttl_s": 60,
+                    "profit_lock_mfe_bp": 0.0,
+                    "profit_lock_floor_bp": 0.0,
+                    "profit_lock_giveback_bp": 0.0,
+                    "staged_entry_reprice_enabled": True,
+                    "staged_entry_bps": (2.0, 1.0, 0.0),
+                    "staged_entry_delay_s": 25,
+                    "adaptive_tp_engine": "v1420_wpr_deep_discount_stable_tight",
+                    "profile_patch": WPR_V1419_DEEP_STABLE_POLICY_TAG,
+                    "live_observation": "v1433_deep_discount_stable_entry2_tp6_full_exit_stage_watch",
+                    "replay_n": 1,
+                    "replay_wr": 1.0,
+                    "replay_net_usdc": 0.03,
+                    "small_n_forward_watch": True,
+                }
+            )
+        return adjusted
+
+    @staticmethod
+    def _codex_v143_metric_float(metrics: Mapping[str, Any] | None, key: str) -> float | None:
+        if not isinstance(metrics, Mapping):
+            return None
+        value = metrics.get(key)
+        try:
+            parsed = float(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+        if parsed is None or not math.isfinite(parsed):
+            return None
+        return parsed
+
+    @staticmethod
+    def _codex_state_throttle_norm(value: Any) -> str:
+        return str(value or "").strip().upper()
+
+    def _codex_state_throttle_allowed_states(self) -> set[str]:
+        raw = str(getattr(self._settings, "mainnet_codex_state_throttle_states", "") or "")
+        states: set[str] = set()
+        for item in re.split(r"[,;]", raw):
+            norm = self._codex_state_throttle_norm(item)
+            if norm:
+                states.add(norm)
+        return states
+
+    def _codex_state_throttle_params(self) -> tuple[int, float, float]:
+        try:
+            loss_count = int(getattr(self._settings, "mainnet_codex_state_throttle_loss_count", 2) or 2)
+        except (TypeError, ValueError):
+            loss_count = 2
+        try:
+            window_seconds = float(getattr(self._settings, "mainnet_codex_state_throttle_window_seconds", 3600.0) or 3600.0)
+        except (TypeError, ValueError):
+            window_seconds = 3600.0
+        try:
+            block_minutes = float(getattr(self._settings, "mainnet_codex_state_throttle_block_minutes", 60.0) or 60.0)
+        except (TypeError, ValueError):
+            block_minutes = 60.0
+        return max(1, loss_count), max(0.0, window_seconds), max(0.0, block_minutes)
+
+    def _codex_state_throttle_key(self, market_state: Any) -> str:
+        if not bool(getattr(self._settings, "mainnet_codex_state_throttle_enabled", True)):
+            return ""
+        state = str(market_state or "").strip()
+        if not state:
+            return ""
+        allowed = self._codex_state_throttle_allowed_states()
+        if not allowed:
+            return ""
+        norm = self._codex_state_throttle_norm(state)
+        short = self._codex_state_throttle_norm(state.split(":", 1)[-1])
+        if "*" in allowed or norm in allowed or short in allowed:
+            return state
+        return ""
+
+    @staticmethod
+    def _codex_v1_market_state_from_metrics(metrics: Mapping[str, Any] | None) -> str:
+        if not isinstance(metrics, Mapping):
+            return ""
+        for key in ("market_state", "v143_market_state", "wpr_profile"):
+            value = metrics.get(key)
+            text = str(value or "").strip()
+            if text:
+                return text
+        return ""
+
+    @classmethod
+    def _codex_v1_market_state_from_decision(cls, decision: CodexV1Decision | None) -> str:
+        if decision is None:
+            return ""
+        return cls._codex_v1_market_state_from_metrics(getattr(decision, "metrics", None))
+
+    @classmethod
+    def _codex_v1_market_state_from_run(cls, run: Mapping[str, Any]) -> str:
+        signal = cls._codex_v1_signal_payload(run)
+        codex = signal.get("codex_v1") if isinstance(signal, Mapping) else None
+        if not isinstance(codex, Mapping):
+            return ""
+        metrics = codex.get("metrics") if isinstance(codex.get("metrics"), Mapping) else {}
+        state = cls._codex_v1_market_state_from_metrics(metrics)
+        if state:
+            return state
+        effective = codex.get("effective_execution") if isinstance(codex.get("effective_execution"), Mapping) else {}
+        metrics = effective.get("metrics") if isinstance(effective.get("metrics"), Mapping) else {}
+        state = cls._codex_v1_market_state_from_metrics(metrics)
+        if state:
+            return state
+        return str(codex.get("regime") or "").strip()
+
+    @staticmethod
+    def _completed_at_ms(row: Mapping[str, Any]) -> int:
+        for key in ("completed_at_ms", "updated_at_ms", "armed_at_ms"):
+            try:
+                value = int(row.get(key) or 0)
+            except (TypeError, ValueError):
+                value = 0
+            if value > 0:
+                return value
+        return 0
+
+    async def _codex_state_throttle_recent_block(self, state: str, now_ms: int) -> dict[str, Any] | None:
+        loss_count, window_seconds, block_minutes = self._codex_state_throttle_params()
+        if not state or window_seconds <= 0 or block_minutes <= 0:
+            return None
+        getter = getattr(self._repo, "get_recent_runs", None)
+        if not callable(getter):
+            return None
+        try:
+            rows = await getter(limit=200)
+        except TypeError:
+            rows = await getter(200)
+        except Exception as exc:  # noqa: BLE001 - fail open; in-memory throttle still protects this process.
+            logger.warning("codex_state_throttle_recent_runs_failed", state=state, error=str(exc)[:200])
+            return None
+
+        norm_state = self._codex_state_throttle_norm(state)
+        window_ms = int(window_seconds * 1000)
+        block_ms = int(block_minutes * 60_000)
+        min_relevant_ms = now_ms - window_ms - block_ms
+        events: list[tuple[int, float, str]] = []
+        for row in rows or []:
+            if not isinstance(row, Mapping):
+                continue
+            if str(row.get("status") or "").upper() != "COMPLETED":
+                continue
+            completed_at = self._completed_at_ms(row)
+            if completed_at <= 0 or completed_at < min_relevant_ms:
+                continue
+            row_state = self._codex_state_throttle_key(self._codex_v1_market_state_from_run(row))
+            if self._codex_state_throttle_norm(row_state) != norm_state:
+                continue
+            events.append((completed_at, self._run_net_pnl(row), str(row.get("run_id") or "")))
+
+        losses: list[tuple[int, str]] = []
+        armed: dict[str, Any] | None = None
+        for completed_at, net_pnl, run_id in sorted(events, key=lambda item: item[0]):
+            if net_pnl < 0:
+                losses = [(ts, rid) for ts, rid in losses if completed_at - ts <= window_ms]
+                losses.append((completed_at, run_id))
+                if len(losses) >= loss_count:
+                    block_until = completed_at + block_ms
+                    armed = {
+                        "market_state": state,
+                        "state": state,
+                        "source": "db",
+                        "block_until_ms": block_until,
+                        "remaining_ms": max(0, block_until - now_ms),
+                        "loss_count": len(losses),
+                        "required_loss_count": loss_count,
+                        "window_seconds": window_seconds,
+                        "block_minutes": block_minutes,
+                        "loss_run_ids": [rid for _ts, rid in losses[-loss_count:] if rid],
+                    }
+            else:
+                losses.clear()
+        if armed and int(armed["block_until_ms"]) > now_ms:
+            return armed
+        return None
+
+    async def _codex_state_throttle_block(self, codex_decision: CodexV1Decision | None, now_ms: int) -> dict[str, Any] | None:
+        state = self._codex_state_throttle_key(self._codex_v1_market_state_from_decision(codex_decision))
+        if not state:
+            return None
+        loss_count, window_seconds, block_minutes = self._codex_state_throttle_params()
+        if window_seconds <= 0 or block_minutes <= 0:
+            return None
+        norm = self._codex_state_throttle_norm(state)
+        block_until = self._codex_state_throttle_until.get(norm, 0.0)
+        if block_until > now_ms:
+            meta = dict(self._codex_state_throttle_meta.get(norm) or {})
+            return {
+                "market_state": state,
+                "state": state,
+                "source": meta.get("source") or "memory",
+                "block_until_ms": block_until,
+                "remaining_ms": max(0, int(block_until - now_ms)),
+                "loss_count": meta.get("loss_count", len(self._codex_state_loss_times.get(norm, []))),
+                "required_loss_count": meta.get("required_loss_count", loss_count),
+                "window_seconds": meta.get("window_seconds", window_seconds),
+                "block_minutes": meta.get("block_minutes", block_minutes),
+                "loss_run_ids": meta.get("loss_run_ids") or [],
+            }
+        recent_block = await self._codex_state_throttle_recent_block(state, now_ms)
+        if recent_block:
+            self._codex_state_throttle_until[norm] = max(
+                self._codex_state_throttle_until.get(norm, 0.0),
+                float(recent_block.get("block_until_ms") or 0.0),
+            )
+            self._codex_state_throttle_meta[norm] = dict(recent_block)
+            return recent_block
+        return None
+
+    async def _maybe_arm_codex_state_throttle_from_completed_run(
+        self,
+        run: Mapping[str, Any],
+        net_pnl: float,
+        now_ms: int,
+    ) -> None:
+        state = self._codex_state_throttle_key(self._codex_v1_market_state_from_run(run))
+        if not state:
+            return
+        loss_count, window_seconds, block_minutes = self._codex_state_throttle_params()
+        if window_seconds <= 0 or block_minutes <= 0:
+            return
+        norm = self._codex_state_throttle_norm(state)
+        if net_pnl >= 0:
+            self._codex_state_loss_times.pop(norm, None)
+            return
+        window_ms = window_seconds * 1000
+        losses = self._codex_state_loss_times.get(norm, [])
+        losses.append(float(now_ms))
+        losses = [ts for ts in losses if now_ms - ts <= window_ms]
+        self._codex_state_loss_times[norm] = losses
+        if len(losses) < loss_count:
+            return
+        block_until = now_ms + block_minutes * 60_000
+        self._codex_state_throttle_until[norm] = max(
+            self._codex_state_throttle_until.get(norm, 0.0),
+            block_until,
+        )
+        throttle_meta = {
+            "market_state": state,
+            "state": state,
+            "source": "memory",
+            "loss_count": len(losses),
+            "required_loss_count": loss_count,
+            "window_seconds": window_seconds,
+            "block_minutes": block_minutes,
+            "block_until_ms": block_until,
+            "net_pnl": net_pnl,
+            "basis": "net_pnl",
+        }
+        self._codex_state_throttle_meta[norm] = dict(throttle_meta)
+        await self._repo.log_event(
+            str(run.get("run_id") or ""),
+            "codex_state_throttle_armed",
+            throttle_meta,
+        )
+        logger.info(
+            "codex_state_throttle_armed",
+            run_id=run.get("run_id"),
+            state=state,
+            loss_count=len(losses),
+            block_minutes=block_minutes,
+        )
 
     async def _codex_v139_maybe_promote_reprice_canary(
         self,
@@ -1672,6 +10517,27 @@ class MainnetOneRunManager:
                 entry_offset_bp = float(getattr(self._settings, "mainnet_codex_v139_reprice_canary_entry_offset_bp", 0.0) or 0.0)
         except (TypeError, ValueError):
             entry_offset_bp = 3.0 if shadow_lane == "SH_WPR_L_S1" else 0.0
+        v143_wpr_state: str | None = None
+        v143_wpr_profile: Mapping[str, Any] | None = None
+        v1419_wpr_block_reason: str | None = None
+        v143_wpr_policy_tag = WPR_V143_PROFILE_POLICY_TAG
+        if shadow_lane == "SH_WPR_L_S1" and bool(getattr(self._settings, "mainnet_codex_v143_adaptive_exec_enabled", True)):
+            v143_wpr_state = self._codex_v143_wpr_market_state(features)
+            v1419_wpr_block_reason = self._codex_v1419_wpr_block_reason(v143_wpr_state, features)
+            v143_wpr_profile = WPR_V143_PROFILES.get(v143_wpr_state)
+            if v143_wpr_profile is not None:
+                v143_wpr_profile = self._codex_v1415_wpr_profile_for_state(
+                    v143_wpr_state,
+                    v143_wpr_profile,
+                    features,
+                )
+                v143_wpr_profile = self._codex_v1419_wpr_profile_for_state(
+                    v143_wpr_state,
+                    v143_wpr_profile,
+                    features,
+                )
+                v143_wpr_policy_tag = str(v143_wpr_profile.get("profile_patch") or WPR_V143_PROFILE_POLICY_TAG)
+                entry_offset_bp = float(v143_wpr_profile["entry_bp"])
         daily_cap = int(getattr(self._settings, "mainnet_codex_v139_reprice_canary_daily_cap", 0) or 0)
         count_24h = await self._codex_v139_reprice_canary_count_24h() if daily_cap > 0 else None
         candidate_lane = str(mapping.get("candidate_lane") or "")
@@ -1712,6 +10578,75 @@ class MainnetOneRunManager:
                 else None
             ),
         }
+        if v143_wpr_state is not None:
+            metrics.update(
+                {
+                    "promotion_version": "v1.4.5",
+                    "canary_policy": v143_wpr_policy_tag if v143_wpr_profile is not None else "v143_wpr_shadow_only",
+                    "policy_note": v143_wpr_policy_tag if v143_wpr_profile is not None else "v143_wpr_shadow_only",
+                    "policy_tag": v143_wpr_policy_tag if v143_wpr_profile is not None else "v143_wpr_shadow_only",
+                    "market_state": v143_wpr_state,
+                    "v143_market_state": v143_wpr_state,
+                    "source": "v143_strategy_market_profile_sweep",
+                    "profile_source": V143_PROFILE_SOURCE,
+                    "wpr_profile": v143_wpr_state,
+                }
+            )
+        if v143_wpr_profile is not None:
+            for key in (
+                "entry_bp",
+                "tp1_bp",
+                "full_tp_bp",
+                "sl_bp",
+                "be_bp",
+                "partial_exit_pct",
+                "ttl_s",
+                "profit_lock_mfe_bp",
+                "profit_lock_floor_bp",
+                "profit_lock_giveback_bp",
+                "pre_tp_profit_lock_enabled",
+                "pre_tp_profit_lock_mfe_bp",
+                "pre_tp_profit_lock_floor_bp",
+                "pre_tp_profit_lock_method",
+                "replay_n",
+                "replay_wr",
+                "replay_net_usdc",
+                "small_n_forward_watch",
+                "no_fill_recovery_tp",
+                "no_fill_recovery_loss",
+                "no_fill_recovery_still_no_fill",
+                "no_fill_recovery_watch",
+                "staged_entry_reprice_enabled",
+                "staged_entry_bps",
+                "staged_entry_delay_s",
+                "adaptive_tp_engine",
+                "live_observation",
+                "profile_patch",
+                "strong_fall_deep_entry",
+                "strong_fall_entry_bp",
+                "strong_fall_d30_max_bp",
+                "strong_fall_rsi_max",
+                "strong_fall_vwap_max_bp",
+                "strong_fall_rng15_min_bp",
+                "strong_fall_observed_d30",
+                "strong_fall_observed_rsi",
+                "strong_fall_observed_vwap_dist_bp",
+                "strong_fall_observed_rng15",
+            ):
+                if key in v143_wpr_profile:
+                    metrics[key] = v143_wpr_profile[key]
+            if v143_wpr_profile.get("profile_patch"):
+                profile_patch = str(v143_wpr_profile.get("profile_patch") or "")
+                metrics["promotion_version"] = "v1.4.20" if profile_patch.startswith("v1420_") else "v1.4.19" if profile_patch.startswith("v1419_") else "v1.4.15"
+            metrics.update(
+                {
+                    "wpr_partial_tp_pct": float(v143_wpr_profile["tp1_bp"]) / 10_000.0,
+                    "wpr_partial_exit_pct": float(v143_wpr_profile["partial_exit_pct"]),
+                    "wpr_max_sl_bp": float(v143_wpr_profile["sl_bp"]),
+                    "entry_model": f"post_only_maker_{float(v143_wpr_profile['entry_bp']):g}bp",
+                    "live_action": "live_canary_adaptive_profile",
+                }
+            )
         risk_tags = tuple(codex_decision.risk_tags) + (
             "v139_reprice_tiny_canary",
             "shadow_reprice_canary",
@@ -1722,23 +10657,68 @@ class MainnetOneRunManager:
         )
         if shadow_lane == "SH_WPR_L_S1":
             risk_tags = risk_tags + ("v139b_wpr_waiting_scratch", "wpr_discount_entry", "wpr_scratch_exit")
+        if shadow_lane == "SH_L1_ADVERSE_REPRICE_MR_LONG":
+            l1mr_block_reason, l1mr_guard_metrics = self._codex_v1424_l1mr_guard(features)
+            metrics = {**metrics, **l1mr_guard_metrics}
+            if l1mr_block_reason:
+                return replace(
+                    codex_decision,
+                    accepted=False,
+                    lane=lane_name_by_shadow.get(shadow_lane, lane_code),
+                    lane_code=lane_code,
+                    strategy=strategy,
+                    side=side,
+                    entry_offset_bp=entry_offset_bp,
+                    size_mult=0.0,
+                    notional_mult=0.0,
+                    requested_notional_usdc=0.0,
+                    reason=l1mr_block_reason,
+                    regime="v1424_l1mr_admission_guard",
+                    missing_features=(),
+                    metrics={**metrics, "policy_note": l1mr_block_reason, "policy_tag": l1mr_block_reason},
+                    policy_tag=l1mr_block_reason,
+                    shadow_lane=shadow_lane,
+                    risk_tags=tuple(dict.fromkeys((*risk_tags, l1mr_block_reason))),
+                )
+        if v143_wpr_profile is not None:
+            wpr_state_tag = str(v143_wpr_state or "unknown").split(":", 1)[-1].replace("-", "_")
+            risk_tags = risk_tags + (
+                v143_wpr_policy_tag,
+                f"wpr_state_{wpr_state_tag}",
+                f"entry{float(v143_wpr_profile['entry_bp']):g}",
+                f"tp{float(v143_wpr_profile['tp1_bp']):g}",
+                f"sl{float(v143_wpr_profile['sl_bp']):g}",
+                f"be{float(v143_wpr_profile['be_bp']):g}",
+                f"ttl{int(v143_wpr_profile['ttl_s'])}s",
+            )
+            if "full_tp_bp" in v143_wpr_profile:
+                risk_tags = risk_tags + (f"fulltp{float(v143_wpr_profile['full_tp_bp']):g}",)
+            if v143_wpr_profile.get("small_n_forward_watch"):
+                risk_tags = risk_tags + ("small_n_forward_watch",)
+            if v143_wpr_profile.get("profile_patch"):
+                risk_tags = risk_tags + (str(v143_wpr_profile["profile_patch"]),)
+        elif v143_wpr_state is not None:
+            risk_tags = risk_tags + ("v143_wpr_shadow_only",)
         if shadow_lane == "SH_WPR_L_S1":
             d30 = MainnetOneRunManager._codex_v1_shadow_feature_float(features, "d30")
             vwap_dist_bp = MainnetOneRunManager._codex_v1_shadow_feature_float(features, "vwap_dist_bp")
             reclaimed = MainnetOneRunManager._codex_v1_shadow_feature_float(features, "price_above_or_reclaimed_vwap")
             rsi = MainnetOneRunManager._codex_v1_shadow_feature_float(features, "rsi")
-            wpr_block_reason = None
-            if vwap_dist_bp is not None and vwap_dist_bp <= -100.0:
+            wpr_block_reason = v1419_wpr_block_reason
+            if wpr_block_reason is None and vwap_dist_bp is not None and vwap_dist_bp <= -100.0:
                 wpr_block_reason = "wpr_extreme_below_vwap_block"
-            elif d30 is not None and d30 <= -15.0 and reclaimed != 1.0:
-                wpr_block_reason = "wpr_down_tape_block"
-            elif (
-                vwap_dist_bp is not None
-                and vwap_dist_bp <= -5.0
-                and rsi is not None
-                and rsi < 40.0
-            ):
-                wpr_block_reason = "wpr_weak_below_vwap_block"
+            elif wpr_block_reason is None and v143_wpr_state is not None and v143_wpr_profile is None:
+                wpr_block_reason = "v143_wpr_missing_profile_shadow_only"
+            elif wpr_block_reason is None and v143_wpr_state is None:
+                if d30 is not None and d30 <= -15.0 and reclaimed != 1.0:
+                    wpr_block_reason = "wpr_down_tape_block"
+                elif (
+                    vwap_dist_bp is not None
+                    and vwap_dist_bp <= -5.0
+                    and rsi is not None
+                    and rsi < 40.0
+                ):
+                    wpr_block_reason = "wpr_weak_below_vwap_block"
             metrics = {
                 **metrics,
                 "wpr_guard_d30": d30,
@@ -1762,6 +10742,23 @@ class MainnetOneRunManager:
                     shadow_lane=shadow_lane,
                     risk_tags=risk_tags + (wpr_block_reason,),
                 )
+
+        if shadow_lane == "SH_WPR_L_S1" and v143_wpr_state is not None:
+            metrics["v1463_admission_lineage"] = {
+                "kind": CNL_SAFE_LINEAGE_KIND,
+                "source_reject_reason": str(
+                    raw_codex_decision.reason or ""
+                ),
+                "source_classifier_lane": str(
+                    raw_codex_decision.lane_code
+                    or raw_codex_decision.lane
+                    or "UNKNOWN"
+                ),
+                "mapped_shadow_lane": shadow_lane,
+                "promotion_source": "no_lane_shadow_reprice_canary",
+                "effective_lane": lane_code,
+                "market_state": v143_wpr_state,
+            }
 
         if daily_cap > 0 and count_24h >= daily_cap:
             block_reason = "v139_reprice_canary_daily_cap_block"
@@ -1791,12 +10788,12 @@ class MainnetOneRunManager:
             size_mult=notional_mult,
             notional_mult=notional_mult,
             requested_notional_usdc=fixed_notional,
-            reason="v139_reprice_canary_promoted",
-            regime="v139_reprice_canary",
+            reason=v143_wpr_policy_tag if v143_wpr_profile is not None else "v139_reprice_canary_promoted",
+            regime=v143_wpr_state if v143_wpr_profile is not None else "v139_reprice_canary",
             missing_features=(),
             risk_tags=risk_tags,
             metrics=metrics,
-            policy_tag="v139_reprice_tiny_canary",
+            policy_tag=v143_wpr_policy_tag if v143_wpr_profile is not None else "v139_reprice_tiny_canary",
             shadow_lane=shadow_lane,
         )
     async def _codex_v134_w6a_weak_drift_canary_count_24h(self) -> int:
@@ -1823,7 +10820,9 @@ class MainnetOneRunManager:
     ) -> str | None:
         if not codex_decision.accepted:
             return None
-        if codex_decision.lane == "w6_lane_s1long_rng38_86_range9_15_e0":
+        if codex_decision.lane == "w6_lane_s1long_rng38_86_range9_15_e0" or str(codex_decision.lane_code or "").upper() == "W6A":
+            if getattr(self._settings, "mainnet_codex_v143_w6a_shadow_only_enabled", True):
+                return "v143_w6a_shadow_only"
             if getattr(self._settings, "mainnet_codex_v137_w6a_risk_shadow_enabled", True):
                 return None
             drift30 = features.get("d30", features.get("drift30"))
@@ -1946,12 +10945,29 @@ class MainnetOneRunManager:
         codex_decision: CodexV1Decision,
     ) -> WildcatLiveDecision:
         base_notional = self._settings.mainnet_effective_entry_notional_usdc
-        requested_notional = max(0.0, base_notional * max(0.0, codex_decision.notional_mult))
+        lane_code = str(codex_decision.lane_code or "").upper()
+        computed_requested_notional = max(0.0, base_notional * max(0.0, codex_decision.notional_mult))
+        requested_notional = computed_requested_notional
+        requested_notional_cap = None
+        try:
+            requested_notional_cap = float(getattr(codex_decision, "requested_notional_usdc", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            requested_notional_cap = None
+        requested_notional_hard_capped = (
+            requested_notional_cap is not None
+            and math.isfinite(requested_notional_cap)
+            and lane_code == "S1P-L"
+            and requested_notional_cap > 0
+            and requested_notional_cap < requested_notional
+        )
+        if requested_notional_hard_capped:
+            requested_notional = requested_notional_cap
         max_notional = self._settings.mainnet_effective_max_cumulative_notional_usdc
         if self._settings.mainnet_codex_v1_max_notional_usdc > 0:
             max_notional = min(max_notional, self._settings.mainnet_codex_v1_max_notional_usdc)
-        metrics = getattr(codex_decision, "metrics", None) or {}
-        applied_cap = metrics.get("applied_notional_cap_usdc") if isinstance(metrics, Mapping) else None
+        metrics_raw = getattr(codex_decision, "metrics", None) or {}
+        metrics = metrics_raw if isinstance(metrics_raw, Mapping) else {}
+        applied_cap = metrics.get("applied_notional_cap_usdc")
         try:
             applied_cap_value = float(applied_cap) if applied_cap is not None else None
         except (TypeError, ValueError):
@@ -1959,39 +10975,111 @@ class MainnetOneRunManager:
         if applied_cap_value is not None and math.isfinite(applied_cap_value) and applied_cap_value > 0:
             max_notional = min(max_notional, applied_cap_value)
         applied_notional = min(requested_notional, max_notional)
-        lane_code = str(codex_decision.lane_code or "").upper()
+        min_entry_notional_lifted = 0.0 < applied_notional < MAINNET_MIN_ENTRY_NOTIONAL_USDC
+        if min_entry_notional_lifted:
+            applied_notional = MAINNET_MIN_ENTRY_NOTIONAL_USDC
         wpr_profile = lane_code == "CNL-WPR-L"
+        adaptive_profiles_enabled = bool(getattr(self._settings, "mainnet_codex_v143_adaptive_exec_enabled", True))
+        profile_metrics = metrics if adaptive_profiles_enabled else {}
+        profile_entry_bp = self._codex_v143_metric_float(profile_metrics, "entry_bp")
+        profile_tp1_bp = self._codex_v143_metric_float(profile_metrics, "tp1_bp")
+        profile_full_tp_bp = self._codex_v143_metric_float(profile_metrics, "full_tp_bp")
+        profile_partial_exit_pct = self._codex_v143_metric_float(profile_metrics, "partial_exit_pct")
+        profile_sl_bp = self._codex_v143_metric_float(profile_metrics, "sl_bp")
+        profile_be_bp = self._codex_v143_metric_float(profile_metrics, "be_bp")
+        profile_ttl_s = self._codex_v143_metric_float(profile_metrics, "ttl_s")
+        profile_state = str(profile_metrics.get("market_state") or profile_metrics.get("v143_market_state") or "").strip()
+        adaptive_profile_used = any(
+            value is not None
+            for value in (
+                profile_entry_bp,
+                profile_tp1_bp,
+                profile_full_tp_bp,
+                profile_partial_exit_pct,
+                profile_sl_bp,
+                profile_be_bp,
+                profile_ttl_s,
+            )
+        )
+        effective_side = str(codex_decision.side or decision.side or "").upper()
+        if effective_side not in {"LONG", "SHORT"}:
+            effective_side = str(decision.side or "").upper()
+        side_overridden = effective_side != str(decision.side or "").upper()
+
+        if profile_entry_bp is not None and profile_entry_bp >= 0:
+            codex_decision = replace(codex_decision, entry_offset_bp=profile_entry_bp)
+        elif lane_code == "STUP-S":
+            stups_offset = float(getattr(self._settings, "mainnet_codex_stups_entry_offset_bp", 1.0))
+            codex_decision = replace(codex_decision, entry_offset_bp=stups_offset)
+        elif lane_code == "W6A":
+            w6a_offset = float(getattr(self._settings, "mainnet_codex_w6a_entry_offset_bp", 0.0))
+            codex_decision = replace(codex_decision, entry_offset_bp=w6a_offset)
+
         partial_tp_pct = decision.partial_tp_pct
         partial_exit_pct = decision.partial_exit_pct
         if self._use_codex_v138_w6a_exit_policy(codex_decision.lane_code):
             partial_tp_pct = self._codex_v138_w6a_partial_tp_pct()
+            partial_exit_pct = float(getattr(self._settings, "mainnet_codex_w6a_partial_exit_pct", 1.00))
         if wpr_profile:
             partial_tp_pct = self._codex_v139b_wpr_partial_tp_pct()
             partial_exit_pct = self._codex_v139b_wpr_partial_exit_pct()
+        elif lane_code == "STUP-S":
+            partial_tp_pct = float(getattr(self._settings, "mainnet_codex_stups_partial_tp_pct", 0.0008))
+            partial_exit_pct = float(getattr(self._settings, "mainnet_codex_stups_partial_exit_pct", 1.00))
+        if profile_tp1_bp is not None and profile_tp1_bp > 0:
+            partial_tp_pct = profile_tp1_bp / 10_000.0
+        if profile_partial_exit_pct is not None and 0.0 < profile_partial_exit_pct <= 1.0:
+            partial_exit_pct = profile_partial_exit_pct
 
         entry_ref = self._codex_v1_entry_reference_price(
             decision.signal.price,
-            decision.side,
+            effective_side,
             codex_decision.entry_offset_bp or 0.0,
         )
         stop_loss = decision.signal.stop_loss
-        if wpr_profile and entry_ref > 0:
+
+        max_sl_bp = None
+        if wpr_profile:
             max_sl_bp = self._codex_v139b_wpr_max_sl_bp()
-            if decision.side == "LONG":
+        elif lane_code == "STUP-S":
+            max_sl_bp = float(getattr(self._settings, "mainnet_codex_stups_max_sl_bp", 6.0))
+        elif lane_code == "W6A":
+            max_sl_bp = float(getattr(self._settings, "mainnet_codex_w6a_max_sl_bp", 20.0))
+        if profile_sl_bp is not None and profile_sl_bp > 0:
+            max_sl_bp = profile_sl_bp
+
+        v1465_exact_sl = bool(
+            lane_code == "W6A"
+            and profile_metrics.get("v1465_exact_sl_enabled") is True
+        )
+        if max_sl_bp is not None and entry_ref > 0:
+            if v1465_exact_sl and effective_side == "LONG":
+                stop_loss = entry_ref * (1 - max_sl_bp / 10_000.0)
+            elif v1465_exact_sl and effective_side == "SHORT":
+                stop_loss = entry_ref * (1 + max_sl_bp / 10_000.0)
+            elif effective_side == "LONG":
                 sl_floor = entry_ref * (1 - max_sl_bp / 10_000.0)
-                if stop_loss is None or stop_loss <= 0 or stop_loss < sl_floor:
+                stop_wrong_side = side_overridden and stop_loss is not None and stop_loss >= entry_ref
+                if stop_loss is None or stop_loss <= 0 or stop_wrong_side or stop_loss < sl_floor:
                     stop_loss = sl_floor
-            elif decision.side == "SHORT":
+            elif effective_side == "SHORT":
                 sl_ceiling = entry_ref * (1 + max_sl_bp / 10_000.0)
-                if stop_loss is None or stop_loss <= 0 or stop_loss > sl_ceiling:
+                stop_wrong_side = side_overridden and stop_loss is not None and stop_loss <= entry_ref
+                if stop_loss is None or stop_loss <= 0 or stop_wrong_side or stop_loss > sl_ceiling:
                     stop_loss = sl_ceiling
         effective_sl_pct = decision.sl_pct
-        if wpr_profile and entry_ref > 0 and stop_loss is not None and stop_loss > 0:
+        if max_sl_bp is not None and entry_ref > 0 and stop_loss is not None and stop_loss > 0:
             effective_sl_pct = abs(entry_ref - stop_loss) / entry_ref
-        if decision.side == "LONG":
-            take_profit = entry_ref * (1 + decision.tp_pct)
+        if profile_full_tp_bp is not None and profile_full_tp_bp > 0:
+            effective_tp_pct = profile_full_tp_bp / 10_000.0
+        elif profile_tp1_bp is not None and profile_tp1_bp > 0:
+            effective_tp_pct = partial_tp_pct
         else:
-            take_profit = entry_ref * (1 - decision.tp_pct)
+            effective_tp_pct = max(decision.tp_pct, partial_tp_pct)
+        if effective_side == "LONG":
+            take_profit = entry_ref * (1 + effective_tp_pct)
+        else:
+            take_profit = entry_ref * (1 - effective_tp_pct)
         leverage = max(1, int(self._settings.mainnet_leverage))
         reasons = list(decision.signal.reasons or [])
         reasons.extend(
@@ -2005,19 +11093,56 @@ class MainnetOneRunManager:
         )
         if getattr(codex_decision, "metrics", None) and codex_decision.metrics.get("policy_note"):
             reasons.append(f"codex_v1_policy_note:{codex_decision.metrics['policy_note']}")
+        if profile_metrics.get("v1433_side_override_guarded"):
+            reasons.append(f"codex_v1433_clean_high_side_override_guard:{profile_metrics.get('v1433_guarded_side', 'SHORT')}_kept")
+        if side_overridden:
+            if getattr(codex_decision, "metrics", None) and codex_decision.metrics.get("v1423_action"):
+                reasons.append(f"codex_v1423_side_override:{decision.side}->{effective_side}")
+            else:
+                reasons.append(f"codex_v1421_side_override:{decision.side}->{effective_side}")
         if self._use_codex_v138_w6a_exit_policy(codex_decision.lane_code):
             reasons.append(f"codex_v138_w6a_partial_tp_pct:{partial_tp_pct:g}")
-        if wpr_profile:
+            reasons.append(f"codex_v142_w6a_partial_exit_pct:{partial_exit_pct:g}")
+            if max_sl_bp is not None:
+                reasons.append(f"codex_v142_w6a_max_sl_bp:{max_sl_bp:g}")
+        if min_entry_notional_lifted:
+            reasons.append(f"codex_v1_min_entry_notional_usdc:{MAINNET_MIN_ENTRY_NOTIONAL_USDC:g}")
+        if adaptive_profile_used:
+            if profile_state:
+                reasons.append(f"codex_v143_profile_state:{profile_state}")
+            reasons.append(f"codex_v143_partial_tp_pct:{partial_tp_pct:g}")
+            reasons.append(f"codex_v143_partial_exit_pct:{partial_exit_pct:g}")
+            if max_sl_bp is not None:
+                reasons.append(f"codex_v143_max_sl_bp:{max_sl_bp:g}")
+            if profile_be_bp is not None:
+                reasons.append(f"codex_v143_be_bp:{profile_be_bp:g}")
+            if profile_full_tp_bp is not None:
+                reasons.append(f"codex_v145_full_tp_bp:{profile_full_tp_bp:g}")
+            if profile_ttl_s is not None:
+                reasons.append(f"codex_v143_ttl_s:{profile_ttl_s:g}")
+        elif wpr_profile:
             reasons.append(f"codex_v139b_wpr_partial_tp_pct:{partial_tp_pct:g}")
             reasons.append(f"codex_v139b_wpr_partial_exit_pct:{partial_exit_pct:g}")
             reasons.append(f"codex_v139b_wpr_max_sl_bp:{self._codex_v139b_wpr_max_sl_bp():g}")
+        elif lane_code == "STUP-S":
+            reasons.append(f"codex_v142_stups_partial_tp_pct:{partial_tp_pct:g}")
+            reasons.append(f"codex_v142_stups_partial_exit_pct:{partial_exit_pct:g}")
+            if max_sl_bp is not None:
+                reasons.append(f"codex_v142_stups_max_sl_bp:{max_sl_bp:g}")
         risk_notes = list(decision.signal.risk_notes or [])
         risk_notes.append("codex_v1_execution_gate")
-        if applied_notional < requested_notional:
+        if requested_notional_hard_capped or applied_notional < computed_requested_notional:
             risk_notes.append("codex_v1_notional_capped")
+        if min_entry_notional_lifted:
+            risk_notes.append("codex_v1_min_entry_notional_floor")
+        if profile_metrics.get("v1433_side_override_guarded"):
+            risk_notes.append("codex_v1433_side_override_guarded")
+        if side_overridden:
+            risk_notes.append("codex_v1_side_overridden")
 
         new_signal = replace(
             decision.signal,
+            action="BUY" if effective_side == "LONG" else "SELL",
             entries=[entry_ref],
             stop_loss=stop_loss,
             take_profits=[take_profit],
@@ -2030,6 +11155,9 @@ class MainnetOneRunManager:
         return replace(
             decision,
             signal=new_signal,
+            strategy=str(codex_decision.strategy or decision.strategy),
+            side=effective_side,
+            tp_pct=effective_tp_pct,
             partial_tp_pct=partial_tp_pct,
             partial_exit_pct=partial_exit_pct,
             sl_pct=effective_sl_pct,
@@ -2049,7 +11177,7 @@ class MainnetOneRunManager:
             pct = float(getattr(self._settings, "mainnet_codex_v139b_wpr_partial_exit_pct", 0.60) or 0.60)
         except (TypeError, ValueError):
             pct = 0.60
-        if not math.isfinite(pct) or pct <= 0 or pct >= 1:
+        if not math.isfinite(pct) or pct <= 0 or pct > 1:
             return 0.60
         return pct
 
@@ -2239,6 +11367,40 @@ class MainnetOneRunManager:
         return ":".join(part.replace(":", "_") for part in parts)
 
     @staticmethod
+    def _codex_v1424_l1mr_guard(features: Mapping[str, Any]) -> tuple[str | None, dict[str, Any]]:
+        d30 = MainnetOneRunManager._codex_v1_shadow_feature_float(features, "d30")
+        slope60 = MainnetOneRunManager._codex_v1_shadow_feature_float(features, "slope60")
+        slope120 = MainnetOneRunManager._codex_v1_shadow_feature_float(features, "slope120")
+        vwap_dist_bp = MainnetOneRunManager._codex_v1_shadow_feature_float(features, "vwap_dist_bp")
+        rng15 = MainnetOneRunManager._codex_v1_shadow_feature_float(features, "rng15")
+        range_pos_15 = MainnetOneRunManager._codex_v1_shadow_feature_float(features, "range_pos_15")
+        rsi = MainnetOneRunManager._codex_v1_shadow_feature_float(features, "rsi")
+        guard_metrics: dict[str, Any] = {
+            "l1mr_guard_d30": d30,
+            "l1mr_guard_slope60": slope60,
+            "l1mr_guard_slope120": slope120,
+            "l1mr_guard_vwap_dist_bp": vwap_dist_bp,
+            "l1mr_guard_rng15": rng15,
+            "l1mr_guard_range_pos_15": range_pos_15,
+            "l1mr_guard_rsi": rsi,
+            "l1mr_guard_reason": None,
+        }
+        block_reason = "v1424_l1mr_strong_fall_long_block"
+        if (
+            d30 is not None
+            and d30 <= -60.0
+            and slope60 is not None
+            and slope60 <= -5.0
+            and slope120 is not None
+            and slope120 <= -20.0
+            and vwap_dist_bp is not None
+            and vwap_dist_bp <= -15.0
+        ):
+            guard_metrics["l1mr_guard_reason"] = block_reason
+            return block_reason, guard_metrics
+        return None, guard_metrics
+
+    @staticmethod
     def _codex_v1_no_lane_shadow_lane(
         reason: str,
         decision: WildcatLiveDecision,
@@ -2360,6 +11522,84 @@ class MainnetOneRunManager:
                 "candidate_lane": "W6A",
             }
         return None
+
+    @staticmethod
+    def _v1461_gate_taxonomy(
+        reason: str,
+        lane_code: str,
+    ) -> tuple[str, str, bool]:
+        """Return stable family, class and promotion eligibility for a reject.
+
+        The taxonomy is intentionally coarse.  Unknown legacy rejects are
+        captured for audit/replay but cannot create a paid admission until a
+        reviewed family mapping is added.
+        """
+
+        normalized = str(reason or "UNKNOWN").strip().lower()
+        lane = str(lane_code or "UNKNOWN").strip().upper()
+        safety_tokens = (
+            "identity",
+            "integrity",
+            "orphan",
+            "late_fill",
+            "reconciliation",
+            "preflight",
+            "missing_feature",
+            "shock",
+            "counter_recoil",
+        )
+        if any(token in normalized for token in safety_tokens):
+            return "SAFETY_INTEGRITY", "SAFETY", False
+        if any(
+            token in normalized
+            for token in ("daily_limit", "canary_limit", "session_limit")
+        ):
+            return "GOVERNANCE_LIMIT", "GOVERNANCE", False
+        if any(
+            token in normalized
+            for token in (
+                "risk_cap_too_small",
+                "bad_payoff",
+                "payoff_geometry",
+                "min_notional",
+                "max_notional",
+            )
+        ):
+            return "PAYOFF_OR_SIZING", "SIZING", False
+        if "loss_prune" in normalized or "loss-prune" in normalized:
+            return "LOSS_PRUNE", "ENTRY_ADMISSION", True
+        if normalized in {
+            "hot_up_extension_short_blocked",
+            "mid_up_extension_short_blocked",
+            "stale_short_after_upmove_blocked",
+        }:
+            family = {
+                "hot_up_extension_short_blocked": "HOT_UP_EXTENSION_SHORT",
+                "mid_up_extension_short_blocked": "MID_UP_EXTENSION_SHORT",
+                "stale_short_after_upmove_blocked": "STALE_UPMOVE_SHORT",
+            }[normalized]
+            return family, "ENTRY_ADMISSION", True
+        if lane == "W6A" or "w6a" in normalized or "w6_" in normalized:
+            if any(token in normalized for token in ("cap50", "force50", "keep200", "promo")):
+                return "W6A_SIZING", "SIZING", False
+            return "W6A_ENTRY_RISK", "ENTRY_ADMISSION", True
+        if lane in {"W6B", "W6C"}:
+            return f"{lane}_ENTRY_RISK", "ENTRY_ADMISSION", True
+        if lane == "W2A" or "w2a" in normalized:
+            return "W2A_PROFILE_SHADOW", "ENTRY_ADMISSION", True
+        if "velocity" in normalized:
+            return "VELOCITY", "ENTRY_ADMISSION", True
+        if "drift" in normalized:
+            return "DRIFT", "ENTRY_ADMISSION", True
+        if "rng" in normalized or "range" in normalized:
+            return "RANGE_POSITION", "ENTRY_ADMISSION", True
+        if "stale" in normalized:
+            return "STALE", "ENTRY_ADMISSION", True
+        if "hot" in normalized:
+            return "HOT_EXTENSION", "ENTRY_ADMISSION", True
+        if "shadow_only" in normalized and lane not in {"", "UNKNOWN", "NONE"}:
+            return f"{lane}_PROFILE_SHADOW", "ENTRY_ADMISSION", True
+        return "LEGACY_UNCLASSIFIED", "UNCLASSIFIED", False
 
     def _codex_v1_map_block_to_shadow_lane(
         self,
@@ -2489,6 +11729,71 @@ class MainnetOneRunManager:
                 "shadow_reprice_state": meta.get("shadow_reprice_state", reprice_state),
             }
 
+        # v1.4.61 capture invariant: every valid raw candidate that reaches a
+        # final strategy reject must have a durable counterfactual opportunity.
+        # Keep existing specialised lanes above; this generic fallback prevents
+        # W6B/W6C and future legacy gates from silently disappearing.  Unknown
+        # families remain observation-only until explicitly classified.
+        if (
+            bool(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1461_shadow_all_strategy_rejects_enabled",
+                    False,
+                )
+            )
+            and bool(raw_codex_decision.accepted)
+            and not bool(codex_decision.accepted)
+        ):
+            gate_family, gate_class, promotion_eligible = self._v1461_gate_taxonomy(
+                reason,
+                lane_code,
+            )
+            safe_family = re.sub(r"[^A-Z0-9_]+", "_", gate_family.upper()).strip("_")
+            return {
+                "shadow_lane": f"SH_V1461_{safe_family or 'LEGACY_UNCLASSIFIED'}",
+                "candidate_lane": lane_code or str(raw_codex_decision.lane or "UNKNOWN"),
+                "mapping_reason": reason or "legacy_strategy_reject",
+                "secondary_reasons": [],
+                "fill_model": "limit_touch",
+                "shadow_lane_family": "V1461_LEGACY_GATE",
+                "shadow_lane_reason": "final_strategy_reject_fallback",
+                "shadow_reprice_state": reprice_state,
+                "gate_family_id": gate_family,
+                "gate_class": gate_class,
+                "promotion_eligible": promotion_eligible,
+            }
+
+        # v1.4.62 Shadow-all is deliberately broader than the promotable
+        # v1.4.61 taxonomy: every non-live lane/state, including raw no-lane
+        # and unknown/fallback candidates, receives an observation identity.
+        if bool(
+            getattr(
+                self._settings,
+                "mainnet_codex_v1462_shadow_all_enabled",
+                False,
+            )
+        ):
+            safe_lane = re.sub(
+                r"[^A-Z0-9_]+",
+                "_",
+                (lane_code or "UNKNOWN").upper(),
+            ).strip("_")
+            return {
+                "shadow_lane": f"SH_V1462_{safe_lane or 'UNKNOWN'}",
+                "candidate_lane": lane_code
+                or str(raw_codex_decision.lane or "UNKNOWN"),
+                "mapping_reason": reason or "v1462_deny_default",
+                "secondary_reasons": [],
+                "fill_model": "limit_touch",
+                "shadow_lane_family": "V1462_DENY_DEFAULT",
+                "shadow_lane_reason": "v1462_non_live_candidate",
+                "shadow_reprice_state": reprice_state,
+                "gate_family_id": "V1462_DENY_DEFAULT",
+                "gate_class": "ENTRY_ADMISSION",
+                "promotion_eligible": False,
+            }
+
         return None
 
     @staticmethod
@@ -2608,11 +11913,6 @@ class MainnetOneRunManager:
         if not replaceable:
             return False
         _priority, _start_ms, old_key, old_sample = sorted(replaceable, key=lambda item: (-item[0], item[1]))[0]
-        self._codex_v1_shadow_samples.pop(old_key, None)
-        self._codex_v1_shadow_sample_counts_by_run[run_id] = max(
-            0,
-            self._codex_v1_shadow_sample_counts_by_run.get(run_id, 0) - 1,
-        )
         drop = {
             key: old_sample.get(key)
             for key in (
@@ -2651,6 +11951,7 @@ class MainnetOneRunManager:
                 "policy_tag",
             )
         }
+        drop.update(self._v1464_shadow_drop_attribution(old_sample))
         drop.update(
             {
                 "event_type": "shadow_sample_dropped",
@@ -2664,15 +11965,829 @@ class MainnetOneRunManager:
             }
         )
         await self._repo.log_event(run_id, "entry_codex_v1_shadow_sample_dropped", drop)
+        await self._v1464_project_shadow_drop(drop)
+        # The durable drop is authoritative.  Keep the old sample available
+        # for evaluation/retry if the DB write raises.
+        self._codex_v1_shadow_samples.pop(old_key, None)
+        self._codex_v1_shadow_sample_counts_by_run[run_id] = max(
+            0,
+            self._codex_v1_shadow_sample_counts_by_run.get(run_id, 0) - 1,
+        )
         return True
+
+    def _v1464_shadow_drop_attribution(
+        self,
+        source: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Keep every true collection drop attributable without widening scope."""
+
+        payload = dict(source or {})
+        ticket = (
+            payload.get("pre_reject_candidate_ticket")
+            if isinstance(payload.get("pre_reject_candidate_ticket"), Mapping)
+            else payload.get("candidate_ticket")
+        )
+        if not isinstance(ticket, Mapping):
+            ticket = {}
+        lane_code = str(
+            payload.get("effective_lane")
+            or ticket.get("effective_lane")
+            or payload.get("lane_code")
+            or payload.get("legacy_lane_code")
+            or payload.get("candidate_lane")
+            or ""
+        ).strip().upper()
+        try:
+            registry_lane = v1462_lane_for(lane_code)
+        except KeyError:
+            attribution_scope = "OUT_OF_REGISTRY"
+            safe_lane = re.sub(
+                r"[^A-Z0-9_]+",
+                "_",
+                lane_code or "UNKNOWN",
+            ).strip("_")
+            monitor_lane_code = str(
+                payload.get("shadow_lane")
+                or f"SH_OUT_OF_REGISTRY_{safe_lane or 'UNKNOWN'}"
+            ).strip().upper()
+            if not monitor_lane_code.startswith("SH_"):
+                monitor_lane_code = (
+                    f"SH_OUT_OF_REGISTRY_{safe_lane or 'UNKNOWN'}"
+                )
+        else:
+            attribution_scope = "LEGACY_REGISTRY"
+            monitor_lane_code = lane_code
+        result = {
+            key: payload.get(key)
+            for key in (
+                "registry_version",
+                "registry_hash",
+                "lane_definition_hash",
+                "v1462_policy_hash",
+                "admission_policy_hash",
+                "profile_identity_schema",
+                "resolved_profile_hash",
+                "environment",
+                "symbol",
+                "classifier_lane",
+                "classifier_side",
+                "effective_side",
+                "strategy",
+                "market_state",
+                "mode",
+                "final_route",
+                "diagnostic_only",
+            )
+        }
+        if attribution_scope == "LEGACY_REGISTRY":
+            result.update(
+                {
+                    "registry_version": (
+                        result.get("registry_version")
+                        or V1462_REGISTRY_VERSION
+                    ),
+                    "registry_hash": (
+                        result.get("registry_hash")
+                        or V1462_REGISTRY_HASH
+                    ),
+                    "lane_definition_hash": (
+                        result.get("lane_definition_hash")
+                        or v1462_lane_definition_hash(registry_lane)
+                    ),
+                    "v1462_policy_hash": (
+                        result.get("v1462_policy_hash")
+                        or V1462_POLICY_HASH
+                    ),
+                    "admission_policy_hash": (
+                        result.get("admission_policy_hash")
+                        or V1462_POLICY_HASH
+                    ),
+                    "profile_identity_schema": (
+                        result.get("profile_identity_schema")
+                        or "v1464.stable-profile.1"
+                    ),
+                }
+            )
+        result.update(
+            {
+                # Out-of-registry candidates must remain quarantined and
+                # visible, but must not become a global blocker for every
+                # registered lane.  Preserve their real code explicitly while
+                # routing the legacy lane field to the existing SH_* namespace.
+                "lane_code": monitor_lane_code or None,
+                "legacy_lane_code": (
+                    payload.get("legacy_lane_code")
+                    or (lane_code if attribution_scope == "LEGACY_REGISTRY" else None)
+                ),
+                "effective_lane": ticket.get("effective_lane") or lane_code or None,
+                "attribution_lane_code": lane_code or None,
+                "out_of_registry_lane_code": (
+                    lane_code if attribution_scope == "OUT_OF_REGISTRY" else None
+                ),
+                "attribution_scope": attribution_scope,
+                # Compatibility for pre-v1.4.64 offline consumers.
+                "registry_scope": attribution_scope,
+            }
+        )
+        return result
+
+    async def _v1464_opportunity_already_terminal(
+        self,
+        opportunity_id: str,
+    ) -> bool:
+        durable_id = str(opportunity_id or "")
+        if not durable_id:
+            return False
+        if durable_id in self._v1464_terminal_opportunity_ids:
+            return True
+        runtime = self._v1464_promotion_runtime
+        getter = (
+            getattr(runtime.repository, "get_evidence", None)
+            if runtime is not None
+            else None
+        )
+        if not callable(getter):
+            return False
+        try:
+            row = await getter(durable_id)
+        except Exception as exc:  # noqa: BLE001 - collection fails closed
+            logger.error(
+                "v1464_terminal_opportunity_lookup_failed",
+                opportunity_id=durable_id,
+                error=str(exc)[:200],
+            )
+            return True
+        if row is None:
+            return False
+        self._v1464_terminal_opportunity_ids.add(durable_id)
+        return True
+
+    async def _v1464_project_shadow_outcome(
+        self,
+        details: Mapping[str, Any],
+    ) -> None:
+        """Project a durable legacy outcome into the exact v1.4.64 ledger."""
+
+        runtime = self._v1464_promotion_runtime
+        if runtime is None:
+            return
+        durable_opportunity_id = str(
+            details.get("v1462_opportunity_id") or ""
+        )
+        if durable_opportunity_id:
+            self._v1464_terminal_opportunity_ids.add(
+                durable_opportunity_id
+            )
+        try:
+            await runtime.project_shadow_outcome(
+                details,
+                int(time.time() * 1000),
+            )
+        except Exception as exc:  # noqa: BLE001 - authority latches unhealthy
+            logger.error(
+                "v1464_shadow_outcome_projection_failed",
+                opportunity_id=details.get("opportunity_id"),
+                error=str(exc)[:200],
+            )
+
+    async def _v1464_project_shadow_drop(
+        self,
+        details: Mapping[str, Any],
+    ) -> None:
+        """Project only a true durable collection drop; benign dedupe skips."""
+
+        runtime = self._v1464_promotion_runtime
+        if runtime is None:
+            return
+        durable_opportunity_id = str(
+            details.get("v1462_opportunity_id") or ""
+        )
+        if durable_opportunity_id:
+            self._v1464_terminal_opportunity_ids.add(
+                durable_opportunity_id
+            )
+        try:
+            await runtime.project_shadow_drop(
+                details,
+                int(time.time() * 1000),
+            )
+        except Exception as exc:  # noqa: BLE001 - authority latches unhealthy
+            logger.error(
+                "v1464_shadow_drop_projection_failed",
+                opportunity_id=details.get("opportunity_id"),
+                error=str(exc)[:200],
+            )
+
+    @staticmethod
+    def _v1465_jsonable(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return {
+                str(key): MainnetOneRunManager._v1465_jsonable(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return [
+                MainnetOneRunManager._v1465_jsonable(item)
+                for item in value
+            ]
+        return value
+
+    async def _v1465_recompute_w6a_selection(
+        self,
+        selector: W6ASelector,
+        *,
+        now_ms: int,
+        source_run_id: str,
+    ) -> None:
+        repo = self._v1465_w6a_profile_repo
+        if (
+            repo is None
+            or not bool(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1465_w6a_profile_selector_enabled",
+                    False,
+                )
+            )
+        ):
+            return
+        window_start_ms = max(
+            0,
+            now_ms
+            - DEFAULT_W6A_WINDOW_CONFIG.guard_window_seconds * 1000,
+        )
+        unfiltered_rows = await repo.list_evidence(
+            selector,
+            window_start_ms=window_start_ms,
+            as_of_ms=now_ms,
+            eligible_only=False,
+        )
+        expected_profile_hashes = {
+            profile_id: self._v1465_w6a_profile_hash(profile_id)
+            for profile_id in W6A_PROFILES
+        }
+        exact_rows: list[dict[str, Any]] = []
+        identity_exclusions: dict[str, int] = {}
+        for row in unfiltered_rows:
+            profile_id = str(row.get("profile_id") or "").upper()
+            expected_hash = expected_profile_hashes.get(profile_id)
+            exclusion_reason: str | None = None
+            if expected_hash is None:
+                exclusion_reason = "profile_id_out_of_registry"
+            elif str(row.get("resolved_profile_hash") or "") != expected_hash:
+                exclusion_reason = "resolved_profile_hash_mismatch"
+            elif str(row.get("profile_plan_hash") or "") != expected_hash:
+                exclusion_reason = "profile_plan_hash_mismatch"
+            if exclusion_reason is not None:
+                identity_exclusions[exclusion_reason] = (
+                    identity_exclusions.get(exclusion_reason, 0) + 1
+                )
+                continue
+            exact_rows.append(row)
+        rows_by_opportunity: dict[str, list[dict[str, Any]]] = {}
+        for row in exact_rows:
+            rows_by_opportunity.setdefault(
+                str(row.get("opportunity_id") or ""),
+                [],
+            ).append(row)
+        expected_profile_ids = set(expected_profile_hashes)
+        rows = []
+        for opportunity_rows in rows_by_opportunity.values():
+            observed_profile_ids = {
+                str(row.get("profile_id") or "").upper()
+                for row in opportunity_rows
+            }
+            if (
+                len(opportunity_rows) != len(expected_profile_ids)
+                or observed_profile_ids != expected_profile_ids
+            ):
+                identity_exclusions["paired_profile_set_incomplete"] = (
+                    identity_exclusions.get(
+                        "paired_profile_set_incomplete",
+                        0,
+                    )
+                    + 1
+                )
+                continue
+            parse_results = [
+                parse_w6a_profile_evidence(row, as_of_ms=now_ms)
+                for row in opportunity_rows
+            ]
+            if any(result.evidence is None for result in parse_results):
+                identity_exclusions["paired_profile_set_not_evaluable"] = (
+                    identity_exclusions.get(
+                        "paired_profile_set_not_evaluable",
+                        0,
+                    )
+                    + 1
+                )
+                continue
+            if len(
+                {
+                    int(row.get("observed_at_ms") or -1)
+                    for row in opportunity_rows
+                }
+            ) != 1:
+                identity_exclusions["paired_observation_time_mismatch"] = (
+                    identity_exclusions.get(
+                        "paired_observation_time_mismatch",
+                        0,
+                    )
+                    + 1
+                )
+                continue
+            rows.extend(opportunity_rows)
+        # A CAS conflict means another worker evaluated a potentially newer
+        # evidence revision.  Never retry with this method's stale row set.
+        for attempt in range(1):
+            current = await repo.get_selection(selector)
+            current_winner = None
+            current_identity_valid = False
+            if (
+                current is not None
+                and str(current.get("status") or "") in {
+                    "SHADOW",
+                    "PROBATION",
+                    "LIVE",
+                }
+                and int(current.get("expires_at_ms") or 0) > now_ms
+            ):
+                candidate_current_winner = str(
+                    current.get("winner_profile_id") or ""
+                ).upper()
+                current_identity_valid = bool(
+                    candidate_current_winner in expected_profile_hashes
+                    and str(
+                        current.get("winner_resolved_profile_hash") or ""
+                    )
+                    == expected_profile_hashes[candidate_current_winner]
+                    and str(current.get("policy_hash") or "")
+                    == self._v1465_w6a_selector_policy_hash()
+                )
+                if current_identity_valid:
+                    current_winner = candidate_current_winner
+            decision = select_w6a_winner(
+                rows,
+                now_ms,
+                current_winner_profile_id=current_winner,
+            )
+            generation = int(current.get("generation") or 0) if current else 0
+            revision_source = [
+                (
+                    str(row.get("evidence_id") or ""),
+                    str(row.get("evidence_hash") or ""),
+                )
+                for row in rows
+            ]
+            revision = hashlib.sha256(
+                json.dumps(
+                    revision_source,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest()
+            snapshot = {
+                "as_of_ms": now_ms,
+                "window_start_ms": window_start_ms,
+                "reason": decision.reason,
+                "winner_profile_id": decision.winner_profile_id,
+                "previous_profile_id": decision.previous_profile_id,
+                "metrics": self._v1465_jsonable(decision.metrics),
+                "blockers": self._v1465_jsonable(decision.blockers),
+                "identity_exclusions": identity_exclusions,
+                "summaries": {
+                    profile_id: {
+                        "eligible": summary.eligible,
+                        "blockers": list(summary.blockers),
+                        "metrics": self._v1465_jsonable(summary.metrics),
+                    }
+                    for profile_id, summary in decision.summaries.items()
+                },
+            }
+            try:
+                if decision.winner_profile_id is None:
+                    if current is None or str(
+                        current.get("status") or ""
+                    ) in {"DEMOTED", "EXPIRED"}:
+                        return
+                    updated = await repo.demote_selection(
+                        selector,
+                        expected_generation=generation,
+                        reason="no_eligible_profile",
+                        event_time_ms=now_ms,
+                        idempotency_key=(
+                            f"v1465-demote:{selector.key}:{revision}"
+                        ),
+                        actor=self._v1465_owner_id,
+                    )
+                else:
+                    enforcement_enabled = bool(
+                        getattr(
+                            self._settings,
+                            (
+                                "mainnet_codex_v1465_w6a_profile_"
+                                "enforcement_enabled"
+                            ),
+                            False,
+                        )
+                    )
+                    paid_state_allowed = selector.market_state != "falling_trap"
+                    status = (
+                        "LIVE"
+                        if enforcement_enabled and paid_state_allowed
+                        else "SHADOW"
+                    )
+                    lease_ttl_s = int(
+                        getattr(
+                            self._settings,
+                            (
+                                "mainnet_codex_v1465_w6a_profile_"
+                                "lease_ttl_seconds"
+                            ),
+                            decision.lease_ttl_seconds,
+                        )
+                        or decision.lease_ttl_seconds
+                    )
+                    issued_at_ms = now_ms
+                    if (
+                        current is not None
+                        and str(current.get("winner_profile_id") or "")
+                        == decision.winner_profile_id
+                        and str(current.get("status") or "") == status
+                    ):
+                        issued_at_ms = int(
+                            current.get("issued_at_ms") or now_ms
+                        )
+                    selection = {
+                        **asdict(selector),
+                        "winner_profile_id": decision.winner_profile_id,
+                        "winner_resolved_profile_hash": (
+                            self._v1465_w6a_profile_hash(
+                                decision.winner_profile_id
+                            )
+                        ),
+                        "status": status,
+                        "notional_cap_usdc": (
+                            float(
+                                getattr(
+                                    self._settings,
+                                    (
+                                        "mainnet_codex_v1465_w6a_profile_"
+                                        "notional_cap_usdc"
+                                    ),
+                                    25.0,
+                                )
+                            )
+                            if status == "LIVE"
+                            else 0.0
+                        ),
+                        "issued_at_ms": issued_at_ms,
+                        "renewed_at_ms": now_ms,
+                        "expires_at_ms": now_ms + lease_ttl_s * 1000,
+                        "evidence_revision": revision,
+                        "evidence_snapshot": snapshot,
+                        "policy_hash": (
+                            self._v1465_w6a_selector_policy_hash()
+                        ),
+                        "owner_id": self._v1465_owner_id,
+                        "boot_id": self._v1465_boot_id,
+                        "demotion_reason": None,
+                        "demoted_at_ms": None,
+                        "cooldown_until_ms": None,
+                    }
+                    if current is None:
+                        event_type = "GRANTED"
+                    elif (
+                        current_identity_valid
+                        and str(current.get("winner_profile_id") or "")
+                        == decision.winner_profile_id
+                        and str(current.get("status") or "") == status
+                    ):
+                        event_type = "RENEWED"
+                    else:
+                        event_type = "SWITCHED"
+                    idempotency_key = (
+                        f"v1465-{event_type.lower()}:{selector.key}:"
+                        f"{generation}:{now_ms}:{revision}:"
+                        f"{decision.winner_profile_id}:{status}"
+                    )
+                    if event_type == "GRANTED":
+                        updated = await repo.grant_selection(
+                            selection,
+                            expected_generation=generation,
+                            event_time_ms=now_ms,
+                            idempotency_key=idempotency_key,
+                            actor=self._v1465_owner_id,
+                            event_payload=snapshot,
+                        )
+                    elif event_type == "RENEWED":
+                        updated = await repo.renew_selection(
+                            selection,
+                            expected_generation=generation,
+                            event_time_ms=now_ms,
+                            idempotency_key=idempotency_key,
+                            actor=self._v1465_owner_id,
+                            event_payload=snapshot,
+                        )
+                    else:
+                        updated = await repo.switch_selection(
+                            selection,
+                            expected_generation=generation,
+                            event_time_ms=now_ms,
+                            idempotency_key=idempotency_key,
+                            actor=self._v1465_owner_id,
+                            event_payload=snapshot,
+                        )
+                await self._repo.log_event(
+                    source_run_id,
+                    "entry_codex_v1465_w6a_selection_updated",
+                    {
+                        "selector_key": selector.key,
+                        "market_state": selector.market_state,
+                        "winner_profile_id": (
+                            None
+                            if updated is None
+                            else updated.get("winner_profile_id")
+                        ),
+                        "status": (
+                            None
+                            if updated is None
+                            else updated.get("status")
+                        ),
+                        "generation": (
+                            None
+                            if updated is None
+                            else updated.get("generation")
+                        ),
+                        "expires_at_ms": (
+                            None
+                            if updated is None
+                            else updated.get("expires_at_ms")
+                        ),
+                        "reason": decision.reason,
+                        "evidence_revision": revision,
+                    },
+                )
+                return
+            except W6ASelectionConflictError:
+                raise
+
+    async def _v1465_project_w6a_profile_outcome(
+        self,
+        details: Mapping[str, Any],
+    ) -> bool:
+        repo = self._v1465_w6a_profile_repo
+        if (
+            repo is None
+            or details.get("v1465_profile_evidence") is not True
+        ):
+            return False
+        outcome = str(details.get("shadow_outcome") or "").lower()
+        supported = {
+            "tp1_first",
+            "tp_first",
+            "tp",
+            "sl_first",
+            "sl",
+            "max_hold",
+            "no_fill",
+            "ambiguous_both",
+        }
+        if outcome not in supported:
+            return False
+        now_ms = int(time.time() * 1000)
+        observed_at_ms = int(details.get("start_ms") or 0)
+        terminal_at_ms = int(
+            details.get("resolved_at_ms")
+            or details.get("hit_time_ms")
+            or now_ms
+        )
+        terminal_at_ms = max(observed_at_ms, terminal_at_ms)
+        net_pnl_bp = details.get("paper_pnl_bp_after_fee")
+        if net_pnl_bp is None:
+            net_pnl_bp = details.get("fee_net_pnl_bp")
+        if net_pnl_bp is None and outcome == "no_fill":
+            net_pnl_bp = 0.0
+        selector = W6ASelector(
+            environment=str(details.get("environment") or "mainnet"),
+            symbol=str(details.get("symbol") or "").upper(),
+            lane_code="W6A",
+            market_state=str(
+                details.get("v1465_market_state") or "mixed"
+            ),
+            effective_side=str(
+                details.get("effective_side")
+                or details.get("side")
+                or ""
+            ).upper(),
+            strategy=str(details.get("strategy") or ""),
+        )
+        opportunity_id = str(
+            details.get("v1465_opportunity_id") or ""
+        )
+        profile_id = str(details.get("v1465_profile_id") or "")
+        profile_hash = str(
+            details.get("v1465_resolved_profile_hash") or ""
+        )
+        evidence_id = (
+            "v1465_ev_"
+            + self._codex_v1_shadow_stable_hash(
+                opportunity_id,
+                profile_id,
+                profile_hash,
+            )
+        )
+        payload = {
+            "evidence_id": evidence_id,
+            "opportunity_id": opportunity_id,
+            **asdict(selector),
+            "profile_id": profile_id,
+            "resolved_profile_hash": profile_hash,
+            "profile_plan_hash": str(
+                details.get("v1465_profile_plan_hash") or profile_hash
+            ),
+            "observed_at_ms": observed_at_ms,
+            "terminal_at_ms": terminal_at_ms,
+            "outcome": outcome,
+            "data_complete": bool(details.get("data_complete")),
+            "ambiguous": outcome == "ambiguous_both",
+            "diagnostic_only": bool(
+                details.get("diagnostic_only")
+                or details.get("terminal_reason") == "live_entry_submitted"
+            ),
+            "net_pnl_bp": net_pnl_bp,
+            "source_payload": dict(details),
+            # Replay must construct byte-identical immutable evidence.
+            "created_at_ms": terminal_at_ms,
+        }
+        try:
+            inserted = await repo.upsert_evidence(payload)
+            # Recompute even when the idempotent evidence row already exists:
+            # a prior process may have committed the row and crashed before
+            # selection CAS or the durable acknowledgement below.
+            await self._v1465_recompute_w6a_selection(
+                selector,
+                now_ms=max(now_ms, terminal_at_ms),
+                source_run_id=str(details.get("run_id") or ""),
+            )
+            await self._repo.log_event(
+                str(details.get("run_id") or ""),
+                "entry_codex_v1465_profile_evidence_projected",
+                {
+                    "event_type": "v1465_profile_evidence_projected",
+                    "run_id": str(details.get("run_id") or ""),
+                    "sample_id": str(details.get("sample_id") or ""),
+                    "v1465_opportunity_id": opportunity_id,
+                    "v1465_profile_id": profile_id,
+                    "v1465_resolved_profile_hash": profile_hash,
+                    "evidence_id": evidence_id,
+                    "inserted": bool(inserted),
+                    "selector_key": selector.key,
+                },
+            )
+            logger.info(
+                "v1465_w6a_profile_evidence_projected",
+                run_id=details.get("run_id"),
+                opportunity_id=opportunity_id,
+                profile_id=profile_id,
+                inserted=bool(inserted),
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001 - profile authority fails closed
+            logger.error(
+                "v1465_w6a_profile_projection_failed",
+                run_id=details.get("run_id"),
+                opportunity_id=opportunity_id,
+                profile_id=profile_id,
+                error=str(exc)[:200],
+            )
+            self._v1465_profile_ledger_unsafe = True
+            return False
+
+    async def _log_v1463_shadow_data_incomplete(
+        self,
+        run_id: str,
+        opportunity_id: str,
+        *,
+        reason: str,
+        source: Mapping[str, Any] | None = None,
+    ) -> None:
+        source_payload = dict(source or {})
+        sample_id = "v1463_incomplete_" + self._codex_v1_shadow_stable_hash(
+            run_id,
+            opportunity_id,
+            reason,
+        )
+        attribution = self._v1464_shadow_drop_attribution(source_payload)
+        drop = {
+            "event_type": "shadow_sample_dropped",
+            "sample_id": sample_id,
+            "opportunity_id": opportunity_id,
+            "v1462_opportunity_id": opportunity_id,
+            "run_id": run_id,
+            **attribution,
+            "registry_version": (
+                source_payload.get("registry_version")
+                or attribution.get("registry_version")
+            ),
+            "registry_hash": (
+                source_payload.get("registry_hash")
+                or attribution.get("registry_hash")
+            ),
+            "lane_definition_hash": (
+                source_payload.get("lane_definition_hash")
+                or attribution.get("lane_definition_hash")
+            ),
+            "v1462_policy_hash": (
+                source_payload.get("v1462_policy_hash")
+                or attribution.get("v1462_policy_hash")
+            ),
+            "admission_policy_hash": (
+                source_payload.get("admission_policy_hash")
+                or attribution.get("admission_policy_hash")
+            ),
+            "profile_identity_schema": (
+                source_payload.get("profile_identity_schema")
+                or attribution.get("profile_identity_schema")
+            ),
+            "resolved_profile_hash": (
+                source_payload.get("resolved_profile_hash")
+                or attribution.get("resolved_profile_hash")
+            ),
+            "drop_reason": f"data_incomplete:{reason}",
+            "data_quality_status": "DATA_INCOMPLETE",
+            "final_route": "SHADOW",
+            "order_api_calls": 0,
+        }
+        await self._repo.log_event(
+            run_id,
+            "entry_codex_v1_shadow_sample_dropped",
+            drop,
+        )
+        await self._v1464_project_shadow_drop(drop)
+
+    def _v1463_frozen_plan_invalid_reason(
+        self,
+        plan: Mapping[str, Any] | None,
+    ) -> str | None:
+        if not isinstance(plan, Mapping):
+            return "missing_frozen_execution_plan"
+        if str(plan.get("schema") or "") != "v1463.frozen-effective-ticket.1":
+            return "invalid_frozen_execution_plan_schema"
+        if str(plan.get("side") or "").upper() not in {"LONG", "SHORT"}:
+            return "invalid_frozen_execution_plan_side"
+        if any(
+            self._codex_v1_shadow_price(plan.get(key)) is None
+            for key in ("entry_price", "tp1_price", "sl_price")
+        ):
+            return "invalid_frozen_execution_plan_prices"
+        try:
+            entry_ttl_s = int(plan.get("entry_ttl_s") or 0)
+            outcome_ttl_s = int(plan.get("outcome_ttl_s") or 0)
+        except (TypeError, ValueError, OverflowError):
+            return "invalid_frozen_execution_plan_ttl"
+        if entry_ttl_s <= 0 or outcome_ttl_s < entry_ttl_s:
+            return "invalid_frozen_execution_plan_ttl"
+        return None
 
     def _codex_v1_should_start_shadow_sample(self, sample: Mapping[str, Any]) -> tuple[bool, str | None]:
         run_id = str(sample.get("run_id") or "")
+        opportunity_id = str(
+            sample.get("v1462_opportunity_id")
+            or sample.get("opportunity_id")
+            or ""
+        )
+        if opportunity_id in self._v1464_terminal_opportunity_ids:
+            return False, "terminal_opportunity_complete"
+        if any(
+            str(
+                active.get("v1462_opportunity_id")
+                or active.get("opportunity_id")
+                or ""
+            )
+            == opportunity_id
+            for active in self._codex_v1_shadow_samples.values()
+        ):
+            return False, "active_opportunity_pending"
+        is_v1463_formal_collector = bool(
+            self._v1462_observation_selected()
+            and str(sample.get("registry_version") or "")
+            == V1462_REGISTRY_VERSION
+            and isinstance(sample.get("frozen_execution_plan"), Mapping)
+            and str(
+                (sample.get("frozen_execution_plan") or {}).get("schema") or ""
+            )
+            == "v1463.frozen-effective-ticket.1"
+            and not bool(sample.get("diagnostic_only"))
+        )
+        # v1.4.63's durable two-minute opportunity ID is the sampling
+        # contract.  Do not truncate the formal strict-shadow cohort with the
+        # legacy 12-sample/cooldown/family quotas.
+        if is_v1463_formal_collector:
+            return True, None
         if self._codex_v1_shadow_sample_counts_by_run.get(run_id, 0) >= self.CODEX_V1_SHADOW_MAX_SAMPLES_PER_RUN:
             return False, "per_run_cap"
-        opportunity_id = str(sample.get("opportunity_id") or "")
-        if any(str(active.get("opportunity_id") or "") == opportunity_id for active in self._codex_v1_shadow_samples.values()):
-            return False, "active_opportunity_pending"
         scope_key = str(sample.get("sample_scope_key") or "")
         last = self._codex_v1_shadow_last_sample_by_scope.get(scope_key)
         if not last:
@@ -2703,6 +12818,211 @@ class MainnetOneRunManager:
                 return False, "cooldown"
         return True, None
 
+    @staticmethod
+    def _v1465_w6a_profile_payload(profile_id: str) -> dict[str, Any]:
+        profile = W6A_PROFILES[profile_id]
+        return {
+            "version": "v1.4.65",
+            "profile_id": profile.profile_id,
+            "entry_offset_bp": profile.entry_offset_bp,
+            "tp_bp": profile.tp_bp,
+            "sl_bp": profile.sl_bp,
+            "entry_ttl_seconds": profile.entry_ttl_seconds,
+            "full_exit": profile.full_exit,
+            "partial_exit_pct": profile.partial_exit_pct,
+            "dca_enabled": profile.dca_enabled,
+            "runner_enabled": profile.runner_enabled,
+            "one_step_reprice_enabled": profile.one_step_reprice_enabled,
+        }
+
+    @classmethod
+    def _v1465_w6a_profile_hash(cls, profile_id: str) -> str:
+        payload = cls._v1465_w6a_profile_payload(profile_id)
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(encoded.encode()).hexdigest()
+
+    @classmethod
+    def _v1465_w6a_selector_policy_hash(cls) -> str:
+        window = DEFAULT_W6A_WINDOW_CONFIG
+        payload = {
+            "version": "v1.4.65",
+            "profiles": {
+                profile_id: cls._v1465_w6a_profile_payload(profile_id)
+                for profile_id in W6A_PROFILES
+            },
+            "windows": {
+                "safety_window_seconds": window.safety_window_seconds,
+                "authority_window_seconds": window.authority_window_seconds,
+                "guard_window_seconds": window.guard_window_seconds,
+                "safety_sl_limit": window.safety_sl_limit,
+                "authority_min_evaluable": window.authority_min_evaluable,
+                "authority_min_tp": window.authority_min_tp,
+                "authority_min_ev_bp": window.authority_min_ev_bp,
+                "guard_min_evaluable": window.guard_min_evaluable,
+                "guard_min_ev_bp": window.guard_min_ev_bp,
+                "guard_max_sl_ratio": window.guard_max_sl_ratio,
+                "switch_min_ev_delta_bp": window.switch_min_ev_delta_bp,
+                "switch_min_paired_wins": window.switch_min_paired_wins,
+                "lease_ttl_seconds": window.lease_ttl_seconds,
+            },
+        }
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(encoded.encode()).hexdigest()
+
+    def _v1465_build_w6a_profile_samples(
+        self,
+        base_sample: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], ...]:
+        """Build paired W6A samples from one immutable market observation."""
+
+        if (
+            self._v1465_w6a_profile_repo is None
+            or not bool(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1465_w6a_profile_shadow_enabled",
+                    False,
+                )
+            )
+            or str(base_sample.get("lane_code") or "").upper() != "W6A"
+            or str(base_sample.get("fill_model") or "") != "limit_touch"
+            or bool(base_sample.get("diagnostic_only"))
+            or base_sample.get("evidence_evaluator_eligible") is not True
+        ):
+            return ()
+        durable_opportunity_id = str(
+            base_sample.get("v1462_opportunity_id") or ""
+        )
+        reference = self._codex_v1_shadow_price(
+            base_sample.get("entry_reference_price")
+        ) or self._codex_v1_shadow_price(base_sample.get("entry_price"))
+        side = str(base_sample.get("side") or "").upper()
+        if not durable_opportunity_id or reference is None or side not in {
+            "LONG",
+            "SHORT",
+        }:
+            return ()
+        state = classify_w6a_market_state(
+            base_sample.get("features")
+            if isinstance(base_sample.get("features"), Mapping)
+            else {}
+        )
+        state_payload = {
+            "state": state.state,
+            "missing": list(state.missing),
+            "risk_score": state.risk_score,
+            "no_reclaim": state.no_reclaim,
+            "risk_flags": dict(state.risk_flags),
+            "stale_hard": state.stale_hard,
+        }
+        result: list[dict[str, Any]] = []
+        for profile_id, profile in W6A_PROFILES.items():
+            entry_direction = -1.0 if side == "LONG" else 1.0
+            entry = reference * (
+                1.0
+                + entry_direction * float(profile.entry_offset_bp) / 10_000.0
+            )
+            if side == "LONG":
+                tp = entry * (1.0 + float(profile.tp_bp) / 10_000.0)
+                stop = entry * (1.0 - float(profile.sl_bp) / 10_000.0)
+            else:
+                tp = entry * (1.0 - float(profile.tp_bp) / 10_000.0)
+                stop = entry * (1.0 + float(profile.sl_bp) / 10_000.0)
+            profile_hash = self._v1465_w6a_profile_hash(profile_id)
+            sample_id = (
+                "v1465_"
+                + self._codex_v1_shadow_stable_hash(
+                    base_sample.get("sample_id"),
+                    durable_opportunity_id,
+                    profile_id,
+                    profile_hash,
+                )
+            )
+            plan = dict(base_sample.get("frozen_execution_plan") or {})
+            action = dict(plan.get("action_parameters") or {})
+            action.update(
+                {
+                    "entry_bp": float(profile.entry_offset_bp),
+                    "tp1_bp": float(profile.tp_bp),
+                    "full_tp_bp": float(profile.tp_bp),
+                    "sl_bp": float(profile.sl_bp),
+                    "ttl_s": int(profile.entry_ttl_seconds),
+                    "partial_exit_pct": 1.0,
+                    "runner_enabled": False,
+                    "one_step_reprice_enabled": False,
+                    "dca_enabled": False,
+                }
+            )
+            plan.update(
+                {
+                    "entry_price": round(entry, 12),
+                    "tp1_price": round(tp, 12),
+                    "full_tp_price": round(tp, 12),
+                    "sl_price": round(stop, 12),
+                    "entry_offset_bp": float(profile.entry_offset_bp),
+                    "tp1_bp": float(profile.tp_bp),
+                    "sl_bp": float(profile.sl_bp),
+                    "partial_exit_pct": 1.0,
+                    "entry_ttl_s": int(profile.entry_ttl_seconds),
+                    "action_parameters": action,
+                }
+            )
+            clone = dict(base_sample)
+            clone.update(
+                {
+                    "sample_id": sample_id,
+                    "strict_sample_id": sample_id,
+                    "opportunity_id": sample_id,
+                    "v1462_opportunity_id": None,
+                    "v1465_opportunity_id": durable_opportunity_id,
+                    "v1465_profile_evidence": True,
+                    "v1465_profile_id": profile_id,
+                    "v1465_market_state": state.state,
+                    "v1465_market_state_snapshot": state_payload,
+                    "v1465_resolved_profile_hash": profile_hash,
+                    "v1465_profile_plan_hash": profile_hash,
+                    "v1465_selector_policy_hash": (
+                        self._v1465_w6a_selector_policy_hash()
+                    ),
+                    "profile_identity_schema": "v1465.w6a-profile.1",
+                    "resolved_profile_hash": profile_hash,
+                    "legacy_market_state": base_sample.get("market_state"),
+                    "market_state": state.state,
+                    "entry_price": round(entry, 8),
+                    "tp_price": round(tp, 8),
+                    "sl_price": round(stop, 8),
+                    "entry_ttl_s": int(profile.entry_ttl_seconds),
+                    "frozen_execution_plan": plan,
+                    "promotion_eligible": False,
+                    "evidence_evaluator_eligible": False,
+                    "diagnostic_only": False,
+                    "promotion_block_reason": "v1465_profile_shadow",
+                    "sampling_quota_key": f"W6A:{profile_id}",
+                    "sample_scope_key": (
+                        f"{base_sample.get('symbol')}:W6A:"
+                        f"{side}:{profile_id}"
+                    ),
+                    "execution_controls": {
+                        "full_exit": True,
+                        "runner_enabled": False,
+                        "one_step_reprice_enabled": False,
+                        "dca_enabled": False,
+                    },
+                }
+            )
+            result.append(clone)
+        return tuple(result)
+
 
     async def _start_codex_v1_shadow_sample(
         self,
@@ -2716,7 +13036,130 @@ class MainnetOneRunManager:
         effective_status: str,
         gaps: Sequence[str] = (),
         preflight: Sequence[str] = (),
+        candidate_ticket: PreRejectCandidateTicket | None = None,
     ) -> None:
+        ticket = candidate_ticket or self._v1462_candidate_ticket(
+            raw_codex_decision,
+            codex_decision,
+        )
+        start_ms = int(time.time() * 1000)
+        durable_opportunity_id: str | None = None
+        durable_opportunity_persisted = False
+        decision_metrics = (
+            codex_decision.metrics
+            if isinstance(codex_decision.metrics, Mapping)
+            else {}
+        )
+        symbol = str(
+            run.get("symbol")
+            or features.get("symbol")
+            or getattr(decision.signal, "symbol", "")
+            or ""
+        ).upper()
+        v1462_admission = (
+            decision_metrics.get("v1462_admission")
+            if isinstance(decision_metrics.get("v1462_admission"), Mapping)
+            else {}
+        )
+        admission_plan = v1462_admission.get("frozen_execution_plan")
+        frozen_execution_plan = (
+            dict(admission_plan)
+            if isinstance(admission_plan, Mapping)
+            else self._v1463_frozen_effective_plan(
+                decision,
+                codex_decision,
+                ticket,
+            )
+        )
+        cohort_identity: dict[str, Any] = {}
+        if self._v1462_observation_selected():
+            cohort_identity = self._v1462_cohort_identity(
+                ticket,
+                symbol=symbol,
+                raw_accepted=bool(
+                    v1462_admission.get(
+                        "raw_accepted",
+                        raw_codex_decision.accepted,
+                    )
+                ),
+                pre_gate_accepted=bool(
+                    v1462_admission.get("pre_gate_accepted", False)
+                ),
+                final_incumbent_accepted=bool(
+                    v1462_admission.get(
+                        "final_incumbent_accepted",
+                        codex_decision.accepted,
+                    )
+                ),
+                reject_lineage=tuple(
+                    v1462_admission.get("reject_lineage") or ()
+                ),
+                permits_order=bool(v1462_admission.get("permits_order", False)),
+                execution_plan=frozen_execution_plan,
+            )
+        if self._v1462_shadow_all_active(run):
+            durable_opportunity_id = str(
+                v1462_admission.get("opportunity_id")
+                or self._v1462_opportunity_id(
+                    run,
+                    ticket,
+                    start_ms,
+                    frozen_execution_plan,
+                )
+            )
+            shadow_event_key = (
+                "entry_codex_v1462_shadow_opportunity",
+                durable_opportunity_id,
+            )
+            try:
+                if shadow_event_key not in self._v1462_durable_event_keys:
+                    await self._repo.log_event(
+                        run["run_id"],
+                        "entry_codex_v1462_shadow_opportunity",
+                        {
+                            "event_type": "v1462_shadow_opportunity",
+                            **cohort_identity,
+                            "opportunity_id": durable_opportunity_id,
+                            "v1462_opportunity_id": durable_opportunity_id,
+                            "run_id": run["run_id"],
+                            "symbol": run.get("symbol"),
+                            "lane_code": ticket.effective_lane,
+                            "classifier_lane": ticket.classifier_lane,
+                            "side": ticket.effective_side,
+                            "market_state": ticket.market_state,
+                            "reason": reason,
+                            "effective_status": effective_status,
+                            "gaps": list(gaps),
+                            "preflight": list(preflight),
+                            "promotion_eligible": False,
+                            "candidate_ticket": ticket.to_payload(),
+                            "frozen_execution_plan": frozen_execution_plan,
+                            "observed_at_ms": start_ms,
+                            "order_api_calls": 0,
+                        },
+                    )
+                    self._v1462_durable_event_keys.add(shadow_event_key)
+                durable_opportunity_persisted = (
+                    shadow_event_key in self._v1462_durable_event_keys
+                )
+                if durable_opportunity_persisted:
+                    self._v1463_opportunity_reconcile_needed = True
+            except Exception as exc:  # noqa: BLE001 - paid path is already closed
+                logger.error(
+                    "entry_codex_v1462_shadow_opportunity_persistence_failed",
+                    run_id=run.get("run_id"),
+                    error=str(exc)[:200],
+                )
+        if (
+            durable_opportunity_id
+            and await self._v1464_opportunity_already_terminal(
+                durable_opportunity_id
+            )
+        ):
+            # One durable two-minute opportunity contributes at most one
+            # formal outcome.  A later scan in the same bucket is a benign
+            # replay, not a new cohort observation or a collection drop.
+            return
         mapping = self._codex_v1_map_block_to_shadow_lane(
             reason,
             decision,
@@ -2725,25 +13168,132 @@ class MainnetOneRunManager:
             features,
         )
         if not mapping:
+            if durable_opportunity_id and durable_opportunity_persisted:
+                await self._log_v1463_shadow_data_incomplete(
+                    str(run["run_id"]),
+                    durable_opportunity_id,
+                    reason="shadow_lane_mapping_unavailable",
+                    source={
+                        **cohort_identity,
+                        "lane_code": ticket.effective_lane,
+                        "classifier_lane": ticket.classifier_lane,
+                        "candidate_ticket": ticket.to_payload(),
+                    },
+                )
             return
-        prices = self._codex_v1_shadow_sample_prices(decision, raw_codex_decision, codex_decision)
         shadow_lane = str(mapping.get("shadow_lane") or "")
         lane_code = str(raw_codex_decision.lane_code or codex_decision.lane_code or "")
-        if prices is None:
+        frozen_plan_invalid = self._v1463_frozen_plan_invalid_reason(
+            frozen_execution_plan
+        )
+        if frozen_plan_invalid:
             logger.warning(
-                "codex_v1_shadow_sample_missing_prices",
+                "codex_v1_shadow_sample_invalid_frozen_execution_plan",
                 run_id=run["run_id"],
                 shadow_lane=shadow_lane,
                 lane_code=lane_code,
+                reason=frozen_plan_invalid,
             )
+            if durable_opportunity_id and durable_opportunity_persisted:
+                await self._log_v1463_shadow_data_incomplete(
+                    str(run["run_id"]),
+                    durable_opportunity_id,
+                    reason=frozen_plan_invalid,
+                    source={
+                        **cohort_identity,
+                        "lane_code": ticket.effective_lane,
+                        "classifier_lane": ticket.classifier_lane,
+                        "candidate_ticket": ticket.to_payload(),
+                    },
+                )
             return
-
-        start_ms = int(time.time() * 1000)
-        entry, stop, tp = prices
-        side = str(codex_decision.side or raw_codex_decision.side or decision.side or "").upper()
-        strategy = str(codex_decision.strategy or raw_codex_decision.strategy or decision.strategy or "")
-        symbol = str(run.get("symbol") or features.get("symbol") or getattr(decision.signal, "symbol", "") or "UNKNOWN")
+        entry = self._codex_v1_shadow_price(frozen_execution_plan.get("entry_price"))
+        stop = self._codex_v1_shadow_price(frozen_execution_plan.get("sl_price"))
+        tp = self._codex_v1_shadow_price(frozen_execution_plan.get("tp1_price"))
+        assert entry is not None and stop is not None and tp is not None
+        derived_side = str(
+            frozen_execution_plan.get("side") or ""
+        ).upper()
+        derived_strategy = str(
+            frozen_execution_plan.get("strategy") or ticket.strategy
+        )
         candidate_lane = str(mapping.get("candidate_lane") or lane_code or raw_codex_decision.lane or "UNKNOWN")
+        gate_family_id, gate_class, taxonomy_promotion_eligible = (
+            self._v1461_gate_taxonomy(reason, lane_code)
+        )
+        gate_family_id = str(mapping.get("gate_family_id") or gate_family_id)
+        gate_class = str(mapping.get("gate_class") or gate_class)
+        promotion_eligible = bool(
+            mapping.get("promotion_eligible", taxonomy_promotion_eligible)
+            and not gaps
+            and not preflight
+        )
+        derived_market_state = (
+            self._codex_v1_market_state_from_decision(codex_decision)
+            or self._codex_v1_market_state_from_decision(raw_codex_decision)
+            or "UNKNOWN"
+        )
+        identity_mismatches: list[str] = []
+        if derived_side != str(ticket.effective_side).upper():
+            identity_mismatches.append("effective_side")
+        if derived_strategy != str(ticket.strategy):
+            identity_mismatches.append("strategy")
+        if derived_market_state != str(ticket.market_state):
+            identity_mismatches.append("market_state")
+        # Exact identity is an authority boundary only for the v1.4.62+
+        # durable collector.  Legacy diagnostic collectors predate the exact
+        # market-state contract and must keep collecting instead of being
+        # silently discarded by a post-filter label difference.
+        if identity_mismatches and self._v1462_observation_selected():
+            if durable_opportunity_id and durable_opportunity_persisted:
+                await self._log_v1463_shadow_data_incomplete(
+                    str(run["run_id"]),
+                    durable_opportunity_id,
+                    reason=(
+                        "exact_identity_mismatch:"
+                        + ",".join(identity_mismatches)
+                    ),
+                    source={
+                        **cohort_identity,
+                        "candidate_ticket": ticket.to_payload(),
+                    },
+                )
+            return
+        side = str(ticket.effective_side).upper()
+        strategy = str(ticket.strategy)
+        market_state = str(ticket.market_state)
+        adaptive_metrics = (
+            codex_decision.metrics
+            if isinstance(codex_decision.metrics, Mapping)
+            else {}
+        )
+        v1461_policy = (
+            adaptive_metrics.get("v1461_adaptive_gate")
+            if isinstance(adaptive_metrics.get("v1461_adaptive_gate"), Mapping)
+            else {}
+        )
+        coarse_market_state = str(
+            v1461_policy.get("market_state") or "UNKNOWN"
+        )
+        episode_id = str(v1461_policy.get("episode_id") or "")
+        if self._v1461_candidate_active(run) and coarse_market_state == "UNKNOWN":
+            try:
+                coarse_market_state = self._v1461_coarse_regime(
+                    run, raw_codex_decision
+                )
+                episode_id = self._v1461_episode_id(
+                    gate_family_id,
+                    lane_code or candidate_lane,
+                    coarse_market_state,
+                    start_ms,
+                )
+            except Exception as exc:  # noqa: BLE001 - shadow remains diagnostic
+                promotion_eligible = False
+                logger.warning(
+                    "v1461_shadow_regime_classification_failed",
+                    run_id=run.get("run_id"),
+                    error=str(exc)[:200],
+                )
         candidate_meta: dict[str, Any] = {}
         if (
             getattr(self._settings, "mainnet_codex_v133_no_lane_miner_enabled", True)
@@ -2793,8 +13343,10 @@ class MainnetOneRunManager:
         )
         sample = {
             "event_type": "shadow_sample_started",
+            **cohort_identity,
             "sample_id": sample_id,
             "opportunity_id": opportunity_id,
+            "v1462_opportunity_id": durable_opportunity_id,
             "first_seen_run_id": opportunity_state.get("first_seen_run_id"),
             "last_seen_run_id": opportunity_state.get("last_seen_run_id"),
             "raw_block_rows_count": opportunity_state.get("raw_block_rows_count"),
@@ -2805,6 +13357,24 @@ class MainnetOneRunManager:
             "baseline": codex_decision.baseline,
             "shadow_lane": shadow_lane,
             "candidate_lane": candidate_lane,
+            "legacy_lane_code": lane_code or None,
+            "gate_id": reason,
+            "gate_family_id": gate_family_id,
+            "gate_variant_id": codex_decision.policy_tag or reason,
+            "gate_class": gate_class,
+            "policy_generation": CODEX_V1_VERSION,
+            "market_state": market_state,
+            "coarse_market_state": coarse_market_state,
+            "episode_id": episode_id or None,
+            "v1461_policy_hash": (
+                v1461_policy.get("policy_hash")
+                or (
+                    self._v1461_gate_config().policy_hash
+                    if self._v1461_config_selected()
+                    else None
+                )
+            ),
+            "reject_stage": "preflight" if (gaps or preflight) else "strategy",
             "candidate_bucket": candidate_bucket or None,
             "nearest_lane_code": candidate_meta.get("nearest_lane_code"),
             "nearest_lane_name": candidate_meta.get("nearest_lane_name"),
@@ -2822,7 +13392,10 @@ class MainnetOneRunManager:
             "shadow_reprice_state": reprice_state,
             "mapping_reason": mapping.get("mapping_reason"),
             "secondary_reasons": list(mapping.get("secondary_reasons") or []),
-            "lane_code": lane_code or codex_decision.lane_code,
+            # v1.4.64 authority always joins on the exact effective registry
+            # lane.  Legacy classifier/mapping labels stay diagnostic only.
+            "lane_code": ticket.effective_lane,
+            "effective_lane": ticket.effective_lane,
             "lane": raw_codex_decision.lane or codex_decision.lane,
             "strategy": strategy,
             "side": side,
@@ -2839,16 +13412,36 @@ class MainnetOneRunManager:
             "sample_scope_key": sample_scope_key,
             "sample_priority": sample_priority,
             "fill_model": fill_model,
-            "promotion_eligible": fill_model == "limit_touch",
+            "promotion_eligible": bool(
+                fill_model == "limit_touch"
+                and promotion_eligible
+                and not self._v1462_observation_selected()
+            ),
+            "evidence_evaluator_eligible": bool(
+                self._v1462_shadow_all_active(run)
+                and fill_model == "limit_touch"
+                and not gaps
+                and not preflight
+                and cohort_identity.get("lane_definition_hash") is not None
+                and cohort_identity.get("final_route") == "SHADOW"
+            ),
             "diagnostic_fill_model": diagnostic_fill_model,
             "diagnostic_only": False,
             "sample_group_id": sample_group_id,
-            "entry_ttl_s": self.CODEX_V1_SHADOW_ENTRY_TTL_S,
-            "outcome_ttl_s": self.CODEX_V1_SHADOW_OUTCOME_TTL_S,
+            "entry_ttl_s": int(frozen_execution_plan["entry_ttl_s"]),
+            "outcome_ttl_s": int(frozen_execution_plan["outcome_ttl_s"]),
             "reason": reason,
             "policy_tag": codex_decision.policy_tag or metrics.get("policy_tag") or metrics.get("policy_note"),
-            "requested_notional_usdc": raw_codex_decision.requested_notional_usdc,
-            "raw_requested_notional_usdc": metrics.get("raw_requested_notional_usdc"),
+            "requested_notional_usdc": float(
+                frozen_execution_plan["planned_notional_usdc"]
+            ),
+            "raw_requested_notional_usdc": ticket.requested_notional_usdc,
+            "applied_planned_notional_usdc": float(
+                frozen_execution_plan["planned_notional_usdc"]
+            ),
+            "candidate_notional_source": ticket.notional_source,
+            "pre_reject_candidate_ticket": ticket.to_payload(),
+            "frozen_execution_plan": dict(frozen_execution_plan),
             "fee_audit": fee_audit,
             "expected_capture_bp": fee_audit.get("expected_capture_bp"),
             "estimated_roundtrip_fee_bp": fee_audit.get("estimated_roundtrip_fee_bp"),
@@ -2872,6 +13465,24 @@ class MainnetOneRunManager:
             "decision": asdict(codex_decision),
             "features": self._codex_v1_payload_features(features),
         }
+        if not (
+            self._v1461_config_selected()
+            or self._v1462_observation_selected()
+        ):
+            for field in (
+                "legacy_lane_code",
+                "gate_id",
+                "gate_family_id",
+                "gate_variant_id",
+                "gate_class",
+                "policy_generation",
+                "market_state",
+                "coarse_market_state",
+                "episode_id",
+                "v1461_policy_hash",
+                "reject_stage",
+            ):
+                sample.pop(field, None)
         if candidate_meta:
             await self._repo.log_event(
                 run["run_id"],
@@ -2904,12 +13515,20 @@ class MainnetOneRunManager:
         if not should_start and drop_reason == "per_run_cap":
             if await self._codex_v1_try_replace_lower_priority_shadow_sample(sample):
                 should_start, drop_reason = self._codex_v1_should_start_shadow_sample(sample)
+        if not should_start and drop_reason in {
+            "active_opportunity_pending",
+            "terminal_opportunity_complete",
+        }:
+            # This is an idempotent retry of an already-active durable
+            # opportunity, not a failed collection obligation.
+            return
         if not should_start:
             drop = {
                 key: sample.get(key)
                 for key in (
                     "sample_id",
                     "opportunity_id",
+                    "v1462_opportunity_id",
                     "first_seen_run_id",
                     "last_seen_run_id",
                     "raw_block_rows_count",
@@ -2946,6 +13565,7 @@ class MainnetOneRunManager:
                     "policy_tag",
                 )
             }
+            drop.update(self._v1464_shadow_drop_attribution(sample))
             drop.update(
                 {
                     "event_type": "shadow_sample_dropped",
@@ -2956,6 +13576,7 @@ class MainnetOneRunManager:
                 }
             )
             await self._repo.log_event(run["run_id"], "entry_codex_v1_shadow_sample_dropped", drop)
+            await self._v1464_project_shadow_drop(drop)
             return
 
         sample["strict_sample_id"] = sample_id
@@ -2977,6 +13598,15 @@ class MainnetOneRunManager:
                 }
             )
 
+        v1465_profile_samples = self._v1465_build_w6a_profile_samples(sample)
+
+        # The event ledger is authoritative.  Never expose a sample to the
+        # evaluator until its complete frozen ticket is durable.
+        await self._repo.log_event(
+            run["run_id"],
+            "entry_codex_v1_shadow_sample_started",
+            sample,
+        )
         self._codex_v1_shadow_samples[sample_id] = sample
         self._codex_v1_shadow_sample_counts_by_run[str(run["run_id"])] = (
             self._codex_v1_shadow_sample_counts_by_run.get(str(run["run_id"]), 0) + 1
@@ -2991,10 +13621,31 @@ class MainnetOneRunManager:
             "side": side,
             "sampling_family": sample.get("sampling_family"),
         }
-        await self._repo.log_event(run["run_id"], "entry_codex_v1_shadow_sample_started", sample)
         if diagnostic_sample is not None:
-            self._codex_v1_shadow_samples[str(diagnostic_sample["sample_id"])] = diagnostic_sample
             await self._repo.log_event(run["run_id"], "entry_codex_v1_shadow_sample_started", diagnostic_sample)
+            self._codex_v1_shadow_samples[str(diagnostic_sample["sample_id"])] = diagnostic_sample
+        for profile_sample in v1465_profile_samples:
+            try:
+                await self._repo.log_event(
+                    run["run_id"],
+                    "entry_codex_v1_shadow_sample_started",
+                    profile_sample,
+                )
+            except Exception as exc:  # noqa: BLE001 - shadow remains fail closed
+                self._v1465_profile_ledger_unsafe = True
+                logger.error(
+                    "entry_codex_v1465_profile_sample_persistence_failed",
+                    run_id=run.get("run_id"),
+                    opportunity_id=profile_sample.get(
+                        "v1465_opportunity_id"
+                    ),
+                    profile_id=profile_sample.get("v1465_profile_id"),
+                    error=str(exc)[:200],
+                )
+                continue
+            self._codex_v1_shadow_samples[
+                str(profile_sample["sample_id"])
+            ] = profile_sample
         await self._start_codex_v132_tp_policy_sample(sample, source_type="shadow_sample")
 
     @staticmethod
@@ -3050,9 +13701,43 @@ class MainnetOneRunManager:
                 exit_price = entry
         gross_bp = self._codex_v1_shadow_gross_pnl_bp(side, entry, exit_price)
         features = sample.get("features") if isinstance(sample.get("features"), Mapping) else {}
-        maker_fee_bp = self._codex_v1_shadow_feature_float(features, "maker_fee_bp") or 0.0
-        fee_bp = max(0.0, maker_fee_bp) * 2.0
-        slippage_buffer_bp = 0.0
+        maker_fee_bp = self._codex_v1_shadow_feature_float(features, "maker_fee_bp")
+        if maker_fee_bp is None:
+            maker_fee_bp = max(
+                0.0,
+                float(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v1460_weak_shadow_maker_fee_rate",
+                        0.0,
+                    )
+                )
+                * 10_000.0,
+            )
+        taker_fee_bp = max(
+            0.0,
+            float(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1460_weak_shadow_taker_fee_rate",
+                    getattr(self._settings, "mainnet_expected_taker_fee_rate", 0.0004),
+                )
+            )
+            * 10_000.0,
+        )
+        exit_liquidity = "MAKER" if shadow_outcome == "tp1_first" else "TAKER"
+        exit_fee_bp = maker_fee_bp if exit_liquidity == "MAKER" else taker_fee_bp
+        fee_bp = max(0.0, maker_fee_bp) + max(0.0, exit_fee_bp)
+        slippage_buffer_bp = max(
+            0.0,
+            float(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v133_estimated_slippage_bp",
+                    0.4,
+                )
+            ),
+        )
         after_fee_bp = gross_bp - fee_bp - slippage_buffer_bp
         notional = sample.get("requested_notional_usdc") or sample.get("raw_requested_notional_usdc") or 0.0
         try:
@@ -3064,6 +13749,8 @@ class MainnetOneRunManager:
             "paper_pnl_bp_after_fee": round(after_fee_bp, 4),
             "paper_pnl_usdc_after_fee": round(after_fee_bp / 10000.0 * max(0.0, notional_value), 6),
             "fee_model": "maker_taker_estimate",
+            "entry_liquidity": "MAKER",
+            "exit_liquidity": exit_liquidity,
             "estimated_fee_bp": round(fee_bp, 4),
             "conservative_slippage_buffer_bp": round(slippage_buffer_bp, 4),
             "exit_reference_price": round(exit_price, 8) if exit_price else None,
@@ -3241,6 +13928,195 @@ class MainnetOneRunManager:
         return None
 
 
+    async def _v1461_record_shadow_evidence(
+        self,
+        details: Mapping[str, Any],
+    ) -> None:
+        session = self._adaptive_session
+        if (
+            not session
+            or not self._v1461_config_selected()
+            or not bool(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1461_shadow_all_strategy_rejects_enabled",
+                    False,
+                )
+            )
+            or details.get("promotion_eligible") is not True
+            or str(details.get("reject_stage") or "") != "strategy"
+            or str(details.get("fill_model") or "") != "limit_touch"
+            or bool(details.get("diagnostic_only"))
+        ):
+            return
+        try:
+            active_hash = self._v1461_gate_config().policy_hash
+        except Exception as exc:  # noqa: BLE001 - invalid policy halts paid path
+            session["stop_requested"] = True
+            session["rearm_enabled"] = False
+            session["safety_halt_reason"] = "v1461_policy_hash_invalid"
+            logger.error("v1461_policy_hash_invalid", error=str(exc)[:200])
+            return
+        if str(details.get("v1461_policy_hash") or "") != active_hash:
+            return
+        gate_family = str(details.get("gate_family_id") or "UNKNOWN")
+        lane = str(details.get("legacy_lane_code") or details.get("lane_code") or "UNKNOWN")
+        coarse_state = str(details.get("coarse_market_state") or "UNKNOWN")
+        key = v1461_promotion_key(gate_family, lane, coarse_state)
+        all_evidence = session.setdefault("v1461_gate_evidence", {})
+        evidence = all_evidence.setdefault(
+            key,
+            {
+                "opportunity_ids": [],
+                "episode_ids": [],
+                "opportunities": 0,
+                "evaluable": 0,
+                "tp_first": 0,
+                "sl_first": 0,
+                "no_fill": 0,
+                "ambiguous": 0,
+                "incomplete": 0,
+                "net_pnl_usdc": 0.0,
+                "policy_hash": active_hash,
+            },
+        )
+        opportunity_id = str(details.get("opportunity_id") or "")
+        seen = evidence.setdefault("opportunity_ids", [])
+        if not opportunity_id or opportunity_id in seen:
+            return
+        seen.append(opportunity_id)
+        episode_id = str(details.get("episode_id") or "")
+        episodes = evidence.setdefault("episode_ids", [])
+        if episode_id and episode_id not in episodes:
+            episodes.append(episode_id)
+        outcome = str(details.get("shadow_outcome") or "").lower()
+        pnl_valid = True
+        try:
+            raw_pnl = details["paper_pnl_usdc_after_fee"]
+            if isinstance(raw_pnl, bool):
+                raise ValueError("boolean PnL is invalid")
+            pnl = float(raw_pnl)
+            if not math.isfinite(pnl):
+                raise ValueError("non-finite PnL is invalid")
+        except (TypeError, ValueError, OverflowError):
+            pnl = 0.0
+            pnl_valid = False
+        except KeyError:
+            pnl = 0.0
+            pnl_valid = False
+        try:
+            raw_resolved_at_ms = details.get("resolved_ts")
+            if isinstance(raw_resolved_at_ms, bool):
+                raise ValueError("boolean resolved timestamp is invalid")
+            resolved_numeric = float(raw_resolved_at_ms)
+            resolved_at_ms = int(resolved_numeric)
+            if (
+                not math.isfinite(resolved_numeric)
+                or resolved_numeric != resolved_at_ms
+                or resolved_at_ms < 0
+            ):
+                raise ValueError("resolved timestamp must be a non-negative integer")
+        except (TypeError, ValueError, OverflowError):
+            resolved_at_ms = 0
+        processed_at_ms = int(time.time() * 1000)
+        data_quality = (
+            details.get("data_quality")
+            if isinstance(details.get("data_quality"), Mapping)
+            else {}
+        )
+        source_complete = bool(
+            details.get("evidence_source") == "binance_aggTrade"
+            and details.get("data_complete") is True
+            and data_quality.get("complete") is True
+        )
+        try:
+            start_ms = int(details.get("start_ms"))
+            entry_ttl_ms = int(float(details.get("entry_ttl_s")) * 1000.0)
+            outcome_ttl_ms = int(float(details.get("outcome_ttl_s")) * 1000.0)
+            if start_ms < 0 or entry_ttl_ms <= 0 or outcome_ttl_ms < entry_ttl_ms:
+                raise ValueError
+        except (TypeError, ValueError, OverflowError):
+            start_ms = 0
+            entry_ttl_ms = 0
+            outcome_ttl_ms = 0
+        terminal_timing_valid = bool(
+            start_ms > 0
+            and (
+                (
+                    outcome == "no_fill"
+                    and resolved_at_ms >= start_ms + entry_ttl_ms
+                )
+                or (
+                    outcome == "max_hold"
+                    and resolved_at_ms >= start_ms + outcome_ttl_ms
+                )
+                or (
+                    outcome in {"tp1_first", "sl_first"}
+                    and resolved_at_ms >= start_ms
+                )
+            )
+        )
+        data_complete = bool(
+            resolved_at_ms > 0
+            and resolved_at_ms <= processed_at_ms
+            and pnl_valid
+            and source_complete
+            and terminal_timing_valid
+            and outcome in {"tp1_first", "sl_first", "max_hold", "no_fill"}
+        )
+        evidence["opportunities"] = int(evidence.get("opportunities") or 0) + 1
+        if data_complete and outcome == "tp1_first":
+            evidence["evaluable"] = int(evidence.get("evaluable") or 0) + 1
+            evidence["tp_first"] = int(evidence.get("tp_first") or 0) + 1
+        elif data_complete and outcome == "sl_first":
+            evidence["evaluable"] = int(evidence.get("evaluable") or 0) + 1
+            evidence["sl_first"] = int(evidence.get("sl_first") or 0) + 1
+        elif data_complete and outcome == "max_hold":
+            evidence["evaluable"] = int(evidence.get("evaluable") or 0) + 1
+            evidence["max_hold"] = int(evidence.get("max_hold") or 0) + 1
+        elif data_complete and outcome == "no_fill":
+            evidence["no_fill"] = int(evidence.get("no_fill") or 0) + 1
+        elif outcome == "ambiguous_both":
+            evidence["ambiguous"] = int(evidence.get("ambiguous") or 0) + 1
+        else:
+            evidence["incomplete"] = int(evidence.get("incomplete") or 0) + 1
+        if data_complete:
+            evidence["net_pnl_usdc"] = (
+                float(evidence.get("net_pnl_usdc") or 0.0) + pnl
+            )
+        evidence.setdefault("records", []).append(
+            {
+                "opportunity_id": opportunity_id,
+                "episode_id": episode_id or None,
+                "outcome": outcome,
+                "net_pnl_usdc": pnl,
+                "pnl_valid": pnl_valid,
+                "resolved_at_ms": resolved_at_ms,
+                "processed_at_ms": processed_at_ms,
+                "data_complete": data_complete,
+                "policy_hash": active_hash,
+            }
+        )
+        evidence["last_outcome"] = outcome
+        evidence["last_outcome_at_ms"] = resolved_at_ms or None
+        evidence["gate_family_id"] = gate_family
+        evidence["lane_code"] = lane
+        evidence["coarse_market_state"] = coarse_state
+        session["route_stats"] = self._adaptive_route_stats_snapshot(session)
+        durable = await self._v1459_guard.checkpoint(
+            session,
+            checkpoint_at_ms=processed_at_ms,
+        )
+        if not durable.continue_live:
+            session["stop_requested"] = True
+            session["rearm_enabled"] = False
+            session["safety_halt_reason"] = "v1461_shadow_evidence_checkpoint_failed"
+            logger.error(
+                "v1461_shadow_evidence_checkpoint_failed",
+                status=durable.status,
+                reason=durable.reason,
+            )
+
     async def _log_codex_v1_shadow_outcome(
         self,
         key: str,
@@ -3254,8 +14130,49 @@ class MainnetOneRunManager:
         shadow_outcome = str(outcome.get("shadow_outcome") or "none")
         details = {
             "event_type": "shadow_outcome",
+            "environment": sample.get("environment"),
+            "registry_version": sample.get("registry_version"),
+            "registry_hash": sample.get("registry_hash"),
+            "lane_definition_hash": sample.get("lane_definition_hash"),
+            "v1462_policy_hash": sample.get("v1462_policy_hash"),
+            "admission_policy_hash": sample.get("admission_policy_hash"),
+            "profile_identity_schema": sample.get("profile_identity_schema"),
+            "resolved_profile_hash": sample.get("resolved_profile_hash"),
+            "raw_accepted": sample.get("raw_accepted"),
+            "pre_gate_accepted": sample.get("pre_gate_accepted"),
+            "final_incumbent_accepted": sample.get(
+                "final_incumbent_accepted"
+            ),
+            "reject_lineage": sample.get("reject_lineage") or [],
+            "reject_reopen_flag": sample.get("reject_reopen_flag"),
+            "reject_reopen_detected": sample.get(
+                "reject_reopen_detected"
+            ),
+            "classifier_side": sample.get("classifier_side"),
+            "effective_side": sample.get("effective_side"),
+            "mode": sample.get("mode"),
+            "final_route": sample.get("final_route"),
             "sample_id": sample.get("sample_id"),
             "opportunity_id": sample.get("opportunity_id"),
+            "v1462_opportunity_id": sample.get("v1462_opportunity_id"),
+            "v1465_opportunity_id": sample.get("v1465_opportunity_id"),
+            "v1465_profile_evidence": sample.get(
+                "v1465_profile_evidence"
+            ),
+            "v1465_profile_id": sample.get("v1465_profile_id"),
+            "v1465_market_state": sample.get("v1465_market_state"),
+            "v1465_market_state_snapshot": sample.get(
+                "v1465_market_state_snapshot"
+            ),
+            "v1465_resolved_profile_hash": sample.get(
+                "v1465_resolved_profile_hash"
+            ),
+            "v1465_profile_plan_hash": sample.get(
+                "v1465_profile_plan_hash"
+            ),
+            "v1465_selector_policy_hash": sample.get(
+                "v1465_selector_policy_hash"
+            ),
             "first_seen_run_id": sample.get("first_seen_run_id"),
             "last_seen_run_id": sample.get("last_seen_run_id"),
             "raw_block_rows_count": sample.get("raw_block_rows_count"),
@@ -3269,6 +14186,17 @@ class MainnetOneRunManager:
             "shadow_lane_reason": sample.get("shadow_lane_reason"),
             "shadow_reprice_state": sample.get("shadow_reprice_state"),
             "candidate_lane": sample.get("candidate_lane"),
+            "legacy_lane_code": sample.get("legacy_lane_code"),
+            "gate_id": sample.get("gate_id"),
+            "gate_family_id": sample.get("gate_family_id"),
+            "gate_variant_id": sample.get("gate_variant_id"),
+            "gate_class": sample.get("gate_class"),
+            "policy_generation": sample.get("policy_generation"),
+            "market_state": sample.get("market_state"),
+            "coarse_market_state": sample.get("coarse_market_state"),
+            "episode_id": sample.get("episode_id"),
+            "v1461_policy_hash": sample.get("v1461_policy_hash"),
+            "reject_stage": sample.get("reject_stage"),
             "candidate_bucket": sample.get("candidate_bucket"),
             "nearest_lane_code": sample.get("nearest_lane_code"),
             "nearest_lane_name": sample.get("nearest_lane_name"),
@@ -3282,6 +14210,9 @@ class MainnetOneRunManager:
             "sampling_family": sample.get("sampling_family"),
             "sampling_quota_key": sample.get("sampling_quota_key"),
             "promotion_eligible": sample.get("promotion_eligible"),
+            "evidence_evaluator_eligible": sample.get(
+                "evidence_evaluator_eligible"
+            ),
             "diagnostic_fill_model": sample.get("diagnostic_fill_model"),
             "diagnostic_only": sample.get("diagnostic_only"),
             "sample_group_id": sample.get("sample_group_id"),
@@ -3298,6 +14229,7 @@ class MainnetOneRunManager:
             "mapping_reason": sample.get("mapping_reason"),
             "secondary_reasons": sample.get("secondary_reasons") or [],
             "lane_code": sample.get("lane_code"),
+            "effective_lane": sample.get("effective_lane"),
             "lane": sample.get("lane"),
             "strategy": sample.get("strategy"),
             "side": sample.get("side"),
@@ -3345,8 +14277,23 @@ class MainnetOneRunManager:
                     age_s = None
                 details["entry_fill_age_s"] = age_s
                 details["entry_fill_age_bucket"] = self._entry_fill_age_bucket(age_s)
-        details.update(self._codex_v1_shadow_paper_pnl(sample, details))
-        if details.get("diagnostic_only") or details.get("promotion_eligible") is False or str(details.get("fill_model") or "") != "limit_touch":
+        # v1.4.61 promotion evidence already carries an aggTrade-derived,
+        # outcome-aware cost payload.  Never overwrite it with the legacy
+        # candle/maker-maker approximation; missing/invalid evidence must stay
+        # incomplete instead of being converted into an invented zero.
+        if "paper_pnl_usdc_after_fee" not in details:
+            details.update(self._codex_v1_shadow_paper_pnl(sample, details))
+        formal_v1464_evidence = bool(
+            details.get("evidence_evaluator_eligible") is True
+        )
+        if (
+            details.get("diagnostic_only")
+            or (
+                details.get("promotion_eligible") is False
+                and not formal_v1464_evidence
+            )
+            or str(details.get("fill_model") or "") != "limit_touch"
+        ):
             details["promotion_counts_as"] = "diagnostic_only"
         elif terminal_reason == "live_entry_submitted" or details.get("shadow_outcome") == "terminated":
             details["promotion_counts_as"] = "excluded_terminal"
@@ -3358,16 +14305,466 @@ class MainnetOneRunManager:
             details["promotion_counts_as"] = "tp_success"
         else:
             details["promotion_counts_as"] = details.get("shadow_outcome")
+        if not (
+            self._v1461_config_selected()
+            or self._v1462_observation_selected()
+        ):
+            for field in (
+                "legacy_lane_code",
+                "gate_id",
+                "gate_family_id",
+                "gate_variant_id",
+                "gate_class",
+                "policy_generation",
+                "market_state",
+                "coarse_market_state",
+                "episode_id",
+                "v1461_policy_hash",
+                "reject_stage",
+            ):
+                details.pop(field, None)
+        try:
+            await self._repo.log_event(
+                str(sample.get("run_id")),
+                "entry_codex_v1_shadow_outcome",
+                details,
+            )
+        except Exception as exc:  # noqa: BLE001 - keep sample active for retry
+            logger.error(
+                "entry_codex_v1_shadow_outcome_persistence_failed",
+                run_id=sample.get("run_id"),
+                sample_id=key,
+                error=str(exc)[:200],
+            )
+            return
         self._codex_v1_shadow_outcomes_logged.add(key)
         self._codex_v1_shadow_samples.pop(key, None)
-        await self._repo.log_event(str(sample.get("run_id")), "entry_codex_v1_shadow_outcome", details)
+        if details.get("v1465_profile_evidence") is True:
+            await self._v1465_project_w6a_profile_outcome(details)
+        else:
+            durable_opportunity_id = str(
+                details.get("v1462_opportunity_id") or ""
+            )
+            if durable_opportunity_id:
+                self._v1464_terminal_opportunity_ids.add(
+                    durable_opportunity_id
+                )
+            await self._v1464_project_shadow_outcome(details)
+            await self._v1461_record_shadow_evidence(details)
+
+    def _v1461_shadow_cost_model(self) -> V1461ShadowCostModel:
+        return V1461ShadowCostModel(
+            maker_fee_rate=float(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1460_weak_shadow_maker_fee_rate",
+                    0.0,
+                )
+            ),
+            taker_fee_rate=float(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1460_weak_shadow_taker_fee_rate",
+                    getattr(self._settings, "mainnet_expected_taker_fee_rate", 0.0004),
+                )
+            ),
+            slippage_bp=max(
+                0.0,
+                float(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v133_estimated_slippage_bp",
+                        0.4,
+                    )
+                ),
+            ),
+        )
+
+    async def _v1461_advance_shadow_aggtrade_cache(
+        self,
+        run_id: str,
+        samples: Sequence[Mapping[str, Any]],
+        target_ms: int,
+    ) -> dict[str, Any]:
+        symbol = str(samples[0].get("symbol") or ADAPTIVE_SYMBOL).upper()
+        start_ms = min(int(sample.get("start_ms") or target_ms) for sample in samples)
+        cache_key = f"{run_id}|{symbol}"
+        cache = self._v1461_shadow_aggtrade_caches.get(cache_key)
+        if cache is None or int(cache.get("coverage_start_ms") or start_ms) > start_ms:
+            cache = {
+                "symbol": symbol,
+                "coverage_start_ms": start_ms,
+                "coverage_end_ms": start_ms - 1,
+                "rows": [],
+                "next_from_id": None,
+                "fetch_failures": 0,
+                "invalid_reason": None,
+                "last_error": None,
+            }
+            self._v1461_shadow_aggtrade_caches[cache_key] = cache
+        if cache.get("invalid_reason") or int(cache.get("coverage_end_ms") or 0) >= target_ms:
+            return cache
+        getter = getattr(self._client, "get_agg_trades", None)
+        if not callable(getter):
+            cache["fetch_failures"] = int(cache.get("fetch_failures") or 0) + 1
+            cache["last_error"] = "client_missing_get_agg_trades"
+            return cache
+        configured_max_pages = max(
+            1,
+            int(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1460_weak_shadow_max_pages",
+                    10,
+                )
+                or 10
+            ),
+        )
+        pages_per_cycle = max(
+            1,
+            int(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1464_shadow_aggtrade_pages_per_cycle",
+                    1,
+                )
+                or 1
+            ),
+        )
+        max_pages = min(configured_max_pages, pages_per_cycle)
+        page_limit = min(
+            1000,
+            max(
+                1,
+                int(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v1460_weak_shadow_page_limit",
+                        1000,
+                    )
+                    or 1000
+                ),
+            ),
+        )
+        for page_index in range(max_pages):
+            from_id = cache.get("next_from_id")
+            try:
+                if from_id is None:
+                    rows = list(
+                        await getter(
+                            symbol,
+                            start_time=max(
+                                start_ms,
+                                int(cache.get("coverage_end_ms") or (start_ms - 1)) + 1,
+                            ),
+                            end_time=target_ms,
+                            limit=page_limit,
+                        )
+                        or []
+                    )
+                else:
+                    rows = list(
+                        await getter(
+                            symbol,
+                            from_id=int(from_id),
+                            limit=page_limit,
+                        )
+                        or []
+                    )
+            except Exception as exc:  # noqa: BLE001 - evidence stays fail-closed
+                cache["fetch_failures"] = int(cache.get("fetch_failures") or 0) + 1
+                cache["last_error"] = str(exc)[:200]
+                break
+            cache["fetch_failures"] = 0
+            cache["last_error"] = None
+            if not rows:
+                cache["coverage_end_ms"] = target_ms
+                break
+            parsed: list[tuple[int, int, Mapping[str, Any]]] = []
+            try:
+                for row in rows:
+                    if not isinstance(row, Mapping):
+                        raise ValueError("aggTrade row is not a mapping")
+                    trade_id = int(row.get("a", row.get("id")))
+                    trade_ms = int(row.get("T", row.get("time")))
+                    if trade_id < 0 or trade_ms < 0:
+                        raise ValueError("negative aggTrade id/time")
+                    parsed.append((trade_ms, trade_id, row))
+            except (TypeError, ValueError, OverflowError) as exc:
+                cache["invalid_reason"] = f"invalid_agg_trade_page:{exc}"
+                break
+            parsed.sort(key=lambda item: (item[0], item[1]))
+            if from_id is not None and max(item[1] for item in parsed) < int(from_id):
+                cache["invalid_reason"] = "aggTrade pagination did not advance"
+                break
+            in_window = [item for item in parsed if item[0] <= target_ms]
+            cache["rows"].extend(item[2] for item in in_window)
+            crossed_target = len(in_window) < len(parsed)
+            if in_window:
+                last_ms, last_id, _last_row = in_window[-1]
+                cache["next_from_id"] = last_id + 1
+            else:
+                last_ms = int(cache.get("coverage_end_ms") or (start_ms - 1))
+            if crossed_target or len(rows) < page_limit:
+                cache["coverage_end_ms"] = target_ms
+                break
+            if page_index + 1 >= max_pages:
+                # A capped page may end in the middle of a millisecond.  Do
+                # not claim that timestamp complete until the next page is
+                # fetched, otherwise a same-ms TP/SL ambiguity can be hidden.
+                cache["coverage_end_ms"] = max(
+                    int(cache.get("coverage_end_ms") or (start_ms - 1)),
+                    last_ms - 1,
+                )
+            else:
+                cache["coverage_end_ms"] = max(
+                    int(cache.get("coverage_end_ms") or (start_ms - 1)),
+                    last_ms - 1,
+                )
+        return cache
+
+    async def _update_v1461_promotion_shadow_outcomes(
+        self,
+        run: Mapping[str, Any],
+    ) -> None:
+        run_id = str(run.get("run_id") or "")
+        samples = [
+            sample
+            for sample in self._codex_v1_shadow_samples.values()
+            if str(sample.get("run_id") or "") == run_id
+            and (
+                sample.get("promotion_eligible") is True
+                or sample.get("evidence_evaluator_eligible") is True
+                or sample.get("v1465_profile_evidence") is True
+            )
+            and str(sample.get("fill_model") or "") == "limit_touch"
+            and not bool(sample.get("diagnostic_only"))
+        ]
+        if not samples:
+            return
+        now_ms = int(time.time() * 1000)
+        target_ms = min(
+            max(0, now_ms - V1461_AGGTRADE_SETTLEMENT_LAG_MS),
+            max(
+                int(sample.get("start_ms") or now_ms)
+                + int(sample.get("outcome_ttl_s") or self.CODEX_V1_SHADOW_OUTCOME_TTL_S)
+                * 1000
+                for sample in samples
+            ),
+        )
+        cache = await self._v1461_advance_shadow_aggtrade_cache(
+            run_id,
+            samples,
+            target_ms,
+        )
+        coverage_start_ms = int(cache.get("coverage_start_ms") or 0)
+        coverage_end_ms = int(cache.get("coverage_end_ms") or 0)
+        cost_model = self._v1461_shadow_cost_model()
+        max_failures = max(
+            1,
+            int(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1460_weak_shadow_max_fetch_failures",
+                    3,
+                )
+                or 3
+            ),
+        )
+        for key, sample in list(self._codex_v1_shadow_samples.items()):
+            if sample not in samples:
+                continue
+            coverage_started = coverage_end_ms >= coverage_start_ms
+            outcome = evaluate_v1461_shadow_evidence(
+                sample,
+                cache.get("rows") or [],
+                coverage_start_ms=coverage_start_ms,
+                coverage_end_ms=max(coverage_start_ms, coverage_end_ms),
+                coverage_complete=(
+                    coverage_started and not bool(cache.get("invalid_reason"))
+                ),
+                cost_model=cost_model,
+            )
+            if bool(outcome.get("data_complete")):
+                await self._log_codex_v1_shadow_outcome(key, sample, outcome)
+                continue
+            entry_deadline_ms = int(sample.get("start_ms") or now_ms) + int(
+                sample.get("entry_ttl_s") or self.CODEX_V1_SHADOW_ENTRY_TTL_S
+            ) * 1000
+            terminal_data_failure = bool(cache.get("invalid_reason")) or int(
+                cache.get("fetch_failures") or 0
+            ) >= max_failures
+            data_quality_reason = str(
+                (outcome.get("data_quality") or {}).get("reason") or ""
+            )
+            pending_coverage = (
+                data_quality_reason == "coverage_not_complete"
+                or data_quality_reason.startswith(
+                    "coverage_ends_before_required_deadline"
+                )
+            )
+            if data_quality_reason and not pending_coverage:
+                terminal_data_failure = True
+            if terminal_data_failure and now_ms >= entry_deadline_ms:
+                data_quality = dict(outcome.get("data_quality") or {})
+                data_quality["fetch_error"] = (
+                    cache.get("invalid_reason") or cache.get("last_error")
+                )
+                outcome = {**dict(outcome), "data_quality": data_quality}
+                await self._log_codex_v1_shadow_outcome(key, sample, outcome)
+
+    async def _update_v1469_paired_shadow_outcomes(
+        self,
+        run: Mapping[str, Any],
+    ) -> None:
+        """Advance every recent matched lane on one shared aggTrade path."""
+
+        runtime = getattr(self, "_v1469_paired_shadow_runtime", None)
+        if runtime is None:
+            return
+        run_id = str(run.get("run_id") or "").strip()
+        if not run_id:
+            return
+        now_ms = int(time.time() * 1000)
+        try:
+            restored = await runtime.rehydrate_run(
+                environment="MAINNET",
+                symbol=ADAPTIVE_SYMBOL,
+                source_run_id=None,
+                observed_after_ms=max(
+                    0, now_ms - 2 * 60 * 60 * 1000
+                ),
+            )
+            if int(restored.get("invalid") or 0) > 0:
+                logger.error(
+                    "v1469_paired_shadow_rehydrate_invalid",
+                    **restored,
+                )
+            elif int(restored.get("evidence") or 0) > 0:
+                logger.info(
+                    "v1469_paired_shadow_rehydrated",
+                    **restored,
+                )
+        except Exception as exc:  # noqa: BLE001 - shadow only
+            logger.error(
+                "v1469_paired_shadow_rehydrate_failed",
+                error=str(exc)[:300],
+            )
+            return
+
+        samples = runtime.cache_samples()
+        if not samples:
+            return
+        target_ms = min(
+            max(0, now_ms - V1461_AGGTRADE_SETTLEMENT_LAG_MS),
+            max(
+                int(sample.get("start_ms") or now_ms)
+                + int(sample.get("outcome_ttl_s") or 1) * 1000
+                for sample in samples
+            ),
+        )
+        cache = await self._v1461_advance_shadow_aggtrade_cache(
+            run_id,
+            samples,
+            target_ms,
+        )
+        coverage_start_ms = int(cache.get("coverage_start_ms") or 0)
+        coverage_end_ms = int(cache.get("coverage_end_ms") or 0)
+        max_failures = max(
+            1,
+            int(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1460_weak_shadow_max_fetch_failures",
+                    3,
+                )
+                or 3
+            ),
+        )
+        force_data_failure = bool(cache.get("invalid_reason")) or int(
+            cache.get("fetch_failures") or 0
+        ) >= max_failures
+        try:
+            roundtrip_fee_bp = max(
+                0.0,
+                float(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v1469_roundtrip_fee_bp",
+                        4.0,
+                    )
+                    or 0.0
+                ),
+            )
+            slippage_bp = max(
+                0.0,
+                float(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v1469_slippage_bp",
+                        1.0,
+                    )
+                    or 0.0
+                ),
+            )
+        except (TypeError, ValueError, OverflowError):
+            roundtrip_fee_bp = 4.0
+            slippage_bp = 1.0
+        summary = await runtime.advance(
+            source_run_id=None,
+            agg_trade_rows=cache.get("rows") or (),
+            coverage_start_ms=coverage_start_ms,
+            coverage_end_ms=max(coverage_start_ms, coverage_end_ms),
+            coverage_complete=bool(
+                coverage_end_ms >= coverage_start_ms
+                and not cache.get("invalid_reason")
+            ),
+            force_data_failure=force_data_failure,
+            now_ms=now_ms,
+            cost_model=ShadowCostModel(
+                maker_fee_bp=roundtrip_fee_bp / 2.0,
+                taker_fee_bp=max(4.0, roundtrip_fee_bp / 2.0),
+                adverse_slippage_bp=slippage_bp,
+                provenance="V1469_SETTINGS_CONSERVATIVE",
+            ),
+        )
+        if int(summary.get("errors") or 0) > 0:
+            logger.error(
+                "v1469_paired_shadow_advance_errors",
+                run_id=run_id,
+                **summary,
+            )
+        elif int(summary.get("evidence_terminal") or 0) > 0:
+            logger.info(
+                "v1469_paired_shadow_terminal",
+                run_id=run_id,
+                **summary,
+            )
 
     async def _update_codex_v1_shadow_outcomes(self, run: Mapping[str, Any], candles: Sequence[Candle]) -> None:
+        use_aggtrade_evidence = bool(
+            self._v1461_config_selected()
+            or self._v1462_observation_selected()
+        )
+        if use_aggtrade_evidence:
+            await self._update_v1461_promotion_shadow_outcomes(run)
+        await self._update_v1469_paired_shadow_outcomes(run)
         if not candles:
             return
         run_id = str(run.get("run_id") or "")
         for key, sample in list(self._codex_v1_shadow_samples.items()):
             if str(sample.get("run_id") or "") != run_id:
+                continue
+            if (
+                use_aggtrade_evidence
+                and (
+                    sample.get("promotion_eligible") is True
+                    or sample.get("evidence_evaluator_eligible") is True
+                    or sample.get("v1465_profile_evidence") is True
+                )
+                and str(sample.get("fill_model") or "") == "limit_touch"
+                and not bool(sample.get("diagnostic_only"))
+            ):
                 continue
             outcome = self._codex_v1_shadow_first_touch(sample, candles)
             if outcome is not None:
@@ -3379,9 +14776,17 @@ class MainnetOneRunManager:
         run: Mapping[str, Any],
         reason: str,
         candles: Sequence[Candle] | None = None,
-    ) -> None:
+    ) -> int:
         if candles:
-            await self._update_codex_v1_shadow_outcomes(run, candles)
+            try:
+                await self._update_codex_v1_shadow_outcomes(run, candles)
+            except Exception as exc:  # noqa: BLE001 - shadow must not block safety
+                logger.warning(
+                    "codex_v1_shadow_terminal_update_failed",
+                    run_id=run.get("run_id"),
+                    reason=reason,
+                    error=str(exc)[:200],
+                )
         run_id = str(run.get("run_id") or "")
         now_ms = int(time.time() * 1000)
         for key, sample in list(self._codex_v1_shadow_samples.items()):
@@ -3389,25 +14794,51 @@ class MainnetOneRunManager:
                 continue
             start_ms = int(sample.get("start_ms") or now_ms)
             terminal_outcome = "terminated" if reason == "live_entry_submitted" else "none"
-            await self._log_codex_v1_shadow_outcome(
-                key,
-                sample,
-                {
-                    "shadow_outcome": terminal_outcome,
-                    "hit_time_ms": now_ms,
-                    "elapsed_s": round(max(0, now_ms - start_ms) / 1000.0, 1),
-                    "excluded_from_promotion": reason == "live_entry_submitted",
-                },
-                terminal_reason=reason,
-            )
+            if isinstance(sample, dict):
+                sample["terminal_pending_reason"] = reason
+            try:
+                await self._log_codex_v1_shadow_outcome(
+                    key,
+                    sample,
+                    {
+                        "shadow_outcome": terminal_outcome,
+                        "hit_time_ms": now_ms,
+                        "elapsed_s": round(max(0, now_ms - start_ms) / 1000.0, 1),
+                        "excluded_from_promotion": reason == "live_entry_submitted",
+                    },
+                    terminal_reason=reason,
+                )
+            except Exception as exc:  # noqa: BLE001 - retry without blocking safety
+                logger.warning(
+                    "codex_v1_shadow_terminal_persistence_unhandled",
+                    run_id=run_id,
+                    sample_id=key,
+                    reason=reason,
+                    error=str(exc)[:200],
+                )
+        unresolved = sum(
+            1
+            for sample in self._codex_v1_shadow_samples.values()
+            if str(sample.get("run_id") or "") == run_id
+        )
+        if unresolved:
+            self._v1463_terminal_reconcile_needed = True
+        return unresolved
 
     def _clear_codex_v1_shadow_samples(self, run_id: str) -> None:
-        self._codex_v1_shadow_samples = {
-            key: value
-            for key, value in self._codex_v1_shadow_samples.items()
-            if str(value.get("run_id") or "") != str(run_id)
-        }
+        unresolved = sum(
+            1
+            for value in self._codex_v1_shadow_samples.values()
+            if str(value.get("run_id") or "") == str(run_id)
+        )
+        if unresolved:
+            self._codex_v1_shadow_sample_counts_by_run[str(run_id)] = unresolved
+            self._v1463_terminal_reconcile_needed = True
+            return
         self._codex_v1_shadow_sample_counts_by_run.pop(str(run_id), None)
+        for cache_key in list(self._v1461_shadow_aggtrade_caches):
+            if cache_key.startswith(f"{run_id}|"):
+                self._v1461_shadow_aggtrade_caches.pop(cache_key, None)
 
     def _clear_codex_v132_tp_policy_samples(self, run_id: str) -> None:
         self._codex_v132_tp_policy_samples = {
@@ -3416,24 +14847,45 @@ class MainnetOneRunManager:
             if str(value.get("run_id") or "") != str(run_id)
         }
 
-    async def _drop_codex_v132_tp_policy_samples(self, run_id: str, reason: str) -> None:
+    async def _drop_codex_v132_tp_policy_sample(
+        self,
+        paired_sample_id: str,
+        active: Mapping[str, Any],
+        reason: str,
+    ) -> None:
         now_ms = int(time.time() * 1000)
+        run_id = str(active.get("run_id") or "")
+        start_ms = int(active.get("start_ms") or now_ms)
+        details = {
+            **dict(active),
+            "event_type": "tp_policy_shadow_dropped",
+            "drop_reason": reason,
+            "dropped_at_ms": now_ms,
+            "elapsed_s": round(max(0, now_ms - start_ms) / 1000.0, 1),
+        }
+        outcome_id = f"tpdrop_{paired_sample_id}_{reason}"
+        if outcome_id not in self._codex_v132_tp_policy_outcomes_logged:
+            self._v132_terminal_reconcile_needed = True
+            await self._repo.log_event(
+                run_id,
+                "entry_codex_v1_tp_policy_shadow_dropped",
+                details,
+            )
+            self._codex_v132_tp_policy_outcomes_logged.add(outcome_id)
+        self._codex_v132_tp_policy_samples.pop(paired_sample_id, None)
+        self._v132_terminal_reconcile_needed = bool(
+            self._codex_v132_tp_policy_samples
+        )
+
+    async def _drop_codex_v132_tp_policy_samples(self, run_id: str, reason: str) -> None:
         for paired_sample_id, active in list(self._codex_v132_tp_policy_samples.items()):
             if str(active.get("run_id") or "") != str(run_id):
                 continue
-            start_ms = int(active.get("start_ms") or now_ms)
-            details = {
-                **dict(active),
-                "event_type": "tp_policy_shadow_dropped",
-                "drop_reason": reason,
-                "dropped_at_ms": now_ms,
-                "elapsed_s": round(max(0, now_ms - start_ms) / 1000.0, 1),
-            }
-            outcome_id = f"tpdrop_{paired_sample_id}_{reason}"
-            if outcome_id not in self._codex_v132_tp_policy_outcomes_logged:
-                self._codex_v132_tp_policy_outcomes_logged.add(outcome_id)
-                await self._repo.log_event(run_id, "entry_codex_v1_tp_policy_shadow_dropped", details)
-            self._codex_v132_tp_policy_samples.pop(paired_sample_id, None)
+            await self._drop_codex_v132_tp_policy_sample(
+                paired_sample_id,
+                active,
+                reason,
+            )
 
     def _codex_v132_enabled(self) -> bool:
         return bool(
@@ -3468,18 +14920,28 @@ class MainnetOneRunManager:
             "entry_codex_v1_tp_policy_shadow_started",
             "entry_codex_v1_tp_policy_shadow_outcome",
             "entry_codex_v1_tp_policy_shadow_dropped",
+            "entry_codex_v1_tp_policy_shadow_terminal_committed",
         )
         get_events_by_types = getattr(self._repo, "get_events_by_types", None)
-        get_events = getattr(self._repo, "get_events", None)
-        if not callable(get_events_by_types) and not callable(get_events):
-            self._codex_v132_rehydrated_runs.add(run_id)
+        if not callable(get_events_by_types):
+            logger.warning(
+                "codex_v132_tp_policy_rehydrate_unbounded_reader_missing",
+                run_id=run_id,
+            )
             return
         try:
-            if callable(get_events_by_types):
-                events = await get_events_by_types(run_id, event_types, limit=5000)
-            else:
-                events = await get_events(run_id, limit=5000)
-                events = [event for event in events if str(event.get("event_type") or "") in event_types]
+            try:
+                events = await get_events_by_types(
+                    run_id,
+                    event_types,
+                    limit=None,
+                )
+            except TypeError:
+                events = await get_events_by_types(
+                    run_id,
+                    event_types,
+                    limit=2_147_483_647,
+                )
         except Exception as exc:  # noqa: BLE001
             logger.warning("codex_v132_tp_policy_rehydrate_events_failed", run_id=run_id, error=str(exc)[:200])
             return
@@ -3493,7 +14955,18 @@ class MainnetOneRunManager:
             paired_id = str(details.get("paired_sample_id") or "")
             if not paired_id:
                 continue
-            if event_type in {"entry_codex_v1_tp_policy_shadow_outcome", "entry_codex_v1_tp_policy_shadow_dropped"}:
+            if event_type == "entry_codex_v1_tp_policy_shadow_outcome":
+                # An outcome row is already a durable terminal fact.  A crash
+                # before the later terminal-committed audit row must not
+                # resurrect the sample and produce a duplicate outcome.
+                terminal_pairs.add(paired_id)
+                outcome_id = str(details.get("tp_policy_outcome_id") or "")
+                if outcome_id:
+                    self._codex_v132_tp_policy_outcomes_logged.add(outcome_id)
+            if event_type in {
+                "entry_codex_v1_tp_policy_shadow_dropped",
+                "entry_codex_v1_tp_policy_shadow_terminal_committed",
+            }:
                 terminal_pairs.add(paired_id)
 
         for event in events:
@@ -3530,6 +15003,52 @@ class MainnetOneRunManager:
                 )
             except Exception as exc:  # noqa: BLE001 - audit write must not affect run management
                 logger.warning("codex_v132_tp_policy_rehydrated_log_failed", run_id=run_id, error=str(exc)[:200])
+
+    async def _reconcile_terminal_v132_tp_policy_samples(self) -> None:
+        """Conservatively close unmatched TP-policy batches after terminal runs."""
+
+        if not self._codex_v132_enabled():
+            return
+        if (
+            self._v132_terminal_startup_reconciled
+            and not self._v132_terminal_reconcile_needed
+        ):
+            return
+        get_unresolved = getattr(
+            self._repo,
+            "get_terminal_runs_with_unresolved_v132_tp_policy_samples",
+            None,
+        )
+        rows = list(await get_unresolved()) if callable(get_unresolved) else []
+        target_run_ids: set[str] = set()
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            await self._rehydrate_codex_v132_tp_policy_samples(row)
+            run_id = str(row.get("run_id") or "")
+            if run_id not in self._codex_v132_rehydrated_runs:
+                self._v132_terminal_reconcile_needed = True
+                raise RuntimeError(
+                    f"v132 TP-policy ledger rehydrate incomplete for {run_id}"
+                )
+            if run_id:
+                target_run_ids.add(run_id)
+        if self._v132_terminal_reconcile_needed:
+            target_run_ids.update(
+                str(sample.get("run_id") or "")
+                for sample in self._codex_v132_tp_policy_samples.values()
+                if sample.get("run_id")
+            )
+        for run_id in target_run_ids:
+            await self._drop_codex_v132_tp_policy_samples(
+                run_id,
+                "terminal_restart_data_incomplete",
+            )
+        self._v132_terminal_startup_reconciled = True
+        self._v132_terminal_reconcile_needed = bool(
+            self._codex_v132_tp_policy_samples
+        )
+
     async def _start_codex_v132_tp_policy_sample(
         self,
         sample: Mapping[str, Any],
@@ -3551,8 +15070,8 @@ class MainnetOneRunManager:
         paired_sample_id = str(active.get("paired_sample_id") or "")
         if not paired_sample_id or paired_sample_id in self._codex_v132_tp_policy_samples:
             return
-        self._codex_v132_tp_policy_samples[paired_sample_id] = active
         await self._repo.log_event(str(active.get("run_id")), "entry_codex_v1_tp_policy_shadow_started", active)
+        self._codex_v132_tp_policy_samples[paired_sample_id] = active
 
     async def _start_codex_v132_live_tp_policy_sample(
         self,
@@ -3625,6 +15144,8 @@ class MainnetOneRunManager:
         if not candles or not self._codex_v132_enabled():
             return
         run_id = str(run.get("run_id") or "")
+        if force_terminal:
+            self._v132_terminal_reconcile_needed = True
         for paired_sample_id, active in list(self._codex_v132_tp_policy_samples.items()):
             if str(active.get("run_id") or "") != run_id:
                 continue
@@ -3638,16 +15159,40 @@ class MainnetOneRunManager:
             if outcomes is None:
                 continue
             if not outcomes:
-                self._codex_v132_tp_policy_samples.pop(paired_sample_id, None)
+                await self._drop_codex_v132_tp_policy_sample(
+                    paired_sample_id,
+                    active,
+                    "invalid_outcome_build",
+                )
                 continue
+            outcome_ids: list[str] = []
             for details in outcomes:
                 outcome_id = str(details.get("tp_policy_outcome_id") or "")
+                if outcome_id:
+                    outcome_ids.append(outcome_id)
                 if outcome_id and outcome_id in self._codex_v132_tp_policy_outcomes_logged:
                     continue
+                await self._repo.log_event(run_id, "entry_codex_v1_tp_policy_shadow_outcome", details)
                 if outcome_id:
                     self._codex_v132_tp_policy_outcomes_logged.add(outcome_id)
-                await self._repo.log_event(run_id, "entry_codex_v1_tp_policy_shadow_outcome", details)
+            await self._repo.log_event(
+                run_id,
+                "entry_codex_v1_tp_policy_shadow_terminal_committed",
+                {
+                    "event_type": "tp_policy_shadow_terminal_committed",
+                    "run_id": run_id,
+                    "paired_sample_id": paired_sample_id,
+                    "tp_policy_path_id": active.get("tp_policy_path_id"),
+                    "outcome_count": len(outcome_ids),
+                    "tp_policy_outcome_ids": outcome_ids,
+                },
+            )
             self._codex_v132_tp_policy_samples.pop(paired_sample_id, None)
+        if force_terminal:
+            self._v132_terminal_reconcile_needed = any(
+                str(sample.get("run_id") or "") == run_id
+                for sample in self._codex_v132_tp_policy_samples.values()
+            )
 
     async def _terminalize_codex_v132_tp_policy_samples(
         self,
@@ -3667,7 +15212,8 @@ class MainnetOneRunManager:
             notional = 0.0
         realized = float(summary.get("realized_pnl_usdc") or 0.0)
         commission = float(summary.get("commission_usdc") or 0.0)
-        net = realized - commission
+        funding = float(summary.get("funding_usdc") or 0.0)
+        net = realized - commission - funding
         actual_live_pnl_bp_after_fee = (net / notional * 10000.0) if notional > 0 else None
         for active in self._codex_v132_tp_policy_samples.values():
             if str(active.get("run_id") or "") != run_id:
@@ -3677,6 +15223,7 @@ class MainnetOneRunManager:
             active["actual_live_pnl_usdc_after_fee"] = round(net, 8)
             active["actual_live_realized_pnl_usdc"] = round(realized, 8)
             active["actual_live_commission_usdc"] = round(commission, 8)
+            active["actual_live_funding_usdc"] = round(funding, 8)
             active["actual_live_pnl_bp_after_fee"] = (
                 round(actual_live_pnl_bp_after_fee, 4)
                 if actual_live_pnl_bp_after_fee is not None
@@ -3712,6 +15259,10 @@ class MainnetOneRunManager:
             "adv3",
             "d3",
             "d5",
+            "slope30",
+            "slope60",
+            "slope120",
+            "v1421_slope_source",
             "range_bp",
             "ret3_bp",
             "close_pos",
@@ -3734,9 +15285,17 @@ class MainnetOneRunManager:
             "feature_age_seconds",
             "maker_fee_bp",
             "open_position",
+            "open_order_count",
+            "open_run_order_count",
+            "ignored_foreign_open_order_count",
             "open_entry_order",
             "open_reduce_order",
             "kill_switch",
+            "market_state",
+            "v1469_regime_state",
+            "v1469_regime_market_state",
+            "v1459_regime_state",
+            "v1459_regime_market_state",
         )
         payload: dict[str, Any] = {}
         for key in keys:
@@ -3802,12 +15361,286 @@ class MainnetOneRunManager:
         signal_json = signal_or_run.get("signal_json") if isinstance(signal_or_run, Mapping) else None
         if not signal_json:
             return {}
-        try:
-            parsed = json.loads(signal_json)
-        except Exception:
-            return {}
+        if isinstance(signal_json, Mapping):
+            parsed = signal_json
+        else:
+            try:
+                parsed = json.loads(str(signal_json))
+            except Exception:
+                return {}
         codex = parsed.get("codex_v1") or {}
         return codex if isinstance(codex, dict) else {}
+
+    async def _v1464_record_paid_terminal(
+        self,
+        run: Mapping[str, Any],
+        *,
+        net_pnl_usdc: float,
+        reason: str,
+        terminal_at_ms: int,
+    ) -> None:
+        """Persist one reconciled paid result for an adaptively admitted run."""
+
+        runtime = self._v1464_promotion_runtime
+        if runtime is None:
+            return
+        codex = self._codex_v1_signal_meta(run)
+        metrics = (
+            codex.get("metrics")
+            if isinstance(codex.get("metrics"), Mapping)
+            else {}
+        )
+        metadata = (
+            metrics.get("v1464_adaptive_promotion")
+            if isinstance(
+                metrics.get("v1464_adaptive_promotion"),
+                Mapping,
+            )
+            else None
+        )
+        if not metadata or not bool(metadata.get("adaptive_authorized")):
+            return
+        try:
+            await runtime.record_paid_terminal(
+                metadata,
+                run_id=str(run.get("run_id") or ""),
+                terminal_at_ms=int(terminal_at_ms),
+                net_pnl_usdc=float(net_pnl_usdc),
+                reason=str(reason),
+                now_ms=int(time.time() * 1000),
+            )
+        except Exception as exc:  # noqa: BLE001 - closed run stays closed
+            self._v1464_paid_terminal_reconciled = False
+            logger.error(
+                "v1464_paid_terminal_projection_failed",
+                run_id=run.get("run_id"),
+                error=str(exc)[:200],
+            )
+
+    async def _v1464_reconcile_paid_terminals(self) -> None:
+        """Idempotently backfill reconciled promoted runs after failure/restart."""
+
+        runtime = self._v1464_promotion_runtime
+        if runtime is None or self._v1464_paid_terminal_reconciled:
+            return
+        get_recent_runs = getattr(self._repo, "get_recent_runs", None)
+        get_events = getattr(self._repo, "get_events", None)
+        if not callable(get_recent_runs) or not callable(get_events):
+            return
+        rows = await get_recent_runs(limit=300)
+        cutoff = int(runtime.activation_cutoff_ms)
+        for run in rows or ():
+            if not isinstance(run, Mapping):
+                continue
+            if str(run.get("status") or "").upper() != "COMPLETED":
+                continue
+            completed_at_ms = self._completed_at_ms(run)
+            if completed_at_ms < cutoff:
+                continue
+            codex = self._codex_v1_signal_meta(run)
+            metrics = (
+                codex.get("metrics")
+                if isinstance(codex.get("metrics"), Mapping)
+                else {}
+            )
+            metadata = (
+                metrics.get("v1464_adaptive_promotion")
+                if isinstance(
+                    metrics.get("v1464_adaptive_promotion"),
+                    Mapping,
+                )
+                else None
+            )
+            if not metadata or not bool(
+                metadata.get("adaptive_authorized")
+            ):
+                continue
+            events = await get_events(
+                str(run.get("run_id") or ""),
+                limit=100,
+            )
+            completed_event: Mapping[str, Any] | None = None
+            completed_details: Mapping[str, Any] | None = None
+            for event in events or ():
+                if (
+                    isinstance(event, Mapping)
+                    and str(event.get("event_type") or "")
+                    == "completed"
+                ):
+                    details = self._event_details(event)
+                    if isinstance(details, Mapping):
+                        completed_event = event
+                        completed_details = details
+                        break
+            if (
+                completed_event is None
+                or completed_details is None
+                or completed_details.get("eligible_for_wr_ev") is not True
+            ):
+                continue
+            terminal_at_ms = int(
+                completed_event.get("event_time_ms")
+                or completed_at_ms
+            )
+            await runtime.record_paid_terminal(
+                metadata,
+                run_id=str(run.get("run_id") or ""),
+                terminal_at_ms=terminal_at_ms,
+                net_pnl_usdc=float(
+                    completed_details.get("net_pnl") or 0.0
+                ),
+                reason=str(
+                    completed_details.get("exit_reason_final")
+                    or completed_details.get("reason")
+                    or run.get("exit_reason")
+                    or ""
+                ),
+                now_ms=int(time.time() * 1000),
+            )
+        runtime.mark_database_healthy()
+        self._v1464_paid_terminal_reconciled = True
+
+    def _codex_v142_profile_shadow(self, lane_code: Any) -> dict[str, Any] | None:
+        if not bool(getattr(self._settings, "mainnet_codex_v142_profile_shadow_enabled", True)):
+            return None
+        lane = str(lane_code or "").upper()
+        profiles = {
+            "STUP-S": {
+                "status": "v1420_fixed_regime_exec",
+                "source": V143_PROFILE_SOURCE,
+                "states": {
+                    "clean_extension": {"entry_bp": 2.0, "tp1_bp": 6.0, "full_tp_bp": 80.0, "partial_exit_pct": 0.70, "sl_bp": 8.0, "be_bp": 2.0, "ttl_s": 60, "adaptive_tp_engine": "v1420_stups_runner_after_clean_gate", "gate": "rng15<=36 and 8<=vwap<=13.5 and d30>=10 and (pullback>=27 or range_pos_15<=0.80)"},
+                    "mixed": {"entry_bp": 2.0, "tp1_bp": 6.0, "full_tp_bp": 80.0, "partial_exit_pct": 0.70, "sl_bp": 8.0, "be_bp": 2.0, "ttl_s": 60, "adaptive_tp_engine": "v1420_stups_runner_after_bad_weakzone_block", "blocked_substates": ["mixed_bad", "mixed_weakzone"]},
+                    "weak_chop": {"entry_bp": 0.0, "tp1_bp": 5.0, "full_tp_bp": 12.0, "partial_exit_pct": 0.60, "sl_bp": 10.0, "be_bp": 4.0, "ttl_s": 90, "adaptive_tp_engine": "v1416_stups_tp1_runner"},
+                    "no_momentum_edge": {"entry_bp": 1.0, "tp1_bp": 8.0, "partial_exit_pct": 1.0, "sl_bp": 15.0, "be_bp": 0.0, "ttl_s": 90, "small_n_forward_watch": True},
+                },
+                "live_adjustments": {
+                    "weak_chop_low_rng_weak_adv": {
+                        "status": "cautious_live_entry",
+                        "condition": "rng15<=30 and adv3<3",
+                        "entry_bp": 2.0,
+                        "tp1_bp": 5.0,
+                        "full_tp_bp": 12.0,
+                        "partial_exit_pct": 0.60,
+                        "policy_tag": "v1417_stups_low_rng_weak_adv_cautious_live",
+                    },
+                    "clean_extension_hot_entry_band": {
+                        "status": "legacy_disabled_by_v1420_runner",
+                        "condition": "rsi>=62 and vwap_dist_bp>=8 and pullback_from_recent_high_bp>=30 and (range_pos_15>=0.90 or adv3>=10 or d30>=30)",
+                        "entry_bp": 6.0,
+                        "ttl_s": 75,
+                        "policy_tag": "v1418_stups_clean_extension_hot_entry_band",
+                        "disabled_when": "adaptive_tp_engine in {v1419_stups_runner,v1420_stups_runner_after_clean_gate}",
+                    },
+                },
+                "shadow_only_states": ["stale_squeeze_top", "counter_recoil", "near_vwap_flat", "missing_features"],
+                "live_blocks": {
+                    "clean_extension_gate": "v1420_stups_clean_extension_gate_block",
+                    "mixed_bad": "v1420_stups_mixed_bad_block",
+                    "mixed_weakzone": "v1420_stups_mixed_weakzone_block",
+                    "weak_chop_extreme": "v1420_stups_weak_chop_extreme_block"
+                },
+            },
+            "W6A": {
+                "status": "v143_shadow_only",
+                "source": V143_PROFILE_SOURCE,
+                "reason": "W6A high_range/mixed stayed below the 75% WR live threshold in the 1.4.1/1.4.2 tick sweep.",
+                "observe_states": ["falling_pullback", "high_range", "mixed"],
+            },
+            "S1P-L": {
+                "status": "v149_live_tiny_profile_hotfix",
+                "source": "reports/v141_aggtick_optimization_2026-06-27.md",
+                "reason": "v1.4.8 forward loss showed requested $10 but live applied $40; v1.4.9+ enforces the Binance-min $25 applied floor with the TP6/SL15 full-exit profile.",
+                "policy_tag": "v149_s1pl_tiny_profile_fix",
+                "fixed_notional_usdc": 25.0,
+                "entry_bp": 0.0,
+                "tp1_bp": 6.0,
+                "partial_exit_pct": 1.0,
+                "sl_bp": 15.0,
+                "be_bp": 0.0,
+                "ttl_s": 180,
+                "small_n_forward_watch": True,
+            },
+            "CNL-WPR-L": {
+                "status": "v1420_fixed_bucket_candidate_live",
+                "source": V143_PROFILE_SOURCE,
+                "policy_tag": WPR_V1419_POLICY_TAG,
+                "states": WPR_V143_PROFILES,
+                "live_blocks": {
+                    "discount_mixed_bad_slice": WPR_V1419_DISCOUNT_MIXED_BLOCK_REASON,
+                    "falling_discount_trap_bad_slice": WPR_V1419_FALLING_BAD_BLOCK_REASON,
+                    "falling_continuation_hirange": WPR_V1420_CONTINUATION_HIGH_RANGE_BLOCK_REASON,
+                },
+                "live_overrides": {
+                    "CNL-WPR-L:discount_mixed": {
+                        "entry_bp": 0.0,
+                        "tp1_bp": 5.0,
+                        "full_tp_bp": 16.0,
+                        "partial_exit_pct": 0.45,
+                        "sl_bp": 15.0,
+                        "be_bp": 2.0,
+                        "ttl_s": 150,
+                        "adaptive_tp_engine": "v1420_wpr_discount_mixed_runner",
+                    },
+                    "CNL-WPR-L:falling_discount_trap": {
+                        "entry_bp": 2.0,
+                        "tp1_bp": 6.0,
+                        "full_tp_bp": 20.0,
+                        "partial_exit_pct": 0.70,
+                        "sl_bp": 8.0,
+                        "be_bp": 2.0,
+                        "ttl_s": 60,
+                        "adaptive_tp_engine": "v1420_wpr_falling_discount_runner",
+                    },
+                    "CNL-WPR-L:falling_continuation_probe": {
+                        "entry_bp": 3.0,
+                        "tp1_bp": 6.0,
+                        "full_tp_bp": 8.0,
+                        "partial_exit_pct": 0.40,
+                        "sl_bp": 10.0,
+                        "be_bp": 2.0,
+                        "ttl_s": 60,
+                        "adaptive_tp_engine": "v1420_wpr_falling_continuation_probe_filtered",
+                    },
+                    "CNL-WPR-L:discount_delayed_reclaim": {
+                        "entry_bp": 3.0,
+                        "tp1_bp": 5.0,
+                        "full_tp_bp": 8.0,
+                        "partial_exit_pct": 0.70,
+                        "sl_bp": 8.0,
+                        "be_bp": 2.0,
+                        "ttl_s": 75,
+                        "adaptive_tp_engine": "v1420_wpr_discount_delayed_reclaim_tight",
+                    },
+                    "CNL-WPR-L:deep_discount_stable": {
+                        "entry_bp": 2.0,
+                        "tp1_bp": 6.0,
+                        "full_tp_bp": 6.0,
+                        "partial_exit_pct": 1.0,
+                        "sl_bp": 8.0,
+                        "be_bp": 0.0,
+                        "ttl_s": 60,
+                        "staged_entry_reprice_enabled": True,
+                        "staged_entry_bps": (2.0, 1.0, 0.0),
+                        "staged_entry_delay_s": 25,
+                        "adaptive_tp_engine": "v1420_wpr_deep_discount_stable_tight",
+                    },
+                },
+                "no_fill_recovery_watch": "No-fill is retained as part of edge; v1.4.20 favors selective fixed buckets and blocks only tested bad substates.",
+            },
+        }
+        profile = profiles.get(lane)
+        if profile is None:
+            return None
+        raw_hours = str(getattr(self._settings, "mainnet_codex_v142_no_fill_watch_hours_tpe", "") or "")
+        watch_hours = [part.strip() for part in raw_hours.split(",") if part.strip()]
+        return {
+            "version": CODEX_V1_VERSION,
+            "source": "v1420_profile_explorer_2026_06_28_29",
+            "lane_code": lane,
+            "profile": profile,
+            "no_fill_watch_hours_tpe": watch_hours,
+        }
 
     @classmethod
     def _codex_v1_telegram_note(cls, signal_or_run: Mapping[str, Any] | dict | None) -> str:
@@ -3950,6 +15783,26 @@ class MainnetOneRunManager:
                 overrides[lane_key] = ttl_s
         return overrides
 
+    def _codex_v1442_cnl_wpr_strict_selector(self, codex: Mapping[str, Any] | None) -> bool:
+        if not bool(getattr(self._settings, "mainnet_codex_v1442_cnl_wpr_strict_ttl_enabled", True)):
+            return False
+        if not isinstance(codex, Mapping) or not codex.get("enabled"):
+            return False
+        lane_code = str(codex.get("lane_code") or codex.get("lane") or "").upper()
+        if lane_code != "CNL-WPR-L":
+            return False
+        metrics = codex.get("metrics") if isinstance(codex.get("metrics"), Mapping) else {}
+        action = str(metrics.get("v1441_research_selector_action") or "").upper()
+        return action == "STRICT_TTL_OR_FILL_POLICY"
+
+    def _codex_v1442_cnl_wpr_max_hold_floor_bp(self, codex: Mapping[str, Any] | None) -> float | None:
+        if not self._codex_v1442_cnl_wpr_strict_selector(codex):
+            return None
+        try:
+            return max(0.0, float(getattr(self._settings, "mainnet_codex_v1442_cnl_wpr_max_hold_floor_bp", 4.0) or 0.0))
+        except (TypeError, ValueError):
+            return 4.0
+
     def _codex_v1_live_entry_ttl_policy(self, run: Mapping[str, Any]) -> dict[str, Any]:
         default_ttl = max(1, int(getattr(self._settings, "mainnet_entry_order_ttl_seconds", 45) or 45))
         signal = self._codex_v1_signal_payload(run)
@@ -3963,6 +15816,27 @@ class MainnetOneRunManager:
         if not getattr(self._settings, "mainnet_codex_v135_entry_ttl_by_lane_enabled", True):
             return policy
         if not isinstance(codex, Mapping) or not codex.get("enabled"):
+            return policy
+        profile_ttl_applied = False
+        metrics = codex.get("metrics") if isinstance(codex.get("metrics"), Mapping) else {}
+        if bool(getattr(self._settings, "mainnet_codex_v143_adaptive_exec_enabled", True)):
+            profile_ttl_s = self._codex_v143_metric_float(metrics, "ttl_s")
+            if profile_ttl_s is not None and profile_ttl_s > 0:
+                policy["ttl_seconds"] = max(1, int(profile_ttl_s))
+                policy["ttl_source"] = "codex_v143_profile"
+                profile_ttl_applied = True
+        if self._codex_v1442_cnl_wpr_strict_selector(codex):
+            try:
+                strict_ttl_s = max(
+                    1,
+                    int(getattr(self._settings, "mainnet_codex_v1442_cnl_wpr_strict_entry_ttl_seconds", 20) or 20),
+                )
+            except (TypeError, ValueError):
+                strict_ttl_s = 20
+            policy["ttl_seconds"] = min(int(policy["ttl_seconds"]), strict_ttl_s)
+            policy["ttl_source"] = "codex_v1442_selector_strict_ttl"
+            return policy
+        if profile_ttl_applied:
             return policy
         overrides = self._codex_v1_entry_ttl_overrides()
         ttl_s = overrides.get(lane_code)
@@ -3979,11 +15853,40 @@ class MainnetOneRunManager:
         return isinstance(codex, Mapping) and bool(codex.get("enabled"))
 
     async def _run_armed(self, run: dict) -> None:
+        if (
+            self._adaptive_session
+            and self._is_adaptive_run(run)
+            and int(time.time() * 1000) >= int(self._adaptive_session.get("deadline_at_ms") or 0)
+        ):
+            await self._expire_codex_v1_shadow_samples(run, "adaptive_wall_clock_cap")
+            try:
+                await self._drop_codex_v132_tp_policy_samples(
+                    str(run.get("run_id") or ""),
+                    "adaptive_wall_clock_cap",
+                )
+            except Exception as exc:  # noqa: BLE001 - wall-clock safety first
+                self._v132_terminal_reconcile_needed = True
+                logger.warning(
+                    "codex_v132_wall_clock_drop_failed",
+                    run_id=run.get("run_id"),
+                    error=str(exc)[:200],
+                )
+            await self._repo.complete_run(run["run_id"], "CANCELLED", "adaptive_wall_clock_cap")
+            await self._repo.log_event(
+                run["run_id"],
+                "adaptive_session_wall_clock_cap",
+                {
+                    "max_duration_seconds": self._adaptive_max_duration_seconds(),
+                    "order_api_calls": 0,
+                },
+            )
+            await self._stop_adaptive_session(run, "wall_clock_cap", unexpected=False)
+            return
         if int(time.time() * 1000) - int(run["armed_at_ms"]) > self._settings.mainnet_one_run_signal_timeout_minutes * 60_000:
             await self._expire_codex_v1_shadow_samples(run, "signal_timeout")
             await self._repo.complete_run(run["run_id"], "ENTRY_EXPIRED", "signal_timeout")
-            await self._notify(f"⌛ Mainnet one-run 等待訊號逾時，已停止：<code>{escape(run['run_id'])}</code>")
             await self._advance_loop_after_entry_failure(run, "signal_timeout")
+            await self._notify(f"⌛ Mainnet one-run 等待訊號逾時，已停止：<code>{escape(run['run_id'])}</code>")
             return
         candles = await self._load_candles(run["symbol"])
         await self._update_codex_v1_shadow_outcomes(run, candles)
@@ -4032,9 +15935,15 @@ class MainnetOneRunManager:
         if decision is None:
             return
 
-        # Option A: direction consecutive-loss throttle (V6.8.5).
+        # Option A: direction consecutive-loss throttle (V6.8.5).  For Codex
+        # v1 execution, V1.4.13 lets state-level throttles own admission so a
+        # bad state does not pause healthier states on the same LONG side.
         now_ms = time.time() * 1000
-        _dir_block_until = self._dir_throttle_until.get(decision.side, 0.0)
+        _codex_state_throttle_owns_codex = (
+            self._codex_v1_execution_enabled()
+            and bool(getattr(self._settings, "mainnet_codex_state_throttle_enabled", True))
+        )
+        _dir_block_until = 0.0 if _codex_state_throttle_owns_codex else self._dir_throttle_until.get(decision.side, 0.0)
         if _dir_block_until > now_ms:
             _remaining_s = int((_dir_block_until - now_ms) / 1000)
             _dir_count_cfg = int(getattr(self._settings, "mainnet_dir_throttle_loss_count", 2) or 2)
@@ -4234,6 +16143,900 @@ class MainnetOneRunManager:
             drift_bp=drift_bp,
         )
 
+    async def _entry_actual_fill_time_ms(self, run: Mapping[str, Any], order_id: int | None) -> int | None:
+        """Best-effort actual entry fill timestamp from trades/order history."""
+        if not order_id:
+            return None
+        start_time = max(0, int(run.get("armed_at_ms") or 0) - 60_000)
+        trade_times: list[int] = []
+        try:
+            trades = await self._client.get_user_trades(run["symbol"], start_time=start_time, limit=1000)
+            for trade in trades:
+                try:
+                    trade_order_id = int(getattr(trade, "order_id", 0) or getattr(trade, "orderId", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                if trade_order_id != int(order_id):
+                    continue
+                try:
+                    ts = int(getattr(trade, "time_ms", 0) or getattr(trade, "time", 0) or 0)
+                except (TypeError, ValueError):
+                    ts = 0
+                if ts > 0:
+                    trade_times.append(ts)
+        except Exception as exc:  # noqa: BLE001 - TTL guard must still be conservative.
+            logger.warning("entry_actual_fill_trades_fetch_failed", run_id=run.get("run_id"), order_id=order_id, error=str(exc)[:200])
+        if trade_times:
+            return max(trade_times)
+
+        order_times: list[int] = []
+        client_order_id = str(run.get("entry_client_order_id") or f"{run.get('run_id')}_entry")
+        try:
+            orders = await self._client.get_all_orders(run["symbol"], start_time=start_time, limit=1000)
+            for order in orders:
+                try:
+                    oid = int(order.get("orderId", 0) or 0)
+                except (TypeError, ValueError):
+                    oid = 0
+                cid = str(order.get("clientOrderId") or "")
+                if oid != int(order_id) and cid != client_order_id:
+                    continue
+                status = str(order.get("status") or "").upper()
+                if status not in {"FILLED", "PARTIALLY_FILLED"}:
+                    continue
+                try:
+                    ts = int(order.get("updateTime") or order.get("time") or 0)
+                except (TypeError, ValueError):
+                    ts = 0
+                if ts > 0:
+                    order_times.append(ts)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("entry_actual_fill_orders_fetch_failed", run_id=run.get("run_id"), order_id=order_id, error=str(exc)[:200])
+        return max(order_times) if order_times else None
+
+    def _entry_timing_snapshot(
+        self,
+        run: Mapping[str, Any],
+        *,
+        now_ms: int | None = None,
+    ) -> dict[str, Any]:
+        """Return the immutable v1.4.60 entry timing contract.
+
+        Older rows do not contain the two persisted timestamps.  They retain
+        the legacy ``updated_at_ms`` anchor so enabling v1.4.60 cannot rewrite
+        an already-open entry's historical deadline.
+        """
+
+        observed_at_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+        ttl_policy = self._codex_v1_live_entry_ttl_policy(run)
+        ttl_seconds = max(1, int(ttl_policy["ttl_seconds"]))
+        signal = self._codex_v1_signal_payload(run)
+
+        def positive_int(value: Any) -> int | None:
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            return parsed if parsed > 0 else None
+
+        persisted_submitted = positive_int(signal.get("entry_submitted_at_ms"))
+        persisted_deadline = positive_int(signal.get("entry_deadline_ms"))
+        legacy_anchor = positive_int(run.get("updated_at_ms")) or observed_at_ms
+        submitted_at_ms = persisted_submitted or legacy_anchor
+        deadline_ms = persisted_deadline or submitted_at_ms + ttl_seconds * 1000
+        grace_s = 0.0
+        if not self._v1460_entry_safety_active(run):
+            grace_s = max(
+                0.0,
+                float(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v1438_entry_late_fill_grace_seconds",
+                        0.0,
+                    )
+                    or 0.0
+                ),
+            )
+        return {
+            "submitted_at_ms": submitted_at_ms,
+            "entry_deadline_ms": deadline_ms,
+            "effective_deadline_ms": deadline_ms + int(grace_s * 1000),
+            "ttl_seconds": ttl_seconds,
+            "ttl_source": ttl_policy["ttl_source"],
+            "lane_code": ttl_policy.get("lane_code"),
+            "grace_s": grace_s,
+            "persisted": bool(persisted_submitted and persisted_deadline),
+        }
+
+    async def _v1460_halt_paid_path(
+        self,
+        run: Mapping[str, Any],
+        reason: str,
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Latch the adaptive session without attempting any new entry."""
+
+        if self._adaptive_session is not None:
+            self._adaptive_session["stop_requested"] = True
+            self._adaptive_session["rearm_enabled"] = False
+            self._adaptive_session["safety_halt_reason"] = reason
+        try:
+            await self._repo.log_event(
+                str(run.get("run_id") or ""),
+                "v1460_paid_path_halted",
+                {"reason": reason, **dict(details or {})},
+            )
+        except Exception as exc:  # noqa: BLE001 - the in-memory halt stays latched
+            logger.error(
+                "v1460_paid_path_halt_event_failed",
+                run_id=run.get("run_id"),
+                reason=reason,
+                error=str(exc)[:200],
+            )
+
+    async def _v1460_cancel_confirm_entry(
+        self,
+        run: Mapping[str, Any],
+        order_id: int | None,
+        *,
+        purpose: str,
+        halt_on_unsafe: bool,
+    ) -> dict[str, Any]:
+        """Cancel once, then prove either a position or a zero-fill terminal.
+
+        A replacement/expiry caller must not infer zero fill from a successful
+        REST cancel alone: the fill can race the cancel response.  This helper
+        confirms open orders and position after the cancel and inspects the
+        returned terminal status/executed quantity.
+        """
+
+        run_id = str(run.get("run_id") or "")
+        symbol = str(run.get("symbol") or self._settings.mainnet_symbol)
+        if not order_id:
+            result = {"status": "UNSAFE", "reason": "missing_order_id"}
+            if halt_on_unsafe:
+                await self._v1460_halt_paid_path(run, "entry_cancel_missing_order_id", result)
+            return result
+
+        signal = self._codex_v1_signal_payload(run)
+        raw_pending = signal.get(V1460_CANCEL_RECONCILE_PENDING_KEY)
+        pending = dict(raw_pending) if isinstance(raw_pending, Mapping) else {}
+        try:
+            pending_order_id = int(pending.get("order_id") or 0)
+        except (TypeError, ValueError, OverflowError):
+            pending_order_id = 0
+        cancel_already_requested = pending_order_id == int(order_id)
+
+        cancel_response: Mapping[str, Any] = {}
+        cancel_error: str | None = None
+        if not cancel_already_requested:
+            try:
+                response = await self._client.cancel_order(symbol, int(order_id))
+                if isinstance(response, Mapping):
+                    cancel_response = response
+            except Exception as exc:  # noqa: BLE001 - post-cancel probes decide safety
+                cancel_error = str(exc)[:300]
+
+        try:
+            open_orders = await self._client.get_open_orders(symbol)
+            position = await self._client.get_position(symbol)
+            start_time = max(0, int(run.get("armed_at_ms") or 0) - 60_000)
+            history = list(
+                await self._client.get_all_orders(
+                    symbol, start_time=start_time, limit=1000
+                )
+                or []
+            )
+            user_trades = list(
+                await self._client.get_user_trades(
+                    symbol, start_time=start_time, limit=1000
+                )
+                or []
+            )
+        except Exception as exc:  # noqa: BLE001 - no proof means no replacement/re-arm
+            result = {
+                "status": "UNSAFE",
+                "reason": "post_cancel_probe_failed",
+                "cancel_error": cancel_error,
+                "error": str(exc)[:300],
+            }
+            if halt_on_unsafe:
+                await self._v1460_halt_paid_path(run, "entry_cancel_probe_failed", result)
+            return result
+
+        client_order_id = str(
+            run.get("entry_client_order_id") or f"{run_id}_entry"
+        )
+        history_response: Mapping[str, Any] = next(
+            (
+                row
+                for row in reversed(history)
+                if int(row.get("orderId", 0) or 0) == int(order_id)
+                or str(row.get("clientOrderId") or "") == client_order_id
+            ),
+            {},
+        )
+
+        def trade_field(row: Any, *names: str) -> Any:
+            if isinstance(row, Mapping):
+                for name in names:
+                    if name in row:
+                        return row.get(name)
+                return None
+            for name in names:
+                value = getattr(row, name, None)
+                if value is not None:
+                    return value
+            return None
+
+        owned_trades: list[Any] = []
+        trade_times: list[int] = []
+        for trade in user_trades:
+            try:
+                trade_order_id = int(
+                    trade_field(trade, "order_id", "orderId") or 0
+                )
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if trade_order_id != int(order_id):
+                continue
+            owned_trades.append(trade)
+            try:
+                trade_time = int(trade_field(trade, "time_ms", "time", "T") or 0)
+            except (TypeError, ValueError, OverflowError):
+                trade_time = 0
+            if trade_time > 0:
+                trade_times.append(trade_time)
+
+        proof_response = history_response or cancel_response
+        status = str(proof_response.get("status") or "").upper()
+        try:
+            executed_qty = max(
+                float(
+                    cancel_response.get("executedQty")
+                    or cancel_response.get("cumQty")
+                    or 0.0
+                ),
+                float(
+                    history_response.get("executedQty")
+                    or history_response.get("cumQty")
+                    or 0.0
+                ),
+            )
+        except (TypeError, ValueError, OverflowError):
+            executed_qty = 0.0
+        has_fill_evidence = bool(
+            owned_trades
+            or executed_qty > 0
+            or status in {"FILLED", "PARTIALLY_FILLED"}
+        )
+        still_open = any(
+            int(row.get("orderId", 0) or 0) == int(order_id)
+            for row in (open_orders or ())
+        )
+        try:
+            position_open = bool(
+                position is not None
+                and abs(float(position.position_amt)) > 1e-12
+            )
+        except (TypeError, ValueError, OverflowError):
+            position_open = False
+        if position_open:
+            identity_unsafe = not has_fill_evidence
+            if identity_unsafe and halt_on_unsafe:
+                await self._v1460_halt_paid_path(
+                    run,
+                    "orphan_position_after_entry_cancel",
+                    {
+                        "order_id": order_id,
+                        "cancel_status": status or None,
+                    },
+                )
+            hard_sl_armed = await self._v1460_arm_cancel_race_hard_sl(
+                run,
+                position,
+                purpose=purpose,
+            )
+            if not hard_sl_armed:
+                return {
+                    "status": "UNSAFE",
+                    "reason": "cancel_race_hard_sl_failed",
+                    "position": position,
+                    "cancel_error": cancel_error,
+                    "identity_unsafe": True,
+                }
+            actual_fill_ms = max(trade_times) if trade_times else None
+            return {
+                "status": "FILLED",
+                "reason": (
+                    "position_detected_after_cancel"
+                    if not identity_unsafe
+                    else "orphan_position_after_cancel"
+                ),
+                "position": position,
+                "actual_fill_ms": actual_fill_ms,
+                "cancel_error": cancel_error,
+                "identity_unsafe": identity_unsafe,
+                "cancel_race_hard_sl_armed": True,
+            }
+        if has_fill_evidence:
+            result = {
+                "status": "UNSAFE",
+                "reason": "fill_reported_without_position",
+                "cancel_status": status,
+                "executed_qty": executed_qty,
+                "owned_trade_count": len(owned_trades),
+                "cancel_error": cancel_error,
+            }
+            if halt_on_unsafe:
+                await self._v1460_halt_paid_path(
+                    run, "entry_fill_without_position_after_cancel", result
+                )
+            return result
+        if still_open:
+            result = {
+                "status": "STILL_OPEN",
+                "reason": "cancel_not_confirmed",
+                "cancel_error": cancel_error,
+            }
+            if halt_on_unsafe:
+                await self._v1460_halt_paid_path(run, "entry_cancel_not_confirmed", result)
+            return result
+
+        zero_fill_terminal = status in {"CANCELED", "CANCELLED", "EXPIRED", "REJECTED"}
+        if not zero_fill_terminal:
+            # A cancel exception/empty/lagging NEW response is not enough to
+            # prove zero execution, even when the order has disappeared from
+            # openOrders.  Persist a bounded pending state so the next manage
+            # cycle (or a process restart) can re-query without replacement or
+            # re-arm.  Only a still-unproven result after the fixed consistency
+            # window becomes an irreversible paid-path halt.
+            now_ms = int(time.time() * 1000)
+            # The order identity, not the caller label, owns the consistency
+            # window.  A later manage path must not reset the clock by changing
+            # purpose while reconciling the same exchange order.
+            same_pending = pending_order_id == int(order_id)
+            try:
+                pending_started_at_ms = int(pending.get("started_at_ms") or now_ms)
+            except (TypeError, ValueError, OverflowError):
+                pending_started_at_ms = now_ms
+            if (
+                not same_pending
+                or pending_started_at_ms <= 0
+                or pending_started_at_ms > now_ms
+            ):
+                pending_started_at_ms = now_ms
+                pending_attempts = 0
+            else:
+                try:
+                    pending_attempts = max(0, int(pending.get("attempts") or 0))
+                except (TypeError, ValueError, OverflowError):
+                    pending_attempts = 0
+            pending_attempts += 1
+            pending_elapsed_ms = max(0, now_ms - pending_started_at_ms)
+            pending_deadline_ms = (
+                pending_started_at_ms + V1460_CANCEL_RECONCILE_TIMEOUT_MS
+            )
+            if pending_elapsed_ms < V1460_CANCEL_RECONCILE_TIMEOUT_MS:
+                marker = {
+                    "order_id": int(order_id),
+                    "purpose": str(pending.get("purpose") or purpose),
+                    "started_at_ms": pending_started_at_ms,
+                    "deadline_ms": pending_deadline_ms,
+                    "attempts": pending_attempts,
+                    "last_checked_at_ms": now_ms,
+                    "last_cancel_status": status or None,
+                    "last_cancel_error": cancel_error,
+                }
+                signal[V1460_CANCEL_RECONCILE_PENDING_KEY] = marker
+                serialized_signal = json.dumps(signal)
+                try:
+                    await self._repo.update_run(
+                        run_id,
+                        signal_json=serialized_signal,
+                    )
+                    if isinstance(run, dict):
+                        run["signal_json"] = serialized_signal
+                    await self._repo.log_event(
+                        run_id,
+                        "v1460_entry_cancel_reconcile_pending",
+                        {
+                            "status": "PENDING_CONFIRMATION",
+                            "reason": "zero_fill_terminal_pending",
+                            "cancel_status": status or None,
+                            "cancel_error": cancel_error,
+                            "attempts": pending_attempts,
+                            "pending_elapsed_ms": pending_elapsed_ms,
+                            "pending_deadline_ms": pending_deadline_ms,
+                            "purpose": purpose,
+                        },
+                    )
+                except Exception as exc:  # noqa: BLE001 - durable pending proof is required
+                    result = {
+                        "status": "UNSAFE",
+                        "reason": "zero_fill_pending_persist_failed",
+                        "cancel_status": status or None,
+                        "cancel_error": cancel_error,
+                        "error": str(exc)[:300],
+                    }
+                    if halt_on_unsafe:
+                        await self._v1460_halt_paid_path(
+                            run,
+                            "entry_zero_fill_pending_persist_failed",
+                            result,
+                        )
+                    return result
+                return {
+                    "status": "PENDING_CONFIRMATION",
+                    "reason": "zero_fill_terminal_pending",
+                    "cancel_status": status or None,
+                    "cancel_error": cancel_error,
+                    "attempts": pending_attempts,
+                    "pending_elapsed_ms": pending_elapsed_ms,
+                    "pending_deadline_ms": pending_deadline_ms,
+                    "purpose": purpose,
+                }
+
+            result = {
+                "status": "UNSAFE",
+                "reason": "zero_fill_terminal_unproven",
+                "cancel_status": status or None,
+                "cancel_error": cancel_error,
+                "attempts": pending_attempts,
+                "pending_elapsed_ms": pending_elapsed_ms,
+                "pending_deadline_ms": pending_deadline_ms,
+            }
+            if halt_on_unsafe:
+                await self._v1460_halt_paid_path(
+                    run, "entry_zero_fill_terminal_unproven", result
+                )
+            return result
+
+        result = {
+            "status": "NO_FILL",
+            "reason": "cancel_confirmed_zero_fill",
+            "cancel_status": status,
+            "executed_qty": executed_qty,
+            "purpose": purpose,
+        }
+        await self._repo.log_event(run_id, "entry_cancel_reconciled_no_fill", result)
+        return result
+
+    async def _v1460_arm_cancel_race_hard_sl(
+        self,
+        run: Mapping[str, Any],
+        position: PositionInfo,
+        *,
+        purpose: str,
+    ) -> bool:
+        """Protect a cancel-race fill before any TP sync or replacement path."""
+
+        run_id = str(run.get("run_id") or "")
+        symbol = str(run.get("symbol") or self._settings.mainnet_symbol)
+        signal = self._codex_v1_signal_payload(run)
+        try:
+            qty = abs(float(position.position_amt))
+            sl_price = float(signal.get("stop_loss") or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            qty = 0.0
+            sl_price = 0.0
+        close_side = "SELL" if float(position.position_amt) > 0 else "BUY"
+        failure: str | None = None
+        if qty <= 0.0 or sl_price <= 0.0:
+            failure = "missing_owned_hard_sl_contract"
+        else:
+            try:
+                await self._place_stop_loss_maker(
+                    symbol=symbol,
+                    side=close_side,
+                    qty_str=await self._client.format_quantity(symbol, qty),
+                    sl_price=sl_price,
+                    run_id=run_id,
+                    reason="ENTRY_CANCEL_RACE_PROTECT",
+                    run=run,
+                )
+            except Exception as exc:  # noqa: BLE001 - risk-off below is authoritative
+                failure = str(exc)[:300] or type(exc).__name__
+        if failure is None:
+            try:
+                await self._repo.log_event(
+                    run_id,
+                    "v1460_entry_cancel_race_hard_sl_armed",
+                    {
+                        "purpose": purpose,
+                        "qty": qty,
+                        "sl_price": sl_price,
+                        "position_amt": float(position.position_amt),
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001 - evidence is part of the contract
+                failure = f"hard_sl_evidence_persistence_failed:{str(exc)[:240]}"
+            else:
+                return True
+
+        await self._v1460_halt_paid_path(
+            run,
+            "entry_cancel_race_hard_sl_failed",
+            {
+                "purpose": purpose,
+                "qty": qty,
+                "sl_price": sl_price or None,
+                "error": failure,
+            },
+        )
+        await self._repo.log_event(
+            run_id,
+            "v1460_entry_cancel_race_hard_sl_failed",
+            {
+                "purpose": purpose,
+                "qty": qty,
+                "sl_price": sl_price or None,
+                "error": failure,
+            },
+        )
+        try:
+            await self._close_position(
+                symbol,
+                close_side,
+                qty,
+                "ENTRY_CANCEL_RACE_PROTECTION_FAILED",
+                run,
+            )
+        except Exception as exc:  # noqa: BLE001 - halt remains latched for operator action
+            await self._repo.log_event(
+                run_id,
+                "v1460_entry_cancel_race_risk_off_failed",
+                {"error": str(exc)[:300], "purpose": purpose},
+            )
+        return False
+
+    async def _handle_entry_fill_after_deadline(
+        self,
+        run: dict,
+        position: PositionInfo,
+        order_id: int | None,
+        *,
+        timing: Mapping[str, Any],
+        fill_detected_ms: int,
+        actual_fill_ms: int | None,
+        detection_source: str,
+    ) -> None:
+        """Protect first, then risk-off close an unavoidable late fill."""
+
+        symbol = str(run["symbol"])
+        if order_id:
+            try:
+                await self._client.cancel_order(symbol, int(order_id))
+            except Exception:  # noqa: BLE001 - hard SL and close remain authoritative
+                pass
+        try:
+            refreshed = await self._client.get_position(symbol)
+        except Exception:  # noqa: BLE001
+            refreshed = None
+        if refreshed is not None:
+            position = refreshed
+        qty = abs(float(position.position_amt))
+        run["avg_entry_price"] = position.entry_price
+        run["qty"] = qty
+        await self._repo.update_run(
+            run["run_id"],
+            avg_entry_price=position.entry_price,
+            qty=qty,
+            exit_reason="ENTRY_LATE_FILL_TTL",
+        )
+        counters = self._adaptive_counters() if self._is_adaptive_run(run) else None
+        if counters is not None:
+            counters["late_fill"] = int(counters.get("late_fill") or 0) + 1
+        v1460_entry_safety = self._v1460_entry_safety_active(run)
+        if v1460_entry_safety:
+            await self._v1460_halt_paid_path(
+                run,
+                "entry_late_fill_ttl",
+                {
+                    "actual_fill_ms": actual_fill_ms,
+                    "entry_deadline_ms": timing["entry_deadline_ms"],
+                    "detection_source": detection_source,
+                },
+            )
+        entry_fill_age_s = round(
+            max(0, fill_detected_ms - int(timing["submitted_at_ms"])) / 1000.0,
+            1,
+        )
+        actual_fill_age_s = (
+            round(
+                max(0, int(actual_fill_ms) - int(timing["submitted_at_ms"]))
+                / 1000.0,
+                1,
+            )
+            if actual_fill_ms is not None
+            else None
+        )
+        await self._repo.log_event(
+            run["run_id"],
+            "entry_late_fill_after_ttl",
+            {
+                "entry_price": position.entry_price,
+                "qty": qty,
+                "entry_fill_age_s": entry_fill_age_s,
+                "actual_entry_fill_age_s": actual_fill_age_s,
+                "entry_ttl_s": timing["ttl_seconds"],
+                "entry_ttl_source": timing["ttl_source"],
+                "lane_code": timing.get("lane_code"),
+                "grace_s": timing["grace_s"],
+                "detected_at_ms": fill_detected_ms,
+                "actual_fill_ms": actual_fill_ms,
+                "deadline_ms": timing["entry_deadline_ms"],
+                "effective_deadline_ms": timing["effective_deadline_ms"],
+                "detection_source": detection_source,
+            },
+        )
+
+        signal = self._codex_v1_signal_payload(run)
+        sl_price = float(signal.get("stop_loss") or 0.0)
+        hard_sl_armed = False
+        if v1460_entry_safety and sl_price > 0 and qty > 0:
+            try:
+                await self._place_stop_loss_maker(
+                    symbol=symbol,
+                    side="SELL" if position.position_amt > 0 else "BUY",
+                    qty_str=await self._client.format_quantity(symbol, qty),
+                    sl_price=sl_price,
+                    run_id=run["run_id"],
+                    reason="ENTRY_LATE_FILL_TTL_PROTECT",
+                    run=run,
+                )
+                hard_sl_armed = True
+            except Exception as exc:  # noqa: BLE001 - proceed to immediate close
+                await self._repo.log_event(
+                    run["run_id"],
+                    "entry_late_fill_hard_sl_failed",
+                    {"error": str(exc)[:300], "sl_price": sl_price},
+                )
+        await self._repo.log_event(
+            run["run_id"],
+            "entry_late_fill_protection",
+            {"hard_sl_armed": hard_sl_armed, "sl_price": sl_price or None},
+        )
+        close_side = "SELL" if position.position_amt > 0 else "BUY"
+        codex_note = self._codex_v1_telegram_note(signal)
+        await self._notify(
+            "⏱ <b>Entry TTL 後成交，已停止新進場並受控平倉</b>\n"
+            f"Run：<code>{escape(run['run_id'])}</code>\n"
+            f"fill_age：<code>{entry_fill_age_s:.1f}s</code> / TTL "
+            f"<code>{timing['ttl_seconds']}s</code>{codex_note}"
+        )
+        await self._close_position(
+            position.symbol,
+            close_side,
+            qty,
+            "ENTRY_LATE_FILL_TTL",
+            run,
+        )
+
+    async def _activate_entry_fill(
+        self,
+        run: dict,
+        position: PositionInfo,
+        order_id: int | None,
+        *,
+        detection_source: str,
+        protection_prearmed: bool = False,
+    ) -> None:
+        """Reconcile one detected entry fill and arm its existing protection."""
+
+        symbol = str(run["symbol"])
+        fill_detected_ms = int(time.time() * 1000)
+        timing = self._entry_timing_snapshot(run, now_ms=fill_detected_ms)
+        entry_fill_age_s = round(
+            max(0, fill_detected_ms - int(timing["submitted_at_ms"])) / 1000.0,
+            1,
+        )
+        if bool(
+            getattr(
+                self._settings,
+                "mainnet_codex_v1438_strict_entry_ttl_enabled",
+                True,
+            )
+        ) and fill_detected_ms >= int(timing["effective_deadline_ms"]):
+            actual_fill_ms = await self._entry_actual_fill_time_ms(run, order_id)
+            if (
+                actual_fill_ms is None
+                or int(actual_fill_ms) >= int(timing["effective_deadline_ms"])
+            ):
+                await self._handle_entry_fill_after_deadline(
+                    run,
+                    position,
+                    order_id,
+                    timing=timing,
+                    fill_detected_ms=fill_detected_ms,
+                    actual_fill_ms=actual_fill_ms,
+                    detection_source=detection_source,
+                )
+                return
+            await self._repo.log_event(
+                run["run_id"],
+                "entry_fill_detected_after_ttl_actual_within_ttl",
+                {
+                    "entry_fill_age_s": entry_fill_age_s,
+                    "actual_entry_fill_age_s": round(
+                        max(
+                            0,
+                            int(actual_fill_ms) - int(timing["submitted_at_ms"]),
+                        )
+                        / 1000.0,
+                        1,
+                    ),
+                    "entry_ttl_s": timing["ttl_seconds"],
+                    "entry_ttl_source": timing["ttl_source"],
+                    "lane_code": timing.get("lane_code"),
+                    "detection_source": detection_source,
+                },
+            )
+
+        await self._repo.update_run(
+            run["run_id"],
+            status="RUNNING",
+            avg_entry_price=position.entry_price,
+            qty=abs(position.position_amt),
+        )
+        counters = self._adaptive_counters() if self._is_adaptive_run(run) else None
+        if counters is not None:
+            counters["normal_fill"] = int(counters.get("normal_fill") or 0) + 1
+        await self._repo.log_event(
+            run["run_id"],
+            "entry_filled",
+            {
+                "entry_price": position.entry_price,
+                "qty": abs(position.position_amt),
+                "entry_fill_age_s": entry_fill_age_s,
+                "entry_fill_age_bucket": self._entry_fill_age_bucket(entry_fill_age_s),
+                "entry_ttl_s": timing["ttl_seconds"],
+                "entry_ttl_source": timing["ttl_source"],
+                "lane_code": timing.get("lane_code"),
+                "entry_deadline_ms": timing["entry_deadline_ms"],
+                "detection_source": detection_source,
+            },
+        )
+        await self._sync_fill_v1_events(run, "entry_filled")
+        signal = self._codex_v1_signal_payload(run)
+        tp_orders = await self._sync_take_profit_orders(run, position, signal)
+        await self._start_codex_v132_live_tp_policy_sample(
+            run,
+            position,
+            signal,
+            tp_orders,
+            fill_detected_ms=fill_detected_ms,
+        )
+        if self._settings.mainnet_sl_use_maker and not protection_prearmed:
+            sl_price = float(signal.get("stop_loss") or 0.0)
+            if sl_price > 0:
+                await self._place_stop_loss_maker(
+                    symbol=symbol,
+                    side="SELL" if position.position_amt > 0 else "BUY",
+                    qty_str=await self._client.format_quantity(
+                        symbol, abs(position.position_amt)
+                    ),
+                    sl_price=sl_price,
+                    run_id=run["run_id"],
+                    reason="SL",
+                    run=run,
+                )
+        run["avg_entry_price"] = position.entry_price
+        run["qty"] = abs(position.position_amt)
+        await self._preplace_next_dca(run, position)
+        trail_sig = self._codex_v1_signal_payload(run)
+        trail_tp_pct = float(trail_sig.get("wildcat", {}).get("tp_pct") or 0.0)
+        trail_side = "LONG" if position.position_amt > 0 else "SHORT"
+        trail_close_side = "SELL" if position.position_amt > 0 else "BUY"
+        self._start_trail_watch(
+            run, trail_side, trail_close_side, trail_tp_pct
+        )
+        codex_note = self._codex_v1_telegram_note(trail_sig)
+        await self._notify(
+            "✅ <b>Mainnet one-run 已成交</b>\n"
+            f"Run：<code>{escape(run['run_id'])}</code>\n"
+            f"方向：<b>{escape(str(run.get('side') or ''))}</b>\n"
+            f"均價：<b>${position.entry_price:.4f}</b>\n"
+            f"數量：<code>{abs(position.position_amt):.6f}</code>"
+            f"{codex_note}"
+        )
+
+    async def _v1461_pending_entry_regime_block(
+        self, run: dict
+    ) -> dict[str, Any] | None:
+        if not self._v1461_enforcement_active(run):
+            return None
+        policy = self._v1461_terminal_policy(run)
+        if (
+            not isinstance(policy, Mapping)
+            or str(policy.get("mode") or "") != "enforcement"
+            or not bool(policy.get("permits_order"))
+        ):
+            return None
+        active_hash = self._v1461_gate_config().policy_hash
+        if str(policy.get("policy_hash") or "") != active_hash:
+            return {
+                "reason": "v1461_pending_policy_hash_mismatch",
+                "compatibility": RegimeCompatibility.HARD_BLOCK.value,
+                "coarse_market_state": "UNKNOWN",
+                "policy_hash": active_hash,
+            }
+        original_lane = str(policy.get("lane") or "UNKNOWN").upper()
+        try:
+            candles = await self._load_candles(str(run.get("symbol") or ADAPTIVE_SYMBOL))
+            if len(candles) < 16:
+                raise RuntimeError("insufficient_pending_regime_candles")
+            window = candles[-16:-1]
+            hi = max(candle.high for candle in window)
+            lo = min(candle.low for candle in window)
+            px = candles[-1].close
+            rng15 = (hi - lo) / px * 1e4 if px > 0 else 0.0
+            drift_bp = self._signed_drift_bp(
+                candles, self._settings.mainnet_range_drift_window_bars
+            )
+            current = generate_wildcat_v2_adverse_guard_live_decision(
+                candles,
+                target_daily_usdc=self._settings.mainnet_equity_cap_usdc * 0.03,
+                notional_usdc=self._settings.mainnet_effective_entry_notional_usdc,
+                leverage=self._settings.mainnet_leverage,
+                rescue_enabled=await self._is_rescue_enabled(),
+            )
+            if current is None:
+                coarse_state = "UNCERTAIN"
+                detailed_state = "UNKNOWN"
+            else:
+                features = await self._build_codex_v1_live_features_for_decision(
+                    run,
+                    current,
+                    candles,
+                    rng15=rng15,
+                    drift_bp=drift_bp,
+                )
+                current_codex = select_codex_v1_lane(features)
+                current_codex = replace(
+                    current_codex,
+                    lane=original_lane,
+                    lane_code=original_lane,
+                )
+                detailed_state = (
+                    self._codex_v1_market_state_from_decision(current_codex)
+                    or "UNKNOWN"
+                )
+                coarse_state = self._v1461_coarse_regime(run, current_codex)
+        except Exception as exc:  # noqa: BLE001 - promoted pending entry fails closed
+            logger.warning(
+                "v1461_pending_regime_recheck_failed",
+                run_id=run.get("run_id"),
+                error=str(exc)[:200],
+            )
+            coarse_state = "UNCERTAIN"
+            detailed_state = "UNKNOWN"
+        compatibility = self._v1461_compatibility(
+            original_lane, coarse_state, detailed_state
+        )
+        promoted = not bool(policy.get("incumbent_accepted"))
+        original_action = str(policy.get("action_mode") or "")
+        invalidated = (
+            compatibility
+            in {RegimeCompatibility.ADVERSE, RegimeCompatibility.HARD_BLOCK}
+            or (promoted and compatibility is not RegimeCompatibility.SUPPORTIVE)
+            or (
+                original_action == V1461ActionMode.CONTROL.value
+                and compatibility is not RegimeCompatibility.SUPPORTIVE
+            )
+        )
+        if not invalidated:
+            return None
+        return {
+            "reason": "v1461_pending_regime_invalidated",
+            "compatibility": compatibility.value,
+            "coarse_market_state": coarse_state,
+            "detailed_market_state": detailed_state,
+            "original_action_mode": original_action,
+            "promoted": promoted,
+            "policy_hash": active_hash,
+        }
+
     async def _run_entry_pending(self, run: dict) -> None:
         symbol = run["symbol"]
         open_orders = await self._client.get_open_orders(symbol)
@@ -4241,80 +17044,72 @@ class MainnetOneRunManager:
         still_open = any(int(row.get("orderId", 0)) == order_id for row in open_orders)
         position = await self._client.get_position(symbol)
         if position:
-            fill_detected_ms = int(time.time() * 1000)
-            ttl_policy = self._codex_v1_live_entry_ttl_policy(run)
-            entry_anchor_ms = int(run.get("updated_at_ms") or fill_detected_ms)
-            entry_fill_age_s = round(max(0, fill_detected_ms - entry_anchor_ms) / 1000.0, 1)
-            await self._repo.update_run(
-                run["run_id"],
-                status="RUNNING",
-                avg_entry_price=position.entry_price,
-                qty=abs(position.position_amt),
-            )
-            await self._repo.log_event(
-                run["run_id"],
-                "entry_filled",
-                {
-                    "entry_price": position.entry_price,
-                    "qty": abs(position.position_amt),
-                    "entry_fill_age_s": entry_fill_age_s,
-                    "entry_fill_age_bucket": self._entry_fill_age_bucket(entry_fill_age_s),
-                    "entry_ttl_s": ttl_policy["ttl_seconds"],
-                    "entry_ttl_source": ttl_policy["ttl_source"],
-                    "lane_code": ttl_policy.get("lane_code"),
-                },
-            )
-            signal = self._codex_v1_signal_payload(run)
-            tp_orders = await self._sync_take_profit_orders(run, position, signal)
-            await self._start_codex_v132_live_tp_policy_sample(
+            await self._activate_entry_fill(
                 run,
                 position,
-                signal,
-                tp_orders,
-                fill_detected_ms=fill_detected_ms,
-            )
-            # Place initial stop-loss maker order if enabled
-            if self._settings.mainnet_sl_use_maker:
-                signal = self._codex_v1_signal_payload(run)
-                sl_price = float(signal.get("stop_loss") or 0.0)
-                if sl_price > 0:
-                    await self._place_stop_loss_maker(
-                        symbol=symbol,
-                        side="SELL" if position.position_amt > 0 else "BUY",
-                        qty_str=await self._client.format_quantity(symbol, abs(position.position_amt)),
-                        sl_price=sl_price,
-                        run_id=run["run_id"],
-                        reason="SL",
-                        run=run,
-                    )
-            # Pre-place DCA #1 right at entry fill so the exchange catches the
-            # first adverse touch without waiting for the poll path.
-            run["avg_entry_price"] = position.entry_price
-            run["qty"] = abs(position.position_amt)
-            await self._preplace_next_dca(run, position)
-            # Start the TRAIL fast-watcher at entry fill so peak-tracking and
-            # arming run on the 2s clock, not the 10s manage cycle (which let
-            # cry3mn_1781054933311 exit BELOW entry — spike+dump inside one cycle
-            # meant the peak was never recorded).  Idempotent / no-op if disabled.
-            trail_sig = self._codex_v1_signal_payload(run)
-            trail_tp_pct = float(trail_sig.get("wildcat", {}).get("tp_pct") or 0.0)
-            trail_side = "LONG" if position.position_amt > 0 else "SHORT"
-            trail_close_side = "SELL" if position.position_amt > 0 else "BUY"
-            self._start_trail_watch(run, trail_side, trail_close_side, trail_tp_pct)
-            codex_note = self._codex_v1_telegram_note(trail_sig)
-            await self._notify(
-                "✅ <b>Mainnet one-run 已成交</b>\n"
-                f"Run：<code>{escape(run['run_id'])}</code>\n"
-                f"方向：<b>{escape(str(run.get('side') or ''))}</b>\n"
-                f"均價：<b>${position.entry_price:.4f}</b>\n"
-                f"數量：<code>{abs(position.position_amt):.6f}</code>"
-                f"{codex_note}"
+                order_id,
+                detection_source="entry_pending_poll",
             )
             return
         if not still_open:
+            if self._v1460_entry_safety_active(run):
+                reconciliation = await self._v1460_cancel_confirm_entry(
+                    run,
+                    order_id,
+                    purpose="entry_not_open",
+                    halt_on_unsafe=True,
+                )
+                if reconciliation["status"] == "FILLED":
+                    await self._activate_entry_fill(
+                        run,
+                        reconciliation["position"],
+                        order_id,
+                        detection_source="not_open_cancel_reconcile",
+                        protection_prearmed=bool(
+                            reconciliation.get("cancel_race_hard_sl_armed")
+                        ),
+                    )
+                    return
+                if reconciliation["status"] != "NO_FILL":
+                    return
             await self._repo.complete_run(run["run_id"], "ENTRY_EXPIRED", "entry_not_open_no_position")
             await self._notify(f"⌛ Entry 掛單已不在 open orders 且沒有持倉，run 已停止：<code>{escape(run['run_id'])}</code>")
             await self._advance_loop_after_entry_failure(run, "entry_not_open_no_position")
+            return
+        regime_block = await self._v1461_pending_entry_regime_block(run)
+        if regime_block is not None:
+            reconciliation = await self._v1460_cancel_confirm_entry(
+                run,
+                order_id,
+                purpose="v1461_pending_regime_invalidated",
+                halt_on_unsafe=True,
+            )
+            if reconciliation["status"] == "FILLED":
+                await self._activate_entry_fill(
+                    run,
+                    reconciliation["position"],
+                    order_id,
+                    detection_source="v1461_regime_cancel_reconcile",
+                    protection_prearmed=bool(
+                        reconciliation.get("cancel_race_hard_sl_armed")
+                    ),
+                )
+                return
+            if reconciliation["status"] != "NO_FILL":
+                return
+            await self._repo.log_event(
+                run["run_id"],
+                "v1461_pending_entry_regime_cancelled",
+                {**regime_block, "order_api_calls_after_cancel": 0},
+            )
+            await self._repo.complete_run(
+                run["run_id"],
+                "ENTRY_EXPIRED",
+                str(regime_block["reason"]),
+            )
+            await self._advance_loop_after_entry_failure(
+                run, str(regime_block["reason"])
+            )
             return
         # Ladder entry: uses a dedicated per-signal deadline instead of the global TTL.
         # Skip reprice (we intentionally sit at the offset price; chasing defeats the purpose).
@@ -4322,7 +17117,27 @@ class MainnetOneRunManager:
         ladder_deadline_ms = signal_j.get("entry_ladder_deadline_ms")
         if ladder_deadline_ms is not None:
             if int(time.time() * 1000) >= ladder_deadline_ms:
-                if order_id:
+                if self._v1460_entry_safety_active(run):
+                    reconciliation = await self._v1460_cancel_confirm_entry(
+                        run,
+                        order_id,
+                        purpose="ladder_ttl_expiry",
+                        halt_on_unsafe=True,
+                    )
+                    if reconciliation["status"] == "FILLED":
+                        await self._activate_entry_fill(
+                            run,
+                            reconciliation["position"],
+                            order_id,
+                            detection_source="ladder_ttl_cancel_reconcile",
+                            protection_prearmed=bool(
+                                reconciliation.get("cancel_race_hard_sl_armed")
+                            ),
+                        )
+                        return
+                    if reconciliation["status"] != "NO_FILL":
+                        return
+                elif order_id:
                     await self._client.cancel_order(symbol, order_id)
                 await self._repo.complete_run(run["run_id"], "ENTRY_EXPIRED", "entry_ttl_expired")
                 await self._notify(
@@ -4340,11 +17155,38 @@ class MainnetOneRunManager:
         requoted = await self._maybe_requote_entry(run, order_id, open_orders)
         if requoted:
             return
+        now_ms = int(time.time() * 1000)
         ttl_policy = self._codex_v1_live_entry_ttl_policy(run)
-        age_ms = int(time.time() * 1000) - int(run["updated_at_ms"])
+        timing = self._entry_timing_snapshot(run, now_ms=now_ms)
+        if self._v1460_entry_safety_active(run):
+            age_ms = max(0, now_ms - int(timing["submitted_at_ms"]))
+            expired = now_ms >= int(timing["entry_deadline_ms"])
+        else:
+            age_ms = now_ms - int(run["updated_at_ms"])
+            expired = age_ms >= max(1, int(ttl_policy["ttl_seconds"])) * 1000
         ttl_seconds = max(1, int(ttl_policy["ttl_seconds"]))
-        if age_ms >= ttl_seconds * 1000:
-            if order_id:
+        if expired:
+            if self._v1460_entry_safety_active(run):
+                reconciliation = await self._v1460_cancel_confirm_entry(
+                    run,
+                    order_id,
+                    purpose="entry_ttl_expiry",
+                    halt_on_unsafe=True,
+                )
+                if reconciliation["status"] == "FILLED":
+                    await self._activate_entry_fill(
+                        run,
+                        reconciliation["position"],
+                        order_id,
+                        detection_source="ttl_cancel_reconcile",
+                        protection_prearmed=bool(
+                            reconciliation.get("cancel_race_hard_sl_armed")
+                        ),
+                    )
+                    return
+                if reconciliation["status"] != "NO_FILL":
+                    return
+            elif order_id:
                 await self._client.cancel_order(symbol, order_id)
             entry_age_s = round(max(0, age_ms) / 1000.0, 1)
             await self._repo.log_event(
@@ -4355,6 +17197,7 @@ class MainnetOneRunManager:
                     "entry_ttl_s": ttl_seconds,
                     "entry_ttl_source": ttl_policy["ttl_source"],
                     "lane_code": ttl_policy.get("lane_code"),
+                    "entry_deadline_ms": timing["entry_deadline_ms"],
                 },
             )
             await self._repo.complete_run(run["run_id"], "ENTRY_EXPIRED", "entry_ttl_expired")
@@ -4366,6 +17209,7 @@ class MainnetOneRunManager:
     async def _run_running(self, run: dict) -> None:
         symbol = run["symbol"]
         position = await self._client.get_position(symbol)
+        await self._sync_fill_v1_events(run, "running_poll")
         if not position:
             await self._finish_flat_run(run, "flat_detected")
             return
@@ -4453,6 +17297,9 @@ class MainnetOneRunManager:
         notional, and re-arm the SL at the new (widened) average entry price."""
         # DCA filled (qty grew) — record the fill, then cancel old SL and
         # re-arm at the new average entry price.
+        counters = self._adaptive_counters() if self._is_adaptive_run(run) else None
+        if counters is not None:
+            counters["recovery_filled"] = int(counters.get("recovery_filled") or 0) + 1
         await self._repo.log_event(
             run["run_id"],
             "recovery_entry_filled",
@@ -4650,6 +17497,174 @@ class MainnetOneRunManager:
             )
             self._w6a_post_tp_probe_recorded.add(key)
 
+    async def _maybe_apply_breakeven_sl(
+        self,
+        run: dict,
+        position: "PositionInfo",
+        signal: dict,
+        side: str,
+        entry: float,
+        qty: float,
+        close_side: str,
+    ) -> None:
+        run_id = run["run_id"]
+        tp1_filled = run_id in self._partial_exits or await self._repo.get_first_event_time(run_id, "partial_exit") is not None
+        if not tp1_filled:
+            return
+
+        codex = signal.get("codex_v1") if isinstance(signal.get("codex_v1"), Mapping) else {}
+        lane_code = str(codex.get("lane_code") or "").upper()
+        strategy = str(run.get("strategy") or signal.get("strategy") or "")
+        metrics = codex.get("metrics") if isinstance(codex.get("metrics"), Mapping) else {}
+        profile_be_bp = (
+            self._codex_v143_metric_float(metrics, "be_bp")
+            if bool(getattr(self._settings, "mainnet_codex_v143_adaptive_exec_enabled", True))
+            else None
+        )
+
+        use_be = False
+        be_offset_bp = 0.0
+
+        if profile_be_bp is not None and lane_code in {"CNL-WPR-L", "STUP-S", "SFD-S"}:
+            use_be = profile_be_bp > 0
+            be_offset_bp = profile_be_bp
+        elif lane_code == "CNL-WPR-L":
+            use_be = bool(getattr(self._settings, "mainnet_codex_wpr_use_breakeven_sl", True))
+            be_offset_bp = float(getattr(self._settings, "mainnet_codex_wpr_breakeven_offset_bp", 2.0))
+        elif lane_code == "STUP-S":
+            use_be = bool(getattr(self._settings, "mainnet_codex_stups_use_breakeven_sl", True))
+            be_offset_bp = float(getattr(self._settings, "mainnet_codex_stups_breakeven_offset_bp", 0.0))
+        elif lane_code == "W6A":
+            use_be = bool(getattr(self._settings, "mainnet_codex_w6a_use_breakeven_sl", True))
+            be_offset_bp = float(getattr(self._settings, "mainnet_codex_w6a_breakeven_offset_bp", 0.0))
+        elif lane_code == "S2_ST" or strategy == "S2_SuperTrend":
+            use_be = bool(getattr(self._settings, "mainnet_codex_s2st_use_breakeven_sl", True))
+            be_offset_bp = float(getattr(self._settings, "mainnet_codex_s2st_breakeven_offset_bp", 0.0))
+
+        if not use_be:
+            return
+
+        if side == "LONG":
+            target_sl = entry * (1 + be_offset_bp / 10_000.0)
+        else:
+            target_sl = entry * (1 - be_offset_bp / 10_000.0)
+
+        sl_price = float(signal.get("stop_loss") or 0.0)
+        if sl_price <= 0:
+            return
+
+        needed = False
+        if side == "LONG" and sl_price < target_sl - 1e-4:
+            needed = True
+        elif side == "SHORT" and sl_price > target_sl + 1e-4:
+            needed = True
+
+        if not needed:
+            return
+
+        symbol = run["symbol"]
+        be_reason = "TP1_BE_SL"
+        logger.info(
+            "applying_breakeven_sl",
+            run_id=run_id,
+            old_sl=sl_price,
+            target_sl=target_sl,
+            reason=be_reason,
+        )
+
+        maker_first_attempted = False
+        if bool(getattr(self._settings, "mainnet_codex_be_maker_first_enabled", True)):
+            try:
+                maker_ttl = max(0, int(getattr(self._settings, "mainnet_codex_be_maker_ttl_seconds", 2) or 2))
+            except (TypeError, ValueError):
+                maker_ttl = 2
+            try:
+                adverse_break_bp = float(getattr(self._settings, "mainnet_codex_be_maker_adverse_break_bp", 1.0) or 1.0)
+            except (TypeError, ValueError):
+                adverse_break_bp = 1.0
+            if maker_ttl > 0:
+                maker_first_attempted = True
+                qty_str = await self._client.format_quantity(symbol, qty)
+                if await self._try_trail_maker_exit(
+                    symbol,
+                    close_side,
+                    qty_str,
+                    run,
+                    reason=be_reason,
+                    ttl_seconds=maker_ttl,
+                    enforce_profit_floor=True,
+                    profit_floor_bp=be_offset_bp,
+                    adverse_break_bp=adverse_break_bp,
+                ):
+                    await self._repo.log_event(
+                        run_id,
+                        "breakeven_maker_exit_done",
+                        {
+                            "reason": be_reason,
+                            "entry": entry,
+                            "target_sl": target_sl,
+                            "be_offset_bp": be_offset_bp,
+                            "ttl_seconds": maker_ttl,
+                        },
+                    )
+                    return
+                refreshed = await self._client.get_position(symbol)
+                if refreshed is None or abs(float(refreshed.position_amt)) < 1e-9:
+                    await self._repo.log_event(
+                        run_id,
+                        "breakeven_position_flat_after_maker_attempt",
+                        {"reason": be_reason, "target_sl": target_sl},
+                    )
+                    return
+                qty = abs(float(refreshed.position_amt))
+                close_side = "SELL" if float(refreshed.position_amt) > 0 else "BUY"
+
+        await self._cancel_stop_loss_order(symbol, run_id)
+
+        signal["stop_loss"] = target_sl
+        signal["stop_loss_reason"] = be_reason
+        signal["stop_loss_kind"] = "breakeven"
+        signal["breakeven_sl"] = {
+            "reason": be_reason,
+            "entry": entry,
+            "target_sl": target_sl,
+            "offset_bp": be_offset_bp,
+            "maker_first_attempted": maker_first_attempted,
+        }
+        new_signal_json = json.dumps(signal)
+        await self._repo.update_run(run_id, signal_json=new_signal_json)
+        run["signal_json"] = new_signal_json
+
+        await self._place_stop_loss_maker(
+            symbol=symbol,
+            side=close_side,
+            qty_str=await self._client.format_quantity(symbol, qty),
+            sl_price=target_sl,
+            run_id=run_id,
+            reason=be_reason,
+            run=run,
+        )
+
+        await self._repo.log_event(
+            run_id,
+            "breakeven_sl_applied",
+            {
+                "reason": be_reason,
+                "old_sl": sl_price,
+                "new_sl": target_sl,
+                "entry": entry,
+                "be_offset_bp": be_offset_bp,
+                "maker_first_attempted": maker_first_attempted,
+            }
+        )
+        direction_sign = "+" if side == "LONG" else "-"
+        codex_note = self._codex_v1_telegram_note(run)
+        await self._notify(
+            f"🛡️ <b>Stop-Loss 已移至保本價 (BE-SL)</b>\n"
+            f"Run：<code>{escape(run_id)}</code>\n"
+            f"保本價：<b>${target_sl:.4f}</b> (Entry: ${entry:.4f} {direction_sign} {be_offset_bp:g}bp){codex_note}"
+        )
+
     async def _run_running_manage(
         self,
         run: dict,
@@ -4684,6 +17699,7 @@ class MainnetOneRunManager:
         close_side = "SELL" if position.position_amt > 0 else "BUY"
         hold_start_ms = await self._get_hold_start_ms(run)
         run_age_bars = max(0, int((int(time.time() * 1000) - hold_start_ms) / 60_000))
+        max_holding_bars = self._max_holding_bars_for_run(signal)
 
         # Residual "dust" cleanup: after partial TP fills the remaining position
         # may be tiny.  The ideal-price TP can then sit unfilled (price moved
@@ -4739,6 +17755,18 @@ class MainnetOneRunManager:
 
         await self._refresh_partial_fill_state(run, position, prev_qty=prev_qty)
         await self._sync_take_profit_orders(run, position, signal)
+        signal = json.loads(run.get("signal_json") or "{}")
+        if await self._maybe_full_tp_touch_lock(run, signal, position, side, mark, entry, qty, close_side):
+            return
+        await self._maybe_apply_breakeven_sl(
+            run=run,
+            position=position,
+            signal=signal,
+            side=side,
+            entry=entry,
+            qty=qty,
+            close_side=close_side,
+        )
         if await self._maybe_recovery(run, signal, position):
             return
         # Ensure the TRAIL fast-watcher is alive — covers bot restart, where the
@@ -4974,30 +18002,718 @@ class MainnetOneRunManager:
                             }
                         )
 
-        if await self._maybe_codex_survival_exit(
-            run,
-            signal,
-            position,
-            side,
-            mark,
-            entry,
-            qty,
-            close_side,
-            hold_start_ms,
-        ):
-            return
-        if self._hit_stop(side, mark, sl_price):
-            await self._close_position(symbol, close_side, qty, "SL", run)
-            return
+        sl_price = float(signal.get("stop_loss") or 0.0)
         unrealized_loss_limit = -float(
-            run.get("cumulative_notional_usdc") or self._settings.mainnet_effective_entry_notional_usdc
+            run.get("cumulative_notional_usdc")
+            or self._settings.mainnet_effective_entry_notional_usdc
         ) * self._settings.mainnet_adverse_exit_loss_pct
+        v1459_hard_exit_pending = False
+        if (
+            self._v1459_profile_candidate_active(run)
+            and self._v1459_profile_enforcement_active()
+        ):
+            v1459_hard_exit_pending = bool(
+                self._hit_stop(side, mark, sl_price)
+                or (
+                    run_age_bars >= self._settings.mainnet_adverse_exit_bars
+                    and position.unrealized_pnl <= unrealized_loss_limit
+                )
+                or run_age_bars >= max_holding_bars
+            )
+        if not v1459_hard_exit_pending:
+            if await self._maybe_codex_survival_exit(
+                run,
+                signal,
+                position,
+                side,
+                mark,
+                entry,
+                qty,
+                close_side,
+                hold_start_ms,
+            ):
+                return
+        if self._hit_stop(side, mark, sl_price):
+            stop_reason = str(signal.get("stop_loss_reason") or "SL")
+            await self._close_position(symbol, close_side, qty, stop_reason, run)
+            return
         if run_age_bars >= self._settings.mainnet_adverse_exit_bars and position.unrealized_pnl <= unrealized_loss_limit:
             await self._close_position(symbol, close_side, qty, "ADVERSE_EXIT", run)
             return
-        if run_age_bars >= self._settings.mainnet_max_holding_bars:
+        if run_age_bars >= max_holding_bars:
             reason = "MAX_HOLD_WIN" if position.unrealized_pnl >= 0 else "MAX_HOLD_LOSS"
+            if reason == "MAX_HOLD_WIN" and self._should_codex_max_hold_profit_lock(signal, side, entry, mark):
+                await self._repo.log_event(
+                    run["run_id"],
+                    "codex_max_hold_profit_lock_triggered",
+                    {
+                        "reason": "CODEX_MAX_HOLD_PROFIT_LOCK",
+                        "side": side,
+                        "entry": entry,
+                        "mark": mark,
+                        "current_bp": round(self._side_pnl_bp(side, entry, mark), 4),
+                        "max_holding_bars": max_holding_bars,
+                    },
+                )
+                await self._close_position(symbol, close_side, qty, "CODEX_MAX_HOLD_PROFIT_LOCK", run)
+                return
+            if reason == "MAX_HOLD_WIN" and self._should_defer_codex_max_hold_win_fee_floor(signal, side, entry, mark, run_age_bars, max_holding_bars):
+                await self._repo.log_event(
+                    run["run_id"],
+                    "codex_max_hold_win_fee_floor_deferred",
+                    {
+                        "reason": "MAX_HOLD_WIN",
+                        "side": side,
+                        "entry": entry,
+                        "mark": mark,
+                        "current_bp": round(self._side_pnl_bp(side, entry, mark), 4),
+                        "max_holding_bars": max_holding_bars,
+                        "defer_extra_bars": int(getattr(self._settings, "mainnet_codex_v1436_max_hold_win_fee_floor_defer_extra_bars", 2) or 0),
+                    },
+                )
+                return
             await self._close_position(symbol, close_side, qty, reason, run)
+
+    def _should_codex_max_hold_profit_lock(self, signal: Mapping[str, Any], side: str, entry: float, mark: float) -> bool:
+        if not bool(getattr(self._settings, "mainnet_codex_max_hold_profit_lock_enabled", True)):
+            return False
+        codex = signal.get("codex_v1") if isinstance(signal, Mapping) else None
+        if not isinstance(codex, Mapping) or not codex.get("enabled"):
+            return False
+        metrics = codex.get("metrics") if isinstance(codex.get("metrics"), Mapping) else {}
+        market_state = str(
+            metrics.get("market_state")
+            or metrics.get("v143_market_state")
+            or metrics.get("wpr_profile")
+            or codex.get("regime")
+            or ""
+        ).strip()
+        raw_allowed = str(
+            getattr(
+                self._settings,
+                "mainnet_codex_max_hold_profit_lock_states",
+                "STUP-S:mixed,STUP-S:weak_chop,STUP-S:clean_extension,CNL-WPR-L:falling_discount_trap,CNL-WPR-L:fast_reclaim,CNL-WPR-L:deep_discount_stable,CNL-WPR-L:discount_mixed",
+            )
+            or ""
+        )
+        allowed_states = {item.strip() for item in raw_allowed.split(",") if item.strip()}
+        if allowed_states and market_state not in allowed_states:
+            return False
+        try:
+            min_floor_bp = max(0.0, float(getattr(self._settings, "mainnet_codex_max_hold_profit_min_floor_bp", 5.0) or 0.0))
+        except (TypeError, ValueError):
+            min_floor_bp = 5.0
+        current_bp = self._side_pnl_bp(side, entry, mark)
+        v1442_floor_bp = self._codex_v1442_cnl_wpr_max_hold_floor_bp(codex)
+        if v1442_floor_bp is not None:
+            return current_bp >= v1442_floor_bp
+        return current_bp >= self._fee_safe_profit_floor_bp(min_floor_bp)
+
+    def _should_defer_codex_max_hold_win_fee_floor(
+        self,
+        signal: Mapping[str, Any],
+        side: str,
+        entry: float,
+        mark: float,
+        run_age_bars: int,
+        max_holding_bars: int,
+    ) -> bool:
+        if not bool(getattr(self._settings, "mainnet_codex_v1436_max_hold_win_fee_floor_defer_enabled", True)):
+            return False
+        try:
+            extra_bars = max(
+                0,
+                int(getattr(self._settings, "mainnet_codex_v1436_max_hold_win_fee_floor_defer_extra_bars", 2) or 0),
+            )
+        except (TypeError, ValueError):
+            extra_bars = 2
+        if int(run_age_bars) >= int(max_holding_bars) + extra_bars:
+            return False
+        codex = signal.get("codex_v1") if isinstance(signal, Mapping) else None
+        if not isinstance(codex, Mapping) or not codex.get("enabled"):
+            return False
+        try:
+            configured_floor = max(
+                0.0,
+                float(getattr(self._settings, "mainnet_codex_max_hold_profit_min_floor_bp", 5.0) or 0.0),
+            )
+        except (TypeError, ValueError):
+            configured_floor = 5.0
+        current_bp = self._side_pnl_bp(side, entry, mark)
+        v1442_floor_bp = self._codex_v1442_cnl_wpr_max_hold_floor_bp(codex)
+        floor_bp = v1442_floor_bp if v1442_floor_bp is not None else self._fee_safe_profit_floor_bp(configured_floor)
+        return 0.0 <= current_bp < floor_bp
+
+    def _codex_v1443_near_flat_scratch_config(self, reason: str) -> tuple[str, float, float, int, float] | None:
+        if reason == "MAX_HOLD_LOSS":
+            if not bool(getattr(self._settings, "mainnet_codex_v1443_max_hold_loss_maker_scratch_enabled", True)):
+                return None
+            return (
+                "CODEX_V1443_MAX_HOLD_LOSS_SCRATCH",
+                float(getattr(self._settings, "mainnet_codex_v1443_max_hold_loss_scratch_min_bp", -2.5) or -2.5),
+                float(getattr(self._settings, "mainnet_codex_v1443_max_hold_loss_scratch_max_bp", 0.75) or 0.75),
+                max(0, int(getattr(self._settings, "mainnet_codex_v1443_max_hold_loss_maker_ttl_seconds", 3) or 3)),
+                float(getattr(self._settings, "mainnet_codex_v1443_max_hold_loss_adverse_break_bp", 0.75) or 0.75),
+            )
+        if reason == "ENTRY_LATE_FILL_TTL":
+            if not bool(getattr(self._settings, "mainnet_codex_v1443_entry_late_fill_maker_scratch_enabled", True)):
+                return None
+            return (
+                "CODEX_V1443_ENTRY_LATE_FILL_SCRATCH",
+                float(getattr(self._settings, "mainnet_codex_v1443_entry_late_fill_scratch_min_bp", -2.0) or -2.0),
+                float(getattr(self._settings, "mainnet_codex_v1443_entry_late_fill_scratch_max_bp", 1.0) or 1.0),
+                max(0, int(getattr(self._settings, "mainnet_codex_v1443_entry_late_fill_maker_ttl_seconds", 3) or 3)),
+                float(getattr(self._settings, "mainnet_codex_v1443_entry_late_fill_adverse_break_bp", 0.75) or 0.75),
+            )
+        return None
+
+    async def _maybe_codex_v1443_near_flat_maker_scratch(
+        self,
+        symbol: str,
+        side: str,
+        qty_str: str,
+        reason: str,
+        run: dict,
+    ) -> bool:
+        scratch_config = self._codex_v1443_near_flat_scratch_config(reason)
+        if scratch_config is None:
+            return False
+        codex = self._codex_v1_signal_meta(run)
+        if not isinstance(codex, Mapping) or not codex.get("enabled"):
+            return False
+        scratch_reason, min_bp, max_bp, maker_ttl, adverse_break_bp = scratch_config
+        lane_code = str(codex.get("lane_code") or "").upper()
+        market_state = (
+            (codex.get("metrics") or {}).get("market_state")
+            if isinstance(codex.get("metrics"), Mapping)
+            else None
+        )
+        scratch_event_type = "codex_v1443_near_flat_scratch_triggered"
+        if (
+            reason == "ENTRY_LATE_FILL_TTL"
+            and lane_code == "CNL-WPR-L"
+            and bool(getattr(self._settings, "mainnet_codex_v1449_cnl_wpr_late_fill_maker_exit_enabled", True))
+        ):
+            scratch_reason = "CODEX_V1449_CNL_WPR_LATE_FILL_MAKER_EXIT"
+            min_bp = float(getattr(self._settings, "mainnet_codex_v1449_cnl_wpr_late_fill_scratch_min_bp", -8.0) or -8.0)
+            max_bp = float(getattr(self._settings, "mainnet_codex_v1449_cnl_wpr_late_fill_scratch_max_bp", 4.0) or 4.0)
+            maker_ttl = max(0, int(getattr(self._settings, "mainnet_codex_v1449_cnl_wpr_late_fill_maker_ttl_seconds", 6)))
+            adverse_break_bp = float(getattr(self._settings, "mainnet_codex_v1449_cnl_wpr_late_fill_adverse_break_bp", 1.0) or 1.0)
+            scratch_event_type = "codex_v1449_cnl_wpr_late_fill_maker_exit_triggered"
+        try:
+            position = await self._client.get_position(symbol)
+            if position is None or abs(float(position.position_amt)) < 1e-9:
+                return False
+            cost_basis = float(position.entry_price or run.get("avg_entry_price") or 0.0)
+            mark_price = float(getattr(position, "mark_price", 0.0) or 0.0)
+            if cost_basis <= 0:
+                return False
+            if mark_price <= 0:
+                book = await self._client.get_book_ticker(symbol)
+                bid = float(book["bidPrice"])
+                ask = float(book["askPrice"])
+                mark_price = (bid + ask) / 2.0
+            current_bp = (
+                (mark_price - cost_basis) / cost_basis * 10_000.0
+                if side == "SELL"
+                else (cost_basis - mark_price) / cost_basis * 10_000.0
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("codex_v1443_near_flat_scratch_check_failed", run_id=run.get("run_id"), reason=reason, error=str(exc)[:200])
+            return False
+        if current_bp < min_bp or current_bp > max_bp:
+            return False
+        await self._repo.log_event(
+            run["run_id"],
+            scratch_event_type,
+            {
+                "original_reason": reason,
+                "scratch_reason": scratch_reason,
+                "current_bp": round(current_bp, 4),
+                "min_bp": min_bp,
+                "max_bp": max_bp,
+                "maker_ttl_seconds": maker_ttl,
+                "adverse_break_bp": adverse_break_bp,
+                "lane_code": codex.get("lane_code"),
+                "market_state": (codex.get("metrics") or {}).get("market_state") if isinstance(codex.get("metrics"), Mapping) else None,
+            },
+        )
+        if await self._try_trail_maker_exit(
+            symbol,
+            side,
+            qty_str,
+            run,
+            reason=scratch_reason,
+            ttl_seconds=maker_ttl,
+            enforce_profit_floor=False,
+            profit_floor_bp=None,
+            adverse_break_bp=adverse_break_bp,
+            fallback_market_on_failure=True,
+        ):
+            await self._cancel_take_profit_orders(symbol, run["run_id"])
+            await self._cancel_stop_loss_order(symbol, run["run_id"])
+            return True
+        await self._repo.log_event(
+            run["run_id"],
+            (
+                "codex_v1449_late_fill_maker_exit_fallback_market"
+                if scratch_reason == "CODEX_V1449_CNL_WPR_LATE_FILL_MAKER_EXIT"
+                else "codex_v1443_near_flat_scratch_fallback_market"
+            ),
+            {"original_reason": reason, "scratch_reason": scratch_reason, "current_bp": round(current_bp, 4)},
+        )
+        return False
+    def _max_holding_bars_for_run(self, signal: Mapping[str, Any]) -> int:
+        default_bars = max(1, int(getattr(self._settings, "mainnet_max_holding_bars", 24) or 24))
+        codex = signal.get("codex_v1") if isinstance(signal, Mapping) else None
+        if not isinstance(codex, Mapping) or not codex.get("enabled"):
+            return default_bars
+        if not bool(getattr(self._settings, "mainnet_codex_v143_adaptive_exec_enabled", True)):
+            return default_bars
+        metrics = codex.get("metrics") if isinstance(codex.get("metrics"), Mapping) else None
+        profile_hold_s = self._codex_v143_metric_float(metrics, "hold_s")
+        if profile_hold_s is None or profile_hold_s <= 0:
+            return default_bars
+        return max(1, int(math.ceil(profile_hold_s / 60.0)))
+
+    async def _v1465_claim_w6a_entry_authority(
+        self,
+        codex_decision: CodexV1Decision,
+        *,
+        actual_decision: WildcatLiveDecision | None,
+        actual_notional_usdc: float,
+    ) -> tuple[CodexV1Decision | None, str]:
+        metrics = (
+            dict(codex_decision.metrics)
+            if isinstance(codex_decision.metrics, Mapping)
+            else {}
+        )
+        metadata = (
+            metrics.get("v1465_w6a_profile_selection")
+            if isinstance(
+                metrics.get("v1465_w6a_profile_selection"),
+                Mapping,
+            )
+            else None
+        )
+        if metadata is None:
+            return codex_decision, "not_v1465_w6a"
+        if self._v1465_profile_ledger_unsafe:
+            return None, "v1465_profile_ledger_unsafe"
+        admission = (
+            metrics.get("v1462_admission")
+            if isinstance(metrics.get("v1462_admission"), Mapping)
+            else {}
+        )
+        session = self._adaptive_session or {}
+        if not bool(
+            admission.get("raw_accepted")
+            and admission.get("pre_gate_accepted")
+            and admission.get("final_incumbent_accepted")
+            and not admission.get("reject_lineage")
+            and not self._v1459_guard.identity_unsafe
+            and self._v1462_execution_controls_safe()
+            and not (
+                session.get("stop_requested")
+                or session.get("safety_halt_reason")
+                or self._v1459_entry_paused()
+            )
+        ):
+            return None, "v1465_current_risk_unsafe"
+        if not bool(
+            getattr(
+                self._settings,
+                "mainnet_codex_v1465_w6a_profile_enforcement_enabled",
+                False,
+            )
+        ):
+            return None, "v1465_enforcement_disabled"
+        repo = self._v1465_w6a_profile_repo
+        if repo is None:
+            return None, "v1465_profile_repository_missing"
+        now_ms = int(time.time() * 1000)
+        evaluated_at_ms = int(metadata.get("evaluated_at_ms") or 0)
+        submit_max_age_ms = max(
+            1,
+            int(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1464_submit_max_age_seconds",
+                    10,
+                )
+            ),
+        ) * 1000
+        if (
+            evaluated_at_ms <= 0
+            or now_ms < evaluated_at_ms
+            or now_ms - evaluated_at_ms > submit_max_age_ms
+        ):
+            return None, "v1465_selection_snapshot_stale"
+        selector_key = str(metadata.get("selector_key") or "")
+        selected_ticket = (
+            metadata.get("selected_candidate_ticket")
+            if isinstance(
+                metadata.get("selected_candidate_ticket"), Mapping
+            )
+            else {}
+        )
+        if (
+            str(codex_decision.lane_code or "").upper() != "W6A"
+            or str(codex_decision.side or "").upper()
+            != str(selected_ticket.get("effective_side") or "").upper()
+            or str(codex_decision.strategy or "")
+            != str(selected_ticket.get("strategy") or "")
+        ):
+            return None, "v1465_current_candidate_identity_changed"
+        selected_plan = (
+            metadata.get("selected_execution_plan")
+            if isinstance(
+                metadata.get("selected_execution_plan"), Mapping
+            )
+            else None
+        )
+        if selected_plan is None:
+            return None, "v1465_selected_execution_plan_missing"
+        selected_plan_hash = hashlib.sha256(
+            json.dumps(
+                selected_plan,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        if selected_plan_hash != str(
+            metadata.get("selected_execution_plan_hash") or ""
+        ):
+            return None, "v1465_selected_execution_plan_hash_changed"
+        winner_profile_id = str(
+            metadata.get("winner_profile_id") or ""
+        ).upper()
+        if winner_profile_id not in W6A_PROFILES:
+            return None, "v1465_winner_profile_unknown"
+        winner_profile = W6A_PROFILES[winner_profile_id]
+        try:
+            geometry_matches = bool(
+                math.isclose(
+                    float(metrics.get("entry_bp")),
+                    float(winner_profile.entry_offset_bp),
+                    abs_tol=1e-9,
+                )
+                and math.isclose(
+                    float(metrics.get("tp1_bp")),
+                    float(winner_profile.tp_bp),
+                    abs_tol=1e-9,
+                )
+                and math.isclose(
+                    float(metrics.get("full_tp_bp")),
+                    float(winner_profile.tp_bp),
+                    abs_tol=1e-9,
+                )
+                and math.isclose(
+                    float(metrics.get("sl_bp")),
+                    float(winner_profile.sl_bp),
+                    abs_tol=1e-9,
+                )
+                and int(metrics.get("ttl_s"))
+                == int(winner_profile.entry_ttl_seconds)
+                and math.isclose(
+                    float(metrics.get("partial_exit_pct")),
+                    1.0,
+                    abs_tol=1e-9,
+                )
+            )
+        except (TypeError, ValueError, OverflowError):
+            geometry_matches = False
+        if not geometry_matches:
+            return None, "v1465_current_profile_geometry_changed"
+        if actual_decision is None:
+            return None, "v1465_actual_execution_plan_missing"
+        try:
+            actual_side = str(actual_decision.side or "").upper()
+            expected_side = str(selected_plan.get("side") or "").upper()
+            expected_action = "BUY" if expected_side == "LONG" else "SELL"
+            entries = list(actual_decision.signal.entries or [])
+            actual_signal_entry = float(entries[0])
+            actual_order_entry = float(
+                self._codex_v1_entry_reference_price(
+                    actual_decision.signal.price,
+                    actual_side,
+                    float(codex_decision.entry_offset_bp or 0.0),
+                )
+            )
+            actual_stop = float(actual_decision.signal.stop_loss)
+            actual_full_tp = float(
+                (actual_decision.signal.take_profits or [None])[0]
+            )
+            actual_tp1 = actual_order_entry * (
+                1.0 + float(actual_decision.partial_tp_pct)
+                if actual_side == "LONG"
+                else 1.0 - float(actual_decision.partial_tp_pct)
+            )
+            actual_plan_matches = bool(
+                actual_side in {"LONG", "SHORT"}
+                and actual_side == expected_side
+                and str(actual_decision.signal.action or "").upper()
+                == expected_action
+                and str(actual_decision.strategy or "")
+                == str(selected_plan.get("strategy") or "")
+                and math.isclose(
+                    actual_signal_entry,
+                    float(selected_plan.get("entry_price")),
+                    rel_tol=1e-10,
+                    abs_tol=1e-9,
+                )
+                and math.isclose(
+                    actual_order_entry,
+                    float(selected_plan.get("entry_price")),
+                    rel_tol=1e-10,
+                    abs_tol=1e-9,
+                )
+                and math.isclose(
+                    actual_stop,
+                    float(selected_plan.get("sl_price")),
+                    rel_tol=1e-10,
+                    abs_tol=1e-9,
+                )
+                and math.isclose(
+                    actual_tp1,
+                    float(selected_plan.get("tp1_price")),
+                    rel_tol=1e-10,
+                    abs_tol=1e-9,
+                )
+                and math.isclose(
+                    actual_full_tp,
+                    float(selected_plan.get("full_tp_price")),
+                    rel_tol=1e-10,
+                    abs_tol=1e-9,
+                )
+                and math.isclose(
+                    float(actual_decision.partial_exit_pct),
+                    float(selected_plan.get("partial_exit_pct")),
+                    rel_tol=1e-10,
+                    abs_tol=1e-9,
+                )
+                and math.isclose(
+                    float(actual_decision.signal.planned_notional_usdc),
+                    float(actual_notional_usdc),
+                    rel_tol=1e-10,
+                    abs_tol=1e-9,
+                )
+                and math.isclose(
+                    float(actual_notional_usdc),
+                    float(selected_plan.get("planned_notional_usdc")),
+                    rel_tol=1e-10,
+                    abs_tol=1e-9,
+                )
+            )
+        except (TypeError, ValueError, OverflowError, IndexError):
+            actual_plan_matches = False
+        if not actual_plan_matches:
+            return None, "v1465_actual_execution_plan_changed"
+        try:
+            current = await repo.get_selection(selector_key)
+        except Exception:  # noqa: BLE001 - no current lease means no order
+            return None, "v1465_selection_read_failed"
+        if current is None:
+            return None, "v1465_selection_missing"
+        if str(current.get("status") or "") != "LIVE":
+            return None, "v1465_selection_not_live"
+        if int(current.get("expires_at_ms") or 0) <= now_ms:
+            return None, "v1465_selection_expired"
+        checks = (
+            ("generation", int),
+            ("winner_profile_id", str),
+            ("winner_resolved_profile_hash", str),
+            ("evidence_revision", str),
+            ("policy_hash", str),
+        )
+        for field, converter in checks:
+            if converter(current.get(field)) != converter(metadata.get(field)):
+                return None, f"v1465_{field}_changed"
+        try:
+            current_cap = float(current.get("notional_cap_usdc") or 0.0)
+            admission_cap = float(
+                metadata.get("notional_cap_usdc") or 0.0
+            )
+            actual = float(actual_notional_usdc)
+        except (TypeError, ValueError, OverflowError):
+            return None, "v1465_notional_invalid"
+        if (
+            not all(math.isfinite(value) for value in (
+                current_cap,
+                admission_cap,
+                actual,
+            ))
+            or actual <= 0.0
+            or actual > min(current_cap, admission_cap) + 1e-9
+        ):
+            return None, "v1465_notional_exceeds_selection"
+        return codex_decision, "v1465_selection_revalidated"
+
+    async def _v1464_claim_entry_authority(
+        self,
+        run: Mapping[str, Any],
+        codex_decision: CodexV1Decision,
+        *,
+        actual_notional_usdc: float,
+        consume_id: str,
+    ) -> tuple[CodexV1Decision | None, str]:
+        """Atomically consume the exact lease generation before order submit."""
+
+        metrics = (
+            dict(codex_decision.metrics)
+            if isinstance(codex_decision.metrics, Mapping)
+            else {}
+        )
+        metadata_payload = (
+            metrics.get("v1464_adaptive_promotion")
+            if isinstance(
+                metrics.get("v1464_adaptive_promotion"),
+                Mapping,
+            )
+            else None
+        )
+        if metadata_payload is None:
+            return codex_decision, "not_adaptive"
+        runtime = self._v1464_promotion_runtime
+        if runtime is None:
+            return None, "promotion_runtime_missing"
+        admission_identity = (
+            metrics.get("v1462_admission")
+            if isinstance(metrics.get("v1462_admission"), Mapping)
+            else None
+        )
+        regime_payload = (
+            metadata_payload.get("regime_snapshot")
+            if isinstance(
+                metadata_payload.get("regime_snapshot"),
+                Mapping,
+            )
+            else None
+        )
+        if admission_identity is None or regime_payload is None:
+            return None, "revalidation_context_missing"
+        try:
+            now_ms = int(time.time() * 1000)
+            evaluated_at_ms = int(
+                metadata_payload.get("evaluated_at_ms") or 0
+            )
+            submit_max_age_ms = max(
+                1,
+                int(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v1464_submit_max_age_seconds",
+                        10,
+                    )
+                ),
+            ) * 1000
+            if (
+                evaluated_at_ms <= 0
+                or now_ms < evaluated_at_ms
+                or now_ms - evaluated_at_ms > submit_max_age_ms
+            ):
+                return None, "admission_snapshot_stale"
+            current_cohort = promotion_cohort_from_identity(
+                admission_identity,
+                config=runtime.config,
+            )
+            if (
+                str(run.get("symbol") or "").strip().upper()
+                != current_cohort.symbol
+                or str(codex_decision.lane_code or "").strip().upper()
+                != current_cohort.lane_code
+                or str(codex_decision.side or "").strip().upper()
+                != current_cohort.effective_side
+                or str(codex_decision.strategy or "").strip()
+                != current_cohort.strategy
+            ):
+                return None, "current_candidate_identity_changed"
+            regime_fields = PromotionRegimeSnapshot.__dataclass_fields__
+            current_regime = PromotionRegimeSnapshot(
+                **{
+                    name: regime_payload[name]
+                    for name in regime_fields
+                    if name in regime_payload
+                }
+            )
+            session = self._adaptive_session or {}
+            reject_lineage = tuple(
+                str(value)
+                for value in admission_identity.get("reject_lineage") or ()
+                if str(value)
+            )
+            current_risk = PromotionRiskInput(
+                raw_accepted=bool(
+                    admission_identity.get("raw_accepted")
+                ),
+                pre_gate_accepted=bool(
+                    admission_identity.get("pre_gate_accepted")
+                ),
+                final_incumbent_accepted=bool(
+                    admission_identity.get("final_incumbent_accepted")
+                ),
+                reject_lineage=reject_lineage,
+                identity_valid=bool(
+                    admission_identity.get("lane_definition_hash")
+                    and admission_identity.get("resolved_profile_hash")
+                    and admission_identity.get("profile_identity_schema")
+                    == "v1464.stable-profile.1"
+                ),
+                integrity_safe=bool(
+                    not reject_lineage
+                    and not self._v1459_guard.identity_unsafe
+                ),
+                execution_controls_safe=(
+                    self._v1462_execution_controls_safe()
+                ),
+                database_healthy=runtime.database_healthy,
+                global_halted=bool(
+                    session.get("stop_requested")
+                    or session.get("safety_halt_reason")
+                    or self._v1459_entry_paused()
+                ),
+            )
+            revalidation = await runtime.revalidate_before_submit(
+                metadata_payload,
+                now_ms,
+                current_cohort=current_cohort,
+                actual_notional_usdc=float(actual_notional_usdc),
+                risk=current_risk,
+                regime=current_regime,
+                consume_id=str(consume_id),
+                enabled=bool(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v1464_auto_promotion_enabled",
+                        False,
+                    )
+                ),
+                database_healthy=runtime.database_healthy,
+            )
+        except Exception as exc:  # noqa: BLE001 - no claim means no order
+            logger.error(
+                "v1464_entry_authority_revalidation_failed",
+                run_id=run.get("run_id"),
+                error=str(exc)[:200],
+            )
+            return None, "revalidation_exception"
+        if not revalidation.allowed or revalidation.metadata is None:
+            return None, revalidation.reason
+        refreshed = {
+            **dict(metadata_payload),
+            **revalidation.metadata.to_payload(),
+            "claim_generation": revalidation.claim_generation,
+            "claim_reason": revalidation.reason,
+            "persistence_healthy": True,
+        }
+        metrics["v1464_adaptive_promotion"] = refreshed
+        metrics["applied_notional_cap_usdc"] = min(
+            float(metrics.get("applied_notional_cap_usdc") or actual_notional_usdc),
+            float(actual_notional_usdc),
+            float(revalidation.notional_cap_usdc),
+        )
+        return replace(codex_decision, metrics=metrics), revalidation.reason
 
     async def _get_hold_start_ms(self, run: dict) -> int:
         cached = run.get("_hold_start_ms")
@@ -5018,6 +18734,7 @@ class MainnetOneRunManager:
         codex_decision: CodexV1Decision | None = None,
         codex_features: Mapping[str, Any] | None = None,
     ) -> None:
+        await self._ensure_runtime_config_loaded()
         if self._codex_v1_execution_enabled() and codex_decision is None:
             await self._repo.log_event(
                 run["run_id"],
@@ -5048,14 +18765,70 @@ class MainnetOneRunManager:
                     f"score=<code>{decision.signal.score}</code>"
                 )
             return
+        strategy_label = str(run.get("strategy") or decision.strategy or "")
+        if strategy_label == "S2_SuperTrend":
+            s2_offset = float(getattr(self._settings, "mainnet_s2_entry_offset_bp", 1.0))
+            s2_sl_bp = float(getattr(self._settings, "mainnet_s2_max_sl_bp", 15.0))
+            s2_partial_tp = float(getattr(self._settings, "mainnet_s2_partial_tp_pct", 0.0010))
+            s2_partial_exit = float(getattr(self._settings, "mainnet_s2_partial_exit_pct", 0.40))
+
+            entry_ref = self._codex_v1_entry_reference_price(
+                decision.signal.price,
+                decision.side,
+                s2_offset,
+            )
+            if decision.side == "LONG":
+                stop_loss = entry_ref * (1 - s2_sl_bp / 10000.0)
+                take_profit = entry_ref * (1 + decision.tp_pct)
+            else:
+                stop_loss = entry_ref * (1 + s2_sl_bp / 10000.0)
+                take_profit = entry_ref * (1 - decision.tp_pct)
+
+            new_signal = replace(
+                decision.signal,
+                entries=[entry_ref],
+                stop_loss=stop_loss,
+                take_profits=[take_profit],
+            )
+            decision = replace(
+                decision,
+                signal=new_signal,
+                partial_tp_pct=s2_partial_tp,
+                partial_exit_pct=s2_partial_exit,
+                sl_pct=s2_sl_bp / 10000.0,
+            )
+
+        adaptive_metadata = self._adaptive_metadata_for_run(run)
+        adaptive_decision_payload: dict[str, Any] | None = None
+        if adaptive_metadata:
+            adaptive_decision_payload = self._adaptive_decision_payload(
+                run,
+                codex_decision,
+                raw_decision=raw_codex_decision,
+                features=codex_features,
+            )
+            if await self._adaptive_gate_before_submit(run, adaptive_decision_payload):
+                return
+            await self._maybe_start_adaptive_stup_fill_shadow(
+                run, decision, codex_decision, adaptive_decision_payload
+            )
+
         await self._ensure_fee_guard(run["symbol"])
         await self._client.set_leverage(run["symbol"], self._settings.mainnet_leverage)
         side = "BUY" if decision.side == "LONG" else "SELL"
         entry_notional = decision.signal.planned_notional_usdc
+
+        if codex_decision:
+            entry_offset_bp = codex_decision.entry_offset_bp or 0.0
+        elif strategy_label == "S2_SuperTrend":
+            entry_offset_bp = float(getattr(self._settings, "mainnet_s2_entry_offset_bp", 1.0))
+        else:
+            entry_offset_bp = 0.0
+
         entry_signal_price = self._codex_v1_entry_reference_price(
             decision.signal.price,
             decision.side,
-            codex_decision.entry_offset_bp if codex_decision else 0.0,
+            entry_offset_bp,
         )
         # V6.5: remember the actual sizing scale so DCA cumulative-cap checks
         # can scale the cap with the entry (fixes the 1.2x bookkeeping bug).
@@ -5067,6 +18840,58 @@ class MainnetOneRunManager:
             entry_notional / entry_signal_price,
         )
         client_order_id = f"{run['run_id']}_entry"
+        if codex_decision is not None:
+            codex_metrics = (
+                codex_decision.metrics
+                if isinstance(codex_decision.metrics, Mapping)
+                else {}
+            )
+            is_v1465_w6a = isinstance(
+                codex_metrics.get("v1465_w6a_profile_selection"),
+                Mapping,
+            )
+            claimed_decision, claim_reason = (
+                await self._v1465_claim_w6a_entry_authority(
+                    codex_decision,
+                    actual_decision=decision,
+                    actual_notional_usdc=entry_notional,
+                )
+            )
+            if claimed_decision is not None:
+                codex_decision = claimed_decision
+                claimed_decision, claim_reason = (
+                    await self._v1464_claim_entry_authority(
+                        run,
+                        codex_decision,
+                        actual_notional_usdc=entry_notional,
+                        consume_id=client_order_id,
+                    )
+                )
+            if claimed_decision is None:
+                await self._repo.log_event(
+                    run["run_id"],
+                    (
+                        "entry_codex_v1465_lease_blocked"
+                        if is_v1465_w6a
+                        else "entry_codex_v1464_lease_blocked"
+                    ),
+                    {
+                        "reason": claim_reason,
+                        "actual_notional_usdc": entry_notional,
+                        "client_order_id": client_order_id,
+                        "order_api_calls": 0,
+                    },
+                )
+                if run["run_id"] not in self._codex_v1_guard_notified:
+                    self._codex_v1_guard_notified.add(run["run_id"])
+                    await self._notify(
+                        "🛑 <b>Adaptive lease 提交前失效，未送單</b>\n"
+                        f"Run：<code>{escape(run['run_id'])}</code>\n"
+                        f"原因：<code>{escape(claim_reason)}</code>\n"
+                        "系統會維持 fail-closed，等待下一個完整且即時的 exact cohort。"
+                    )
+                return
+            codex_decision = claimed_decision
         ladder_offset = 0.0 if codex_decision is not None else self._settings.mainnet_entry_limit_offset
         ladder_deadline_ms: int | None = None
         entry_note = ""
@@ -5136,6 +18961,10 @@ class MainnetOneRunManager:
                         exc = requote_exc  # book moved again; fall through to reject
                 if order is None:
                     err_detail = str(exc)[:500]
+                    await self._expire_codex_v1_shadow_samples(
+                        run,
+                        "ladder_rejected",
+                    )
                     await self._repo.complete_run(run["run_id"], "ENTRY_REJECTED", "ladder_rejected", err_detail)
                     await self._repo.log_event(run["run_id"], "entry_rejected", {
                         "reason": "ladder_rejected", "detail": err_detail,
@@ -5172,6 +19001,10 @@ class MainnetOneRunManager:
                 )
             except GTXSlippageExceeded as exc:
                 err_detail = str(exc)[:500]
+                await self._expire_codex_v1_shadow_samples(
+                    run,
+                    "slippage_exceeded",
+                )
                 await self._repo.complete_run(run["run_id"], "ENTRY_REJECTED", "slippage_exceeded", err_detail)
                 await self._repo.log_event(run["run_id"], "entry_rejected", {
                     "reason": "slippage_exceeded",
@@ -5188,8 +19021,22 @@ class MainnetOneRunManager:
             final_price = float(order.get("price", 0) or entry_signal_price)
             used_gtc = order.get("timeInForce") != "GTX"
             entry_note = "\n⚠️ 使用 GTC 限價單進場（maker 保護已關閉）" if used_gtc else ""
-        sl_pct = self._effective_sl_pct({"wildcat": {"sl_pct": decision.sl_pct}})
+        sl_pct = self._entry_sl_pct_for_decision(decision, codex_decision)
         stop_loss = self._sl_price_from_pct(final_price, decision.side, sl_pct)
+        recovery_runtime = self._recovery_runtime_payload(
+            lane_code=codex_decision.lane_code if codex_decision is not None else None,
+            uses_codex_v1=codex_decision is not None,
+        )
+        if (
+            codex_decision is not None
+            and "v1464_adaptive_lease" in codex_decision.risk_tags
+        ):
+            recovery_runtime = {
+                **recovery_runtime,
+                "codex_recovery_allowed": False,
+                "effective_recovery_enabled": False,
+                "recovery_block_reason": "v1464_adaptive_recovery_disabled",
+            }
         payload = {
             "side": decision.side,
             "strategy": decision.strategy,
@@ -5219,6 +19066,10 @@ class MainnetOneRunManager:
                 "recovery_tp_shrink": self._settings.mainnet_recovery_tp_shrink,
                 "recovery_sl_widen_per_layer": self._settings.mainnet_recovery_sl_widen_per_layer,
                 "dca_enabled": self._dca_enabled,
+                "runtime_dca_enabled": recovery_runtime["runtime_dca_enabled"],
+                "codex_recovery_allowed": recovery_runtime["codex_recovery_allowed"],
+                "effective_recovery_enabled": recovery_runtime["effective_recovery_enabled"],
+                "recovery_block_reason": recovery_runtime["recovery_block_reason"],
                 "adverse_exit_bars": decision.adverse_exit_bars,
                 "adverse_exit_loss_pct": decision.adverse_exit_loss_pct,
                 "max_holding_bars": decision.max_holding_bars,
@@ -5235,6 +19086,7 @@ class MainnetOneRunManager:
             # range-scale thresholds (see golden-window vs V5.5 forensics).
             "drift30": round(drift_bp, 2) if drift_bp is not None else None,
             "notional_scale": round(self._notional_scale.get(run["run_id"], 1.0), 4),
+            **recovery_runtime,
         }
         if codex_decision is not None:
             raw_snapshot = self._codex_v1_decision_snapshot(raw_codex_decision or codex_decision, codex_features)
@@ -5253,7 +19105,15 @@ class MainnetOneRunManager:
                 target_price=float(codex_target_price or final_price),
             )
             live_ttl_policy = self._codex_v1_live_entry_ttl_policy(
-                {"signal_json": {"codex_v1": {"enabled": True, "lane_code": codex_decision.lane_code}}}
+                {
+                    "signal_json": {
+                        "codex_v1": {
+                            "enabled": True,
+                            "lane_code": codex_decision.lane_code,
+                            "metrics": getattr(codex_decision, "metrics", None),
+                        }
+                    }
+                }
             )
             entry_note += f"\n⏱ Codex Entry TTL：{live_ttl_policy['ttl_seconds']}s"
             payload["codex_v1"] = {
@@ -5270,6 +19130,10 @@ class MainnetOneRunManager:
                 "live_entry_ttl_s": live_ttl_policy["ttl_seconds"],
                 "live_entry_ttl_source": live_ttl_policy["ttl_source"],
                 "live_entry_ttl_lane_code": live_ttl_policy.get("lane_code"),
+                "runtime_dca_enabled": recovery_runtime["runtime_dca_enabled"],
+                "codex_recovery_allowed": recovery_runtime["codex_recovery_allowed"],
+                "effective_recovery_enabled": recovery_runtime["effective_recovery_enabled"],
+                "recovery_block_reason": recovery_runtime["recovery_block_reason"],
                 "risk_tags": list(codex_decision.risk_tags),
                 "policy_tag": (
                     codex_decision.policy_tag
@@ -5303,6 +19167,40 @@ class MainnetOneRunManager:
                 "raw_classifier": raw_snapshot,
                 "effective_execution": effective_snapshot,
             }
+            v142_profile_shadow = self._codex_v142_profile_shadow(codex_decision.lane_code)
+            if v142_profile_shadow is not None:
+                payload["codex_v1"]["v142_profile_shadow"] = v142_profile_shadow
+        submitted_now_ms = int(time.time() * 1000)
+        try:
+            entry_submitted_at_ms = int(
+                order.get("transactTime")
+                or order.get("updateTime")
+                or order.get("time")
+                or submitted_now_ms
+            )
+        except (TypeError, ValueError, OverflowError):
+            entry_submitted_at_ms = submitted_now_ms
+        if entry_submitted_at_ms <= 0 or entry_submitted_at_ms > submitted_now_ms + 60_000:
+            entry_submitted_at_ms = submitted_now_ms
+        persisted_ttl_policy = self._codex_v1_live_entry_ttl_policy(
+            {"signal_json": payload}
+        )
+        entry_deadline_ms = (
+            int(ladder_deadline_ms)
+            if ladder_deadline_ms is not None
+            else entry_submitted_at_ms
+            + max(1, int(persisted_ttl_policy["ttl_seconds"])) * 1000
+        )
+        # Immutable entry timing: later run/order updates and a future
+        # cancel/replace must retain these original values.
+        payload["entry_submitted_at_ms"] = entry_submitted_at_ms
+        payload["entry_deadline_ms"] = entry_deadline_ms
+        payload["entry_ttl_seconds"] = max(
+            1, int(persisted_ttl_policy["ttl_seconds"])
+        )
+        payload["entry_ttl_source"] = persisted_ttl_policy["ttl_source"]
+        if adaptive_metadata:
+            payload["adaptive"] = {**adaptive_metadata, "decision": adaptive_decision_payload}
         codex_note = self._codex_v1_telegram_note(payload)
         await self._repo.update_run(
             run["run_id"],
@@ -5315,6 +19213,9 @@ class MainnetOneRunManager:
             cumulative_notional_usdc=entry_notional,
         )
         await self._repo.log_event(run["run_id"], "entry_placed", {"order": order, "signal": payload})
+        counters = self._adaptive_counters() if adaptive_metadata else None
+        if counters is not None:
+            counters["entry_placed"] = int(counters.get("entry_placed") or 0) + 1
         await self._expire_codex_v1_shadow_samples(run, "live_entry_submitted")
         drift_note = f"{drift_bp:.1f}bp" if drift_bp is not None else "n/a"
         await self._notify(
@@ -5349,6 +19250,29 @@ class MainnetOneRunManager:
             await self._client.cancel_order(symbol, int(order["orderId"]))
         if stale_own:
             logger.warning("mainnet_one_run_stale_orders_cancelled", symbol=symbol, count=len(stale_own))
+
+        margin_asset = "USDC" if symbol.upper().endswith("USDC") else "USDT"
+        balance = await self._client.get_asset_balance(margin_asset)
+        available_margin = float((balance or {}).get("availableBalance") or 0.0)
+        required_margin = (
+            float(self._settings.mainnet_effective_max_cumulative_notional_usdc)
+            / max(1, int(self._settings.mainnet_leverage))
+            * 1.05
+        )
+        if available_margin + 1e-9 < required_margin:
+            logger.warning(
+                "mainnet_one_run_insufficient_margin_preflight",
+                symbol=symbol,
+                margin_asset=margin_asset,
+                available_margin=available_margin,
+                required_margin=required_margin,
+                max_cumulative_notional=self._settings.mainnet_effective_max_cumulative_notional_usdc,
+                leverage=self._settings.mainnet_leverage,
+            )
+            return (
+                f"❌ {margin_asset} 可用保證金不足：目前 {available_margin:.4f}，"
+                f"此 one-run basket 至少需要 {required_margin:.4f}（含 5% buffer）。"
+            )
         return None
 
     async def _ensure_fee_guard(self, symbol: str) -> None:
@@ -5524,10 +19448,45 @@ class MainnetOneRunManager:
         )
         if existing is None:
             return False
+        v1460_entry_safety = self._v1460_entry_safety_active(run)
+        if v1460_entry_safety and not bool(
+            getattr(
+                self._settings,
+                "mainnet_codex_v1460_one_step_reprice_enabled",
+                False,
+            )
+        ):
+            # v1.4.60 freezes all live entry/TTL loosening.  The generic legacy
+            # requote switch must not bypass the frozen lane policy.
+            return False
+        profile_reprice_enforcement = bool(
+            self._v1459_profile_candidate_active(run)
+            and self._v1459_profile_enforcement_active()
+            and getattr(
+                self._settings,
+                "mainnet_codex_v1459_one_step_reprice_enabled",
+                False,
+            )
+            is True
+        )
+        raw_side = str(run.get("side") or "").upper()
+        side = (
+            {
+                "LONG": "BUY",
+                "SHORT": "SELL",
+            }.get(raw_side, raw_side)
+            if profile_reprice_enforcement
+            else raw_side
+        )
+        if side not in {"BUY", "SELL"}:
+            return False
 
         # Counters (initialised lazily, so first call counts as 0)
         count = self._entry_requote_counts.get(run_id, 0)
-        if count >= s.mainnet_entry_reprice_max_updates:
+        if profile_reprice_enforcement or v1460_entry_safety:
+            if count >= 1:
+                return False
+        elif count >= s.mainnet_entry_reprice_max_updates:
             return False
 
         # Age gate — uses armed_at_ms (not updated_at_ms) so requote
@@ -5552,20 +19511,39 @@ class MainnetOneRunManager:
             return False
         try:
             book = await self._client.get_book_ticker(symbol)
-            mark = float(book.get("bidPrice", 0)) if str(run.get("side") or "").upper() == "SELL" else float(book.get("askPrice", 0))
+            bid = float(book.get("bidPrice", 0) or 0)
+            ask = float(book.get("askPrice", 0) or 0)
+            mark = (
+                bid
+                if side == "SELL"
+                else ask
+            )
             if mark <= 0:
                 mark = float(existing_price)
         except Exception as exc:  # noqa: BLE001
             logger.warning("entry_requote_book_fetch_failed", run_id=run_id, error=str(exc)[:200])
             return False
         deviation_bps = abs(mark - existing_price) / existing_price * 10_000
-        if deviation_bps <= s.mainnet_entry_max_deviation_bps:
+        ttl_policy = self._codex_v1_live_entry_ttl_policy(run)
+        entry_profile_decision = await self._v1459_observe_entry_profile(
+            run,
+            order_id=int(order_id),
+            existing_order=existing,
+            open_orders=open_orders,
+            age_ms=age_ms,
+            ttl_seconds=int(ttl_policy["ttl_seconds"]),
+            bid=bid,
+            ask=ask,
+            deviation_bps=deviation_bps,
+        )
+        if profile_reprice_enforcement and (
+            entry_profile_decision is None
+            or entry_profile_decision.profile
+            is not EntryProfile.ONE_STEP_REPRICE
+        ):
             return False
 
-        # Side for the new order — must match the original run side.
-        side = str(run.get("side") or "").upper()
-        if side not in {"BUY", "SELL"}:
-            # Fall back to inferring from position direction if any.
+        if deviation_bps <= s.mainnet_entry_max_deviation_bps:
             return False
 
         # Quantity: re-read from the run (cumulative_notional_usdc /
@@ -5602,18 +19580,35 @@ class MainnetOneRunManager:
         new_client_order_id = f"{run_id}_entry_r{count + 1}"
         attempt_no = count + 1
 
-        # 1) Cancel the existing order first.  We do this even if the
-        # new order might fail — we are committed to leaving the run
-        # with a fresh passive price, and a partial cancel/replace
-        # race on Binance is rare for our small size.
-        try:
-            await self._client.cancel_order(symbol, order_id)
-        except Exception as exc:  # noqa: BLE001
-            # If the order is already gone (filled or already
-            # cancelled), the next tick will sort it out via the
-            # position check.  Anything else is fatal for this run.
-            logger.warning("entry_requote_cancel_failed", run_id=run_id, order_id=order_id, error=str(exc)[:200])
-            return False
+        # 1) Cancel and explicitly reconcile before replacement.  v1.4.60
+        # never relies on the cancel response alone because a fill can land in
+        # the cancel/replace race window.
+        if v1460_entry_safety:
+            reconciliation = await self._v1460_cancel_confirm_entry(
+                run,
+                order_id,
+                purpose="entry_requote",
+                halt_on_unsafe=True,
+            )
+            if reconciliation["status"] == "FILLED":
+                await self._activate_entry_fill(
+                    run,
+                    reconciliation["position"],
+                    order_id,
+                    detection_source="requote_cancel_reconcile",
+                    protection_prearmed=bool(
+                        reconciliation.get("cancel_race_hard_sl_armed")
+                    ),
+                )
+                return True
+            if reconciliation["status"] != "NO_FILL":
+                return True
+        else:
+            try:
+                await self._client.cancel_order(symbol, order_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("entry_requote_cancel_failed", run_id=run_id, order_id=order_id, error=str(exc)[:200])
+                return False
 
         # 2) Place the new maker order via the existing helper, which
         # already implements GTX retry + slippage cap + GTC fallback.
@@ -5625,7 +19620,11 @@ class MainnetOneRunManager:
                 signal_price=signal_price,
                 client_order_id=new_client_order_id,
                 slippage_bps=s.mainnet_entry_slippage_bps,
-                fallback_to_gtc=s.mainnet_entry_fallback_to_gtc,
+                fallback_to_gtc=(
+                    False
+                    if profile_reprice_enforcement or v1460_entry_safety
+                    else s.mainnet_entry_fallback_to_gtc
+                ),
                 reduce_only=False,
             )
         except GTXSlippageExceeded as exc:
@@ -5662,6 +19661,28 @@ class MainnetOneRunManager:
         )
         self._entry_requote_counts[run_id] = attempt_no
         self._entry_requote_last_ms[run_id] = int(time.time() * 1000)
+        entry_profile = (
+            entry_profile_decision.profile.value
+            if entry_profile_decision is not None
+            else None
+        )
+        codex_meta = self._codex_v1_signal_meta(run)
+        codex_metrics = (
+            codex_meta.get("metrics")
+            if isinstance(codex_meta.get("metrics"), Mapping)
+            else {}
+        )
+        maker_mode = str(
+            codex_metrics.get("maker_mode") or ""
+        ).strip().upper() or None
+        remaining_requotes = (
+            max(0, 1 - attempt_no)
+            if profile_reprice_enforcement or v1460_entry_safety
+            else max(
+                0,
+                s.mainnet_entry_reprice_max_updates - attempt_no,
+            )
+        )
         await self._repo.log_event(
             run_id,
             "entry_requoted",
@@ -5674,6 +19695,10 @@ class MainnetOneRunManager:
                 "mark_price": mark,
                 "deviation_bps": deviation_bps,
                 "new_client_order_id": new_client_order_id,
+                "profile": entry_profile,
+                "v1459_profile": entry_profile,
+                "maker_mode": maker_mode,
+                "enforcement": profile_reprice_enforcement,
             },
         )
         await self._notify(
@@ -5681,7 +19706,7 @@ class MainnetOneRunManager:
             f"Run：<code>{escape(run_id)}</code>\n"
             f"舊價：<code>${existing_price:.4f}</code> → 新價：<code>${float(new_order.get('price', 0) or 0):.4f}</code>\n"
             f"Mark 偏離：<b>{deviation_bps:.2f} bps</b>（門檻 {s.mainnet_entry_max_deviation_bps:.1f} bps）\n"
-            f"剩餘 requote 額度：<b>{s.mainnet_entry_reprice_max_updates - attempt_no}</b>"
+            f"剩餘 requote 額度：<b>{remaining_requotes}</b>"
         )
         return True
 
@@ -6074,7 +20099,10 @@ class MainnetOneRunManager:
         if (
             partial_exit_pct > 0
             and partial_price > 0
-            and abs(partial_price - full_tp_price) > 0.01
+            and (
+                self._settings.mainnet_trail_disable_final_tp
+                or abs(partial_price - full_tp_price) > 0.01
+            )
         ):
             partial_qty_raw = current_qty * partial_exit_pct
             partial_qty = await self._client.format_quantity(position.symbol, partial_qty_raw)
@@ -6115,10 +20143,41 @@ class MainnetOneRunManager:
         return run_id in self._partial_exits
 
     def _effective_sl_pct(self, signal: dict) -> float:
+        wildcat = signal.get("wildcat", {}) if isinstance(signal, Mapping) else {}
+        codex = signal.get("codex_v1", {}) if isinstance(signal, Mapping) else {}
+        if isinstance(codex, Mapping) and codex.get("enabled"):
+            metrics = codex.get("metrics") if isinstance(codex.get("metrics"), Mapping) else {}
+            profile_sl_bp = (
+                self._codex_v143_metric_float(metrics, "sl_bp")
+                if bool(getattr(self._settings, "mainnet_codex_v143_adaptive_exec_enabled", True))
+                else None
+            )
+            if profile_sl_bp is not None and profile_sl_bp > 0:
+                return profile_sl_bp / 10_000.0
+            try:
+                codex_sl_pct = float(wildcat.get("sl_pct") or 0.0) if isinstance(wildcat, Mapping) else 0.0
+            except (TypeError, ValueError):
+                codex_sl_pct = 0.0
+            if math.isfinite(codex_sl_pct) and codex_sl_pct > 0:
+                return codex_sl_pct
         override = float(getattr(self._settings, "mainnet_hard_sl_pct_override", 0.0) or 0.0)
         if override > 0:
             return override
-        return float(signal.get("wildcat", {}).get("sl_pct") or 0.0)
+        return float(wildcat.get("sl_pct") or 0.0) if isinstance(wildcat, Mapping) else 0.0
+
+    def _entry_sl_pct_for_decision(
+        self,
+        decision: WildcatLiveDecision,
+        codex_decision: CodexV1Decision | None = None,
+    ) -> float:
+        signal: dict[str, Any] = {"wildcat": {"sl_pct": decision.sl_pct}}
+        if codex_decision is not None:
+            signal["codex_v1"] = {
+                "enabled": True,
+                "lane_code": codex_decision.lane_code,
+                "metrics": getattr(codex_decision, "metrics", None),
+            }
+        return self._effective_sl_pct(signal)
 
     @staticmethod
     def _sl_price_from_pct(entry_price: float, side: str, sl_pct: float) -> float:
@@ -6240,6 +20299,168 @@ class MainnetOneRunManager:
             return None
         return (last_close - candles[-(window + 1)].close) / last_close * 1e4
 
+    def _dca_trigger_pct_for_layer(self, layer_index: int, run: Mapping[str, Any] | None = None) -> float:
+        if run is not None and not self._run_uses_codex_v1(run):
+            return float(self._settings.mainnet_recovery_trigger_pct) * (layer_index + 1)
+        raw = str(getattr(self._settings, "mainnet_recovery_trigger_steps_pct", "") or "")
+        steps: list[float] = []
+        for part in raw.replace(";", ",").split(","):
+            try:
+                value = float(part.strip())
+            except (TypeError, ValueError):
+                continue
+            if value > 0 and math.isfinite(value):
+                steps.append(value)
+        if 0 <= layer_index < len(steps):
+            return steps[layer_index]
+        return float(self._settings.mainnet_recovery_trigger_pct) * (layer_index + 1)
+
+    def _codex_recovery_allowed_lane_codes(self) -> set[str]:
+        return {
+            part.strip().upper()
+            for part in str(getattr(self._settings, "mainnet_codex_recovery_lane_codes", "") or "").split(",")
+            if part.strip()
+        }
+
+    def _codex_recovery_lane_status(self, lane_code: str | None, *, uses_codex_v1: bool) -> tuple[bool, str | None]:
+        if not uses_codex_v1:
+            return True, None
+        if not bool(getattr(self._settings, "mainnet_codex_recovery_enabled", False)):
+            return False, "codex_recovery_disabled"
+        normalized = str(lane_code or "").strip().upper()
+        if not normalized:
+            return False, "codex_recovery_missing_lane_code"
+        if normalized not in self._codex_recovery_allowed_lane_codes():
+            return False, "codex_recovery_lane_not_whitelisted"
+        return True, None
+
+    def _codex_recovery_status(self, run: Mapping[str, Any]) -> tuple[bool, str | None, str]:
+        uses_codex = self._run_uses_codex_v1(run)
+        signal = self._codex_v1_signal_payload(run) if uses_codex else {}
+        lane_code = self._codex_v1_signal_lane_code(signal) if uses_codex else ""
+        codex = signal.get("codex_v1") if isinstance(signal, Mapping) else None
+        if uses_codex and isinstance(codex, Mapping):
+            risk_tags = codex.get("risk_tags")
+            metrics = codex.get("metrics")
+            promotion = (
+                metrics.get("v1464_adaptive_promotion")
+                if isinstance(metrics, Mapping)
+                else None
+            )
+            promoted = bool(
+                (
+                    isinstance(risk_tags, Sequence)
+                    and not isinstance(risk_tags, (str, bytes))
+                    and "v1464_adaptive_lease" in risk_tags
+                )
+                or (
+                    isinstance(promotion, Mapping)
+                    and promotion.get("adaptive_authorized") is True
+                )
+            )
+            if promoted:
+                # This is a per-run, cross-restart authority boundary.  The
+                # global Telegram DCA switch must never add exposure to a
+                # v1.4.64 probation/live lease.
+                return (
+                    False,
+                    "v1464_adaptive_recovery_disabled",
+                    lane_code,
+                )
+        allowed, reason = self._codex_recovery_lane_status(lane_code, uses_codex_v1=uses_codex)
+        return allowed, reason, lane_code
+
+    def _codex_recovery_allowed(self, run: Mapping[str, Any]) -> bool:
+        allowed, _, _ = self._codex_recovery_status(run)
+        return allowed
+
+    def _recovery_runtime_payload(
+        self,
+        run: Mapping[str, Any] | None = None,
+        *,
+        lane_code: str | None = None,
+        uses_codex_v1: bool | None = None,
+    ) -> dict[str, Any]:
+        if run is not None:
+            codex_allowed, codex_reason, effective_lane_code = self._codex_recovery_status(run)
+        else:
+            codex_uses = bool(uses_codex_v1)
+            effective_lane_code = str(lane_code or "").strip().upper()
+            codex_allowed, codex_reason = self._codex_recovery_lane_status(
+                effective_lane_code,
+                uses_codex_v1=codex_uses,
+            )
+        recovery_enabled = bool(getattr(self._settings, "mainnet_recovery_enabled", False))
+        runtime_dca_enabled = bool(self._dca_enabled)
+        effective_enabled = bool(recovery_enabled and runtime_dca_enabled and codex_allowed)
+        block_reason = codex_reason
+        if not recovery_enabled:
+            block_reason = block_reason or "mainnet_recovery_disabled"
+        elif not runtime_dca_enabled:
+            block_reason = block_reason or "runtime_dca_disabled"
+        return {
+            "runtime_dca_enabled": runtime_dca_enabled,
+            "codex_recovery_allowed": bool(codex_allowed),
+            "effective_recovery_enabled": effective_enabled,
+            "recovery_block_reason": block_reason,
+            "codex_recovery_lane_code": effective_lane_code or None,
+        }
+
+    async def _log_recovery_skip(
+        self,
+        run: Mapping[str, Any],
+        reason: str,
+        path: str,
+        *,
+        position: PositionInfo | None = None,
+        dca_number: int | None = None,
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
+        run_id = str(run.get("run_id") or "")
+        payload = self._recovery_runtime_payload(run)
+        payload.update(
+            {
+                "reason": reason,
+                "path": path,
+                "mainnet_recovery_enabled": bool(getattr(self._settings, "mainnet_recovery_enabled", False)),
+            }
+        )
+        if dca_number is not None:
+            payload["dca_number"] = dca_number
+        if position is not None:
+            payload.update(
+                {
+                    "side": position.position_direction,
+                    "mark_price": position.mark_price,
+                    "entry_price": position.entry_price,
+                    "unrealized_pnl": position.unrealized_pnl,
+                }
+            )
+        if details:
+            payload.update(dict(details))
+        logger.info(
+            "recovery_skipped",
+            run_id=run_id,
+            reason=reason,
+            path=path,
+            dca_number=dca_number,
+            codex_lane_code=payload.get("codex_recovery_lane_code"),
+        )
+        event_key = (run_id, path, reason, int(dca_number or 0))
+        if event_key in self._recovery_skip_event_keys:
+            return
+        self._recovery_skip_event_keys.add(event_key)
+        counters = self._adaptive_counters() if self._is_adaptive_run(run) else None
+        if counters is not None:
+            counters["recovery_skipped"] = int(counters.get("recovery_skipped") or 0) + 1
+        await self._repo.log_event(run_id, "recovery_skipped", payload)
+
+    def _dca_basket_loss_blocked(self, run: Mapping[str, Any], position: PositionInfo) -> bool:
+        cap = float(getattr(self._settings, "mainnet_codex_recovery_max_basket_loss_usdc", 0.0) or 0.0)
+        if cap <= 0 or not self._run_uses_codex_v1(run):
+            return False
+        unrealized = float(getattr(position, "unrealized_pnl", 0.0) or 0.0)
+        return unrealized <= -cap
     def _dca_drift_blocked(self, candles: list[Candle]) -> float | None:
         """Return the offending drift (bp) when the DCA drift gate blocks, else None.
 
@@ -6262,55 +20483,99 @@ class MainnetOneRunManager:
         return drift_bp if abs(drift_bp) > gate else None
 
     async def _maybe_recovery(self, run: dict, signal: dict, position: PositionInfo) -> bool:
-        if self._run_uses_codex_v1(run):
+        run_id = run["run_id"]
+        count = self._recovery_counts.get(run_id, 0)
+        dca_number = count + 1
+        codex_allowed, codex_reason, codex_lane_code = self._codex_recovery_status(run)
+        if not codex_allowed:
+            await self._log_recovery_skip(
+                run,
+                codex_reason or "codex_recovery_blocked",
+                "poll",
+                position=position,
+                dca_number=dca_number,
+                details={"codex_lane_code": codex_lane_code or None},
+            )
             return False
         if not self._settings.mainnet_recovery_enabled:
+            await self._log_recovery_skip(run, "mainnet_recovery_disabled", "poll", position=position, dca_number=dca_number)
             return False
         if not self._dca_enabled:
+            await self._log_recovery_skip(run, "runtime_dca_disabled", "poll", position=position, dca_number=dca_number)
             return False
-        count = self._recovery_counts.get(run["run_id"], 0)
+        if self._dca_basket_loss_blocked(run, position):
+            cap = getattr(self._settings, "mainnet_codex_recovery_max_basket_loss_usdc", 0.0)
+            logger.info("dca_blocked_basket_loss_cap", run_id=run_id, cap=cap)
+            await self._log_recovery_skip(
+                run,
+                "basket_loss_cap",
+                "poll",
+                position=position,
+                dca_number=dca_number,
+                details={"cap_usdc": cap},
+            )
+            return False
         if count >= self._settings.mainnet_recovery_steps:
+            await self._log_recovery_skip(
+                run,
+                "max_layers_reached",
+                "poll",
+                position=position,
+                dca_number=dca_number,
+                details={"count": count, "max_layers": self._settings.mainnet_recovery_steps},
+            )
             return False
-        # Block DCA after TP1 partial fill: never average into a runner that
-        # already booked partial profit.
-        if run["run_id"] in self._partial_exits:
-            logger.info("dca_blocked_partial_exit", run_id=run["run_id"])
+        if run_id in self._partial_exits:
+            logger.info("dca_blocked_partial_exit", run_id=run_id)
+            await self._log_recovery_skip(run, "partial_exit", "poll", position=position, dca_number=dca_number)
             return False
-        # P0 (06-11): one guard block = permanent DCA ban for this run.  The
-        # 60s cooldown alone re-opened the door: all 4 losing guarded-DCA
-        # fills (net −5.58 USDC) landed 1.1~2.8 min after the block, well past
-        # the window.  See __init__ (_dca_guard_blocked_runs) for the data.
-        if run["run_id"] in self._dca_guard_blocked_runs:
-            if run["run_id"] not in self._dca_guard_blocked_notified:
-                self._dca_guard_blocked_notified.add(run["run_id"])
-                logger.info("dca_blocked_guard_permanent", run_id=run["run_id"], path="poll")
+        if run_id in self._dca_guard_blocked_runs:
+            if run_id not in self._dca_guard_blocked_notified:
+                self._dca_guard_blocked_notified.add(run_id)
+                logger.info("dca_blocked_guard_permanent", run_id=run_id, path="poll")
+            await self._log_recovery_skip(run, "guard_permanent", "poll", position=position, dca_number=dca_number)
             return False
-        # Block DCA within cooldown after a guard block to prevent regime-flicker
-        # from briefly re-classifying the market as range and bypassing the guard.
         cooldown_ms = self._settings.mainnet_dca_guard_cooldown_seconds * 1000
-        last_block_ms = self._dca_block_times.get(run["run_id"], 0)
+        last_block_ms = self._dca_block_times.get(run_id, 0)
         if cooldown_ms > 0 and last_block_ms > 0:
             now_ms = int(time.time() * 1000)
             if now_ms - last_block_ms < cooldown_ms:
-                logger.info(
-                    "dca_blocked_guard_cooldown",
-                    run_id=run["run_id"],
-                    remaining_ms=cooldown_ms - (now_ms - last_block_ms),
+                remaining_ms = cooldown_ms - (now_ms - last_block_ms)
+                logger.info("dca_blocked_guard_cooldown", run_id=run_id, remaining_ms=remaining_ms)
+                await self._log_recovery_skip(
+                    run,
+                    "guard_cooldown",
+                    "poll",
+                    position=position,
+                    dca_number=dca_number,
+                    details={"remaining_ms": remaining_ms},
                 )
                 return False
-        # V6.5: scale both the layer notional and the cumulative cap by the
-        # run's actual entry scale (rng15 sweet-zone sizing).  Without this a
-        # scaled entry eats the unscaled cap and silently swallows the last
-        # DCA layer (the original 1.2x bookkeeping bug).
-        scale = self._notional_scale.get(run["run_id"], 1.0)
+        scale = self._notional_scale.get(run_id, 1.0)
         entry_notional = self._settings.mainnet_effective_entry_notional_usdc * scale
         cumulative = float(run.get("cumulative_notional_usdc") or entry_notional)
-        if cumulative + entry_notional > self._settings.mainnet_effective_max_cumulative_notional_usdc * scale:
+        cumulative_cap = self._settings.mainnet_effective_max_cumulative_notional_usdc * scale
+        if cumulative + entry_notional > cumulative_cap:
+            await self._log_recovery_skip(
+                run,
+                "max_cumulative_notional_cap",
+                "poll",
+                position=position,
+                dca_number=dca_number,
+                details={"cumulative_notional_usdc": cumulative, "next_notional_usdc": entry_notional, "cap_usdc": cumulative_cap},
+            )
             return False
-        # If a pre-placed DCA limit order is already on the book, let it fill.
-        if run["run_id"] in self._dca_preloaded:
+        if run_id in self._dca_preloaded:
+            await self._log_recovery_skip(
+                run,
+                "preloaded_order_active",
+                "poll",
+                position=position,
+                dca_number=dca_number,
+                details={"order_id": self._dca_preloaded.get(run_id)},
+            )
             return False
-        trigger_pct = self._settings.mainnet_recovery_trigger_pct * (count + 1)
+        trigger_pct = self._dca_trigger_pct_for_layer(count, run)
         if position.position_direction == "LONG":
             hit = position.mark_price <= position.entry_price * (1 - trigger_pct)
             side = "BUY"
@@ -6319,38 +20584,17 @@ class MainnetOneRunManager:
             side = "SELL"
         if not hit:
             return False
-        # DCA risk gate: averaging down doubles the position (and the loss if SL
-        # then triggers).  Block DCA when the adverse move looks like a trend or
-        # the momentum has reversed against us, instead of a range pullback.
-        # When mainnet_dca_guard_enabled is False the directional guard is OFF
-        # (user-chosen 2026-06-09): DCA fires on any trigger hit.  The structural
-        # brakes (steps cap, cumulative notional cap, TP1-then-no-DCA) still apply.
-        # Load candles once for both DCA gates (Stoch momentum guard + drift gate).
         candles: list[Candle] | None = None
         if self._settings.mainnet_dca_guard_enabled or self._settings.mainnet_dca_drift_gate_bp > 0:
             candles = await self._load_candles(position.symbol)
         if self._settings.mainnet_dca_guard_enabled:
             allow_dca, guard_reason = evaluate_dca_guard(candles, position.position_direction)
             if not allow_dca:
-                self._dca_block_times[run["run_id"]] = int(time.time() * 1000)
-                # P0 (06-11): arm the permanent per-run DCA ban — see __init__
-                # for the live loss data (net −5.58 over 5 post-block fills).
-                self._dca_guard_blocked_runs.add(run["run_id"])
-                logger.info(
-                    "dca_blocked_by_guard",
-                    run_id=run["run_id"],
-                    dca_number=count + 1,
-                    side=position.position_direction,
-                    reason=guard_reason,
-                )
-                # Persist a DB event so we can later count guard blocks that were
-                # SAVES (price kept falling) vs MISFIRES (V-bounce above TP).  Live
-                # evidence is 1:1 so far (cry3mn_1781051773405 misfire -0.29 vs
-                # cry3mn_1781055344337 save); accumulate samples before deciding
-                # whether to keep the guard.  Records mark/entry for the post-hoc
-                # counterfactual against the would-be DCA fill and widened SL.
-                await self._repo.log_event(run["run_id"], "dca_guard_blocked", {
-                    "dca_number": count + 1,
+                self._dca_block_times[run_id] = int(time.time() * 1000)
+                self._dca_guard_blocked_runs.add(run_id)
+                logger.info("dca_blocked_by_guard", run_id=run_id, dca_number=dca_number, side=position.position_direction, reason=guard_reason)
+                await self._repo.log_event(run_id, "dca_guard_blocked", {
+                    "dca_number": dca_number,
                     "side": position.position_direction,
                     "reason": guard_reason,
                     "mark_price": position.mark_price,
@@ -6358,47 +20602,71 @@ class MainnetOneRunManager:
                     "trigger_pct": trigger_pct,
                     "path": "poll",
                 })
+                await self._log_recovery_skip(
+                    run,
+                    "dca_guard_blocked",
+                    "poll",
+                    position=position,
+                    dca_number=dca_number,
+                    details={"guard_reason": guard_reason, "trigger_pct": trigger_pct},
+                )
                 await self._notify(
-                    f"🛡️ DCA #{count + 1} 已跳過（風險守門）：<code>{escape(guard_reason)}</code>"
+                    f"🛡️ DCA #{dca_number} 已跳過（風險守門）：<code>{escape(guard_reason)}</code>"
                     f"{self._codex_v1_telegram_note(run)}"
                 )
                 return False
-        # P1 (06-11): DCA-only drift gate — checked after the momentum guard so
-        # a momentum block still arms the permanent ban first.  Dynamic by
-        # design: NOT added to _dca_guard_blocked_runs, so DCA resumes once
-        # the drift fades (see _dca_drift_blocked for the regime rationale).
         if candles is not None:
             drift_bp = self._dca_drift_blocked(candles)
             if drift_bp is not None:
                 logger.info(
                     "dca_drift_blocked",
-                    run_id=run["run_id"],
-                    dca_number=count + 1,
+                    run_id=run_id,
+                    dca_number=dca_number,
                     drift_bp=round(drift_bp, 2),
                     gate_bp=self._settings.mainnet_dca_drift_gate_bp,
                     window_bars=self._settings.mainnet_dca_drift_window_bars,
                     path="poll",
                 )
-                event_key = (run["run_id"], count + 1)
+                event_key = (run_id, dca_number)
                 if event_key not in self._dca_drift_event_keys:
                     self._dca_drift_event_keys.add(event_key)
-                    await self._repo.log_event(run["run_id"], "dca_drift_blocked", {
-                        "dca_number": count + 1,
+                    await self._repo.log_event(run_id, "dca_drift_blocked", {
+                        "dca_number": dca_number,
                         "drift_bp": round(drift_bp, 2),
                         "gate_bp": self._settings.mainnet_dca_drift_gate_bp,
                         "window_bars": self._settings.mainnet_dca_drift_window_bars,
                         "mark_price": position.mark_price,
                         "path": "poll",
                     })
+                await self._log_recovery_skip(
+                    run,
+                    "drift_gate",
+                    "poll",
+                    position=position,
+                    dca_number=dca_number,
+                    details={
+                        "drift_bp": round(drift_bp, 2),
+                        "gate_bp": self._settings.mainnet_dca_drift_gate_bp,
+                        "window_bars": self._settings.mainnet_dca_drift_window_bars,
+                    },
+                )
                 return False
         open_orders = await self._client.get_open_orders(position.symbol)
-        if any(str(row.get("clientOrderId") or "").startswith(f"{run['run_id']}_dca") for row in open_orders):
+        if any(str(row.get("clientOrderId") or "").startswith(f"{run_id}_dca") for row in open_orders):
+            await self._log_recovery_skip(
+                run,
+                "open_dca_order_exists",
+                "poll",
+                position=position,
+                dca_number=dca_number,
+                details={"open_order_count": len(open_orders)},
+            )
             return False
         qty = await self._client.format_quantity(
             position.symbol,
             entry_notional / max(position.mark_price, 1e-9),
         )
-        client_order_id = f"{run['run_id']}_dca{count + 1}"
+        client_order_id = f"{run_id}_dca{dca_number}"
         try:
             order = await self._place_post_only_with_retry(
                 symbol=position.symbol,
@@ -6407,28 +20675,102 @@ class MainnetOneRunManager:
                 signal_price=position.mark_price,
                 client_order_id=client_order_id,
                 slippage_bps=self._settings.mainnet_dca_slippage_bps,
-                fallback_to_gtc=False,  # DCA 不用 GTC 追價
+                fallback_to_gtc=False,
                 reduce_only=False,
             )
         except (GTXSlippageExceeded, BinanceAPIException) as exc:
-            logger.warning(
-                "dca_order_failed_skipping",
-                run_id=run["run_id"],
-                dca_number=count + 1,
-                error=str(exc)[:300],
+            logger.warning("dca_order_failed_skipping", run_id=run_id, dca_number=dca_number, error=str(exc)[:300])
+            await self._log_recovery_skip(
+                run,
+                "order_failed",
+                "poll",
+                position=position,
+                dca_number=dca_number,
+                details={"error": str(exc)[:300]},
             )
             await self._notify(
-                f"⚠️ DCA #{count + 1} 掛單失敗，跳過：<code>{escape(str(exc)[:200])}</code>"
+                f"⚠️ DCA #{dca_number} 掛單失敗，跳過：<code>{escape(str(exc)[:200])}</code>"
                 f"{self._codex_v1_telegram_note(run)}"
             )
             return False
-        self._recovery_counts[run["run_id"]] = count + 1
-        await self._repo.update_run(run["run_id"], cumulative_notional_usdc=cumulative + entry_notional)
-        await self._repo.log_event(run["run_id"], "recovery_entry_placed", {"order": order, "signal": signal})
+        self._recovery_counts[run_id] = dca_number
+        await self._repo.update_run(run_id, cumulative_notional_usdc=cumulative + entry_notional)
+        counters = self._adaptive_counters() if self._is_adaptive_run(run) else None
+        if counters is not None:
+            counters["recovery_placed"] = int(counters.get("recovery_placed") or 0) + 1
+        await self._repo.log_event(run_id, "recovery_entry_placed", {"order": order, "signal": signal})
         await self._notify(
-            f"🧩 Mainnet one-run 已掛 DCA maker 單 #{count + 1}：<code>{escape(run['run_id'])}</code>"
+            f"🧩 Mainnet one-run 已掛 DCA maker 單 #{dca_number}：<code>{escape(run_id)}</code>"
             f"{self._codex_v1_telegram_note(run)}"
         )
+        return True
+
+    async def _maybe_full_tp_touch_lock(
+        self,
+        run: dict,
+        signal: Mapping[str, Any],
+        position: PositionInfo,
+        side: str,
+        mark: float,
+        entry: float,
+        qty: float,
+        close_side: str,
+    ) -> bool:
+        if not bool(getattr(self._settings, "mainnet_codex_full_tp_touch_maker_only_enabled", True)):
+            return False
+        if side not in {"LONG", "SHORT"} or entry <= 0 or mark <= 0 or qty <= 0:
+            return False
+        run_id = str(run.get("run_id") or "")
+        if not run_id or run_id in self._trail_exiting:
+            return False
+        if run_id in self._partial_exits or await self._repo.get_first_event_time(run_id, "partial_exit") is not None:
+            return False
+        codex = signal.get("codex_v1") if isinstance(signal, Mapping) else None
+        if not isinstance(codex, Mapping) or not codex.get("enabled"):
+            return False
+        lane_code = str(codex.get("lane_code") or "")
+        metrics = codex.get("metrics") if isinstance(codex.get("metrics"), Mapping) else {}
+        market_state = str(metrics.get("market_state") or "")
+        if lane_code != "STUP-S" or market_state != "STUP-S:clean_extension":
+            return False
+        partial_exit_pct = self._codex_v143_metric_float(metrics, "partial_exit_pct")
+        if partial_exit_pct is None:
+            partial_exit_pct = self._signal_partial_exit_pct(signal)
+        if partial_exit_pct < 0.999:
+            return False
+        tp_bp = self._codex_v143_metric_float(metrics, "tp1_bp")
+        if tp_bp is None or tp_bp <= 0:
+            wildcat = signal.get("wildcat") if isinstance(signal.get("wildcat"), Mapping) else {}
+            try:
+                tp_bp = float(wildcat.get("tp_pct") or 0.0) * 10_000.0
+            except (TypeError, ValueError):
+                tp_bp = 0.0
+        if tp_bp <= 0:
+            return False
+        current_bp = self._side_pnl_bp(side, entry, mark)
+        trigger_buffer_bp = 0.0
+        if current_bp < tp_bp + trigger_buffer_bp:
+            return False
+        self._trail_exiting.add(run_id)
+        await self._repo.log_event(
+            run_id,
+            "full_tp_touch_lock_signal",
+            {
+                "reason": "CODEX_FULL_TP_TOUCH_LOCK",
+                "lane_code": lane_code,
+                "market_state": market_state,
+                "side": side,
+                "entry_price": entry,
+                "mark": mark,
+                "current_bp": round(current_bp, 4),
+                "tp_bp": round(tp_bp, 4),
+                "qty": qty,
+            },
+        )
+        submitted = await self._close_position(position.symbol, close_side, qty, "CODEX_FULL_TP_TOUCH_LOCK", run)
+        if not submitted:
+            self._trail_exiting.discard(run_id)
+            return False
         return True
 
     async def _maybe_trailing_exit(
@@ -6470,7 +20812,8 @@ class MainnetOneRunManager:
         # The zero-margin floor was passed by 0.002 on the 06-10 08:32 loss
         # run — firing AT breakeven leaves nothing for the maker exit to lose
         # before going net negative.  Require at least floor_bp of gain.
-        floor_bp = self._settings.mainnet_trail_profit_floor_bp
+        floor_bp = self._trail_profit_floor_bp(run)
+        giveback_bp = self._trail_giveback_bp(run)
 
         if side == "LONG":
             # Check the lock against the peak from prior cycles BEFORE updating
@@ -6481,11 +20824,18 @@ class MainnetOneRunManager:
             # below-entry TRAIL losses on 06-10, −1.40).  Below the floor, hand
             # back to the SL/DCA path (which can still rescue via averaging).
             if run_id in self._trail_armed and peak is not None:
-                trail_stop = entry + (peak - entry) * keep
-                if mark <= trail_stop and mark > entry * (1 + floor_bp / 10_000):
-                    self._trail_exiting.add(run_id)
-                    if await self._close_position(position.symbol, close_side, qty, "TRAIL", run):
-                        return True
+                if giveback_bp is not None:
+                    peak_bp, current_bp = self._trail_bp_state(side, entry, mark, peak)
+                    if peak_bp - current_bp >= giveback_bp and current_bp >= floor_bp:
+                        self._trail_exiting.add(run_id)
+                        if await self._close_position(position.symbol, close_side, qty, "TRAIL", run):
+                            return True
+                else:
+                    trail_stop = entry + (peak - entry) * keep
+                    if mark <= trail_stop and mark > entry * (1 + floor_bp / 10_000):
+                        self._trail_exiting.add(run_id)
+                        if await self._close_position(position.symbol, close_side, qty, "TRAIL", run):
+                            return True
                     # E3 anchor gate aborted the fire (book already below the
                     # floor) — fall through and keep managing the position.
             new_peak = mark if peak is None else max(peak, mark)
@@ -6509,11 +20859,18 @@ class MainnetOneRunManager:
                 self._start_trail_watch(run, side, close_side, tp_pct)
         else:
             if run_id in self._trail_armed and peak is not None:
-                trail_stop = entry - (entry - peak) * keep
-                if mark >= trail_stop and mark < entry * (1 - floor_bp / 10_000):
-                    self._trail_exiting.add(run_id)
-                    if await self._close_position(position.symbol, close_side, qty, "TRAIL", run):
-                        return True
+                if giveback_bp is not None:
+                    peak_bp, current_bp = self._trail_bp_state(side, entry, mark, peak)
+                    if peak_bp - current_bp >= giveback_bp and current_bp >= floor_bp:
+                        self._trail_exiting.add(run_id)
+                        if await self._close_position(position.symbol, close_side, qty, "TRAIL", run):
+                            return True
+                else:
+                    trail_stop = entry - (entry - peak) * keep
+                    if mark >= trail_stop and mark < entry * (1 - floor_bp / 10_000):
+                        self._trail_exiting.add(run_id)
+                        if await self._close_position(position.symbol, close_side, qty, "TRAIL", run):
+                            return True
             new_peak = mark if peak is None else min(peak, mark)
             self._trail_peak[run_id] = new_peak
             if run_id not in self._trail_armed and (entry - new_peak) / entry >= arm_mfe:
@@ -6559,13 +20916,361 @@ class MainnetOneRunManager:
             return self._w6a_fast_trail_watch_interval_seconds()
         return max(1, int(self._settings.mainnet_trail_watch_interval_seconds))
 
+    def _codex_v1_run_metrics(self, run: Mapping[str, Any]) -> Mapping[str, Any]:
+        codex = self._codex_v1_signal_meta(run)
+        metrics = codex.get("metrics") if isinstance(codex.get("metrics"), Mapping) else {}
+        if metrics:
+            return metrics
+        effective = codex.get("effective_execution") if isinstance(codex.get("effective_execution"), Mapping) else {}
+        metrics = effective.get("metrics") if isinstance(effective.get("metrics"), Mapping) else {}
+        return metrics if isinstance(metrics, Mapping) else {}
+
+    def _trail_profile_bp(self, run: Mapping[str, Any], key: str) -> float | None:
+        value = self._codex_v143_metric_float(self._codex_v1_run_metrics(run), key)
+        if value is None or value <= 0:
+            return None
+        return float(value)
+
+    def _trail_profit_floor_bp(self, run: Mapping[str, Any]) -> float:
+        profile_floor = self._trail_profile_bp(run, "trail_floor_bp")
+        if profile_floor is not None:
+            return profile_floor
+        return float(self._settings.mainnet_trail_profit_floor_bp)
+
+    def _trail_giveback_bp(self, run: Mapping[str, Any]) -> float | None:
+        return self._trail_profile_bp(run, "trail_giveback_bp")
+
+    def _stups_staged_tp1_profile(
+        self,
+        run: Mapping[str, Any],
+        *,
+        require_floor_enabled: bool = False,
+    ) -> dict[str, float] | None:
+        if require_floor_enabled and not bool(getattr(self._settings, "mainnet_codex_v1435_stups_tp1_floor_enabled", True)):
+            return None
+        codex = self._codex_v1_signal_meta(run)
+        if str(codex.get("lane_code") or "").upper() != "STUP-S":
+            return None
+        metrics = codex.get("metrics") if isinstance(codex.get("metrics"), Mapping) else {}
+        policy_tag = str(metrics.get("policy_tag") or codex.get("policy_tag") or "")
+        if "v1430_loss_prune" not in policy_tag:
+            return None
+        market_state = str(
+            metrics.get("market_state")
+            or metrics.get("v143_market_state")
+            or codex.get("regime")
+            or ""
+        ).strip()
+        raw_states = getattr(
+            self._settings,
+            "mainnet_codex_v1435_stups_tp1_floor_states",
+            getattr(
+                self._settings,
+                "mainnet_codex_v1434_stups_fast_floor_states",
+                "STUP-S:mixed,STUP-S:clean_extension,STUP-S:counter_recoil",
+            ),
+        )
+        allowed_states = {
+            part.strip()
+            for part in str(raw_states or "").replace(";", ",").split(",")
+            if part.strip()
+        }
+        if allowed_states and market_state and market_state not in allowed_states:
+            return None
+
+        signal: dict[str, Any] | None = None
+        partial_exit_pct = self._codex_v143_metric_float(metrics, "partial_exit_pct")
+        if partial_exit_pct is None:
+            signal = self._codex_v1_signal_payload(run)
+            partial_exit_pct = self._signal_partial_exit_pct(signal)
+        if partial_exit_pct is None or partial_exit_pct <= 0 or partial_exit_pct >= 0.999:
+            return None
+
+        tp1_bp = self._codex_v143_metric_float(metrics, "tp1_bp")
+        if tp1_bp is None or tp1_bp <= 0:
+            signal = signal or self._codex_v1_signal_payload(run)
+            partial_tp_pct = self._signal_partial_tp_pct(signal)
+            tp1_bp = partial_tp_pct * 10_000.0 if partial_tp_pct > 0 else None
+        if tp1_bp is None or tp1_bp <= 0:
+            return None
+
+        try:
+            configured_floor = float(getattr(self._settings, "mainnet_codex_v1435_stups_tp1_floor_floor_bp", 5.0) or 0.0)
+        except (TypeError, ValueError):
+            configured_floor = 5.0
+        try:
+            configured_trigger = float(getattr(self._settings, "mainnet_codex_v1435_stups_tp1_floor_trigger_bp", tp1_bp) or 0.0)
+        except (TypeError, ValueError):
+            configured_trigger = tp1_bp
+        trigger_bp = max(float(tp1_bp), max(0.0, configured_trigger))
+        floor_bp = min(trigger_bp, max(0.0, configured_floor))
+        if trigger_bp <= 0 or floor_bp <= 0:
+            return None
+        return {
+            "partial_exit_pct": float(partial_exit_pct),
+            "tp1_bp": float(tp1_bp),
+            "trigger_bp": float(trigger_bp),
+            "floor_bp": float(floor_bp),
+        }
+
+    def _stups_staged_runner_pre_tp1_watch_enabled(self, run: Mapping[str, Any]) -> bool:
+        return bool(
+            getattr(self._settings, "mainnet_codex_v1435_stups_staged_runner_pre_tp1_watch_enabled", True)
+            and self._stups_staged_tp1_profile(run) is not None
+        )
+
+    def _stups_fast_floor_lock_trigger_bp(self, run: Mapping[str, Any]) -> float | None:
+        if not bool(getattr(self._settings, "mainnet_codex_v1434_stups_fast_floor_maker_only_enabled", True)):
+            return None
+        codex = self._codex_v1_signal_meta(run)
+        if str(codex.get("lane_code") or "").upper() != "STUP-S":
+            return None
+        metrics = codex.get("metrics") if isinstance(codex.get("metrics"), Mapping) else {}
+        policy_tag = str(metrics.get("policy_tag") or codex.get("policy_tag") or "")
+        if "v1430_loss_prune" not in policy_tag:
+            return None
+        market_state = str(metrics.get("market_state") or metrics.get("v143_market_state") or "").strip()
+        raw_states = getattr(
+            self._settings,
+            "mainnet_codex_v1434_stups_fast_floor_states",
+            "STUP-S:mixed,STUP-S:clean_extension,STUP-S:counter_recoil",
+        )
+        allowed_states = {
+            part.strip()
+            for part in str(raw_states or "").replace(";", ",").split(",")
+            if part.strip()
+        }
+        if allowed_states and market_state and market_state not in allowed_states:
+            return None
+        partial_exit_pct = self._codex_v143_metric_float(metrics, "partial_exit_pct")
+        if partial_exit_pct is None:
+            try:
+                signal = json.loads(str(run.get("signal_json") or "{}"))
+            except (TypeError, json.JSONDecodeError):
+                signal = {}
+            if isinstance(signal, Mapping):
+                partial_exit_pct = self._signal_partial_exit_pct(signal)
+        # V1.4.34 staged TP profiles should let the exchange-side TP1 handle
+        # the first capture. This software floor is only a backstop for older
+        # full-exit profiles where 5-10bp MFE could round-trip before 11bp TP.
+        if partial_exit_pct is not None and partial_exit_pct < 0.999:
+            return None
+        try:
+            configured_floor = max(
+                0.0,
+                float(getattr(self._settings, "mainnet_codex_v1434_stups_fast_floor_floor_bp", 5.0) or 0.0),
+            )
+        except (TypeError, ValueError):
+            configured_floor = 5.0
+        profile_floor = self._trail_profile_bp(run, "trail_floor_bp") or 0.0
+        floor_bp = max(configured_floor, float(profile_floor))
+        try:
+            trigger_bp = max(
+                0.0,
+                float(getattr(self._settings, "mainnet_codex_v1434_stups_fast_floor_trigger_bp", floor_bp) or 0.0),
+            )
+        except (TypeError, ValueError):
+            trigger_bp = floor_bp
+        return max(floor_bp, trigger_bp)
+
+    @staticmethod
+    def _trail_bp_state(side: str, entry: float, mark: float, peak: float) -> tuple[float, float]:
+        if side == "LONG":
+            peak_bp = (peak - entry) / entry * 10_000.0
+            current_bp = (mark - entry) / entry * 10_000.0
+        else:
+            peak_bp = (entry - peak) / entry * 10_000.0
+            current_bp = (entry - mark) / entry * 10_000.0
+        return peak_bp, current_bp
+
+    @staticmethod
+    def _trail_stop_from_bp(side: str, entry: float, peak_bp: float, giveback_bp: float) -> float:
+        stop_bp = max(0.0, peak_bp - giveback_bp)
+        if side == "LONG":
+            return entry * (1 + stop_bp / 10_000.0)
+        return entry * (1 - stop_bp / 10_000.0)
+
     def _trail_arm_mfe(self, run: Mapping[str, Any], tp_pct: float) -> float:
-        arm_mfe = tp_pct * self._settings.mainnet_trail_arm_frac
+        profile_arm_bp = self._trail_profile_bp(run, "trail_arm_bp")
+        arm_mfe = profile_arm_bp / 10_000.0 if profile_arm_bp is not None else tp_pct * self._settings.mainnet_trail_arm_frac
         if self._is_w6a_run(run) and self._w6a_fast_trail_enabled():
             cap_bp = self._w6a_fast_trail_arm_cap_bp()
             if cap_bp > 0:
                 arm_mfe = min(arm_mfe, cap_bp / 10_000.0)
         return arm_mfe
+
+    async def _cancel_stups_tp1_orders(self, symbol: str, run_id: str) -> None:
+        try:
+            open_orders = await self._client.get_open_orders(symbol)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("stups_tp1_floor_cancel_get_failed", run_id=run_id, error=str(exc)[:200])
+            return
+        tp1_prefix = f"{run_id}{PARTIAL_TP_SUFFIX}"
+        for order in open_orders:
+            client_order_id = str(order.get("clientOrderId") or "")
+            if not client_order_id.startswith(tp1_prefix):
+                continue
+            try:
+                await self._client.cancel_order(symbol, int(order["orderId"]))
+            except BinanceAPIException as exc:
+                if exc.code in {-2011, -2022}:
+                    logger.info(
+                        "stups_tp1_floor_cancel_order_not_found",
+                        run_id=run_id,
+                        order_id=int(order["orderId"]),
+                        code=exc.code,
+                    )
+                    continue
+                raise
+
+    async def _maybe_fire_stups_staged_tp1_floor_lock(
+        self,
+        run: dict,
+        side: str,
+        close_side: str,
+        position: PositionInfo,
+        entry: float,
+        mark: float,
+        peak: float,
+    ) -> bool:
+        run_id = run["run_id"]
+        profile = self._stups_staged_tp1_profile(run, require_floor_enabled=True)
+        if profile is None or run_id in self._stups_tp1_floor_lock_attempted or run_id in self._partial_exits:
+            return False
+        peak_bp, current_bp = self._trail_bp_state(side, entry, mark, peak)
+        trigger_bp = float(profile["trigger_bp"])
+        floor_bp = float(profile["floor_bp"])
+        if peak_bp < trigger_bp or current_bp < floor_bp or current_bp > trigger_bp:
+            return False
+        self._stups_tp1_floor_lock_attempted.add(run_id)
+        await self._repo.log_event(
+            run_id,
+            "stups_tp1_floor_lock_signal",
+            {
+                "side": side,
+                "entry_price": entry,
+                "current_price": mark,
+                "peak_price": peak,
+                "peak_bp": round(peak_bp, 4),
+                "current_bp": round(current_bp, 4),
+                "trigger_bp": round(trigger_bp, 4),
+                "floor_bp": round(floor_bp, 4),
+                "partial_exit_pct": profile["partial_exit_pct"],
+            },
+        )
+        await self._cancel_stups_tp1_orders(position.symbol, run_id)
+        fresh_position = await self._client.get_position(position.symbol)
+        if fresh_position is None or abs(fresh_position.position_amt) < 1e-9:
+            await self._repo.log_event(run_id, "stups_tp1_floor_lock_skipped", {"reason": "position_flat"})
+            return False
+        fresh_qty = abs(fresh_position.position_amt)
+        if fresh_qty < abs(position.position_amt) - 1e-9:
+            await self._repo.log_event(
+                run_id,
+                "stups_tp1_floor_lock_skipped",
+                {"reason": "position_qty_changed", "old_qty": abs(position.position_amt), "fresh_qty": fresh_qty},
+            )
+            return False
+        qty_raw = fresh_qty * float(profile["partial_exit_pct"])
+        qty_str = await self._client.format_quantity(position.symbol, qty_raw)
+        try:
+            qty_float = float(qty_str)
+        except (TypeError, ValueError):
+            qty_float = 0.0
+        if qty_float <= 0:
+            await self._repo.log_event(run_id, "stups_tp1_floor_lock_skipped", {"reason": "zero_qty"})
+            return False
+        floor_price = (
+            entry * (1 + floor_bp / 10_000.0)
+            if side == "LONG"
+            else entry * (1 - floor_bp / 10_000.0)
+        )
+        client_order_id = f"{run_id}{PARTIAL_TP_SUFFIX}_floor"
+        try:
+            order = await self._place_post_only_with_retry(
+                symbol=position.symbol,
+                side=close_side,
+                quantity=qty_str,
+                signal_price=floor_price,
+                client_order_id=client_order_id,
+                slippage_bps=self._settings.mainnet_tp_slippage_bps,
+                fallback_to_gtc=False,
+                reduce_only=True,
+            )
+        except (GTXSlippageExceeded, BinanceAPIException) as exc:
+            await self._repo.log_event(
+                run_id,
+                "stups_tp1_floor_lock_deferred",
+                {"reason": "place_failed", "error": str(exc)[:300], "floor_price": floor_price, "qty": qty_str},
+            )
+            return False
+        self._partial_order_armed.add(run_id)
+        self._tp_layer_qty.setdefault(run_id, {})["tp1"] = qty_float
+        await self._repo.log_event(
+            run_id,
+            "stups_tp1_floor_lock_placed",
+            {
+                "order": order,
+                "client_order_id": client_order_id,
+                "qty": qty_str,
+                "floor_price": floor_price,
+                "partial_exit_pct": profile["partial_exit_pct"],
+                "peak_bp": round(peak_bp, 4),
+                "current_bp": round(current_bp, 4),
+            },
+        )
+        return True
+
+    async def _maybe_fire_stups_fast_floor_lock(
+        self,
+        run: dict,
+        side: str,
+        close_side: str,
+        position: PositionInfo,
+        entry: float,
+        mark: float,
+        peak: float,
+    ) -> bool:
+        run_id = run["run_id"]
+        trigger_bp = self._stups_fast_floor_lock_trigger_bp(run)
+        if trigger_bp is None or run_id in self._stups_fast_floor_lock_attempted:
+            return False
+        peak_bp, current_bp = self._trail_bp_state(side, entry, mark, peak)
+        if peak_bp < trigger_bp or current_bp < trigger_bp:
+            return False
+        self._stups_fast_floor_lock_attempted.add(run_id)
+        self._trail_exiting.add(run_id)
+        await self._repo.log_event(
+            run_id,
+            "stups_fast_floor_lock_signal",
+            {
+                "reason": "CODEX_STUPS_FAST_FLOOR_LOCK",
+                "side": side,
+                "position_qty": abs(position.position_amt),
+                "entry_price": entry,
+                "current_price": mark,
+                "peak_price": peak,
+                "peak_bp": round(peak_bp, 4),
+                "current_bp": round(current_bp, 4),
+                "trigger_bp": round(trigger_bp, 4),
+            },
+        )
+        try:
+            submitted = await self._close_position(
+                position.symbol,
+                close_side,
+                abs(position.position_amt),
+                "CODEX_STUPS_FAST_FLOOR_LOCK",
+                run,
+            )
+        except Exception:
+            self._trail_exiting.discard(run_id)
+            raise
+        if not submitted:
+            self._trail_exiting.discard(run_id)
+            return False
+        return True
+
     def _start_trail_watch(self, run: dict, side: str, close_side: str, tp_pct: float) -> None:
         """Spawn the fast trail watcher for a run (idempotent).
 
@@ -6574,10 +21279,12 @@ class MainnetOneRunManager:
         the 10s manage cycle wakes.
         """
         run_id = run["run_id"]
+        fast_floor_enabled = self._stups_fast_floor_lock_trigger_bp(run) is not None
+        staged_pre_tp1_watch_enabled = self._stups_staged_runner_pre_tp1_watch_enabled(run)
         if (
             not self._settings.mainnet_trail_enabled
             or tp_pct <= 0
-            or not self._trail_ready(run_id)
+            or (not self._trail_ready(run_id) and not fast_floor_enabled and not staged_pre_tp1_watch_enabled)
         ):
             return
         existing = self._trail_watch_tasks.get(run_id)
@@ -6610,6 +21317,7 @@ class MainnetOneRunManager:
         interval = self._trail_watch_interval_seconds(run)
         arm_mfe = self._trail_arm_mfe(run, tp_pct)
         keep = 1.0 - self._settings.mainnet_trail_giveback_frac
+        giveback_bp = self._trail_giveback_bp(run)
         last_entry: float | None = None
         try:
             while True:
@@ -6643,6 +21351,7 @@ class MainnetOneRunManager:
                     last_entry = entry
                     continue
                 last_entry = entry
+                runner_ready = self._trail_ready(run_id)
                 peak = self._trail_peak.get(run_id)
                 # No-lookahead ordering: check the trigger against the prior peak,
                 # then fold in the current mark, then arm if the new peak crossed.
@@ -6650,16 +21359,25 @@ class MainnetOneRunManager:
                 # least floor_bp ABOVE cost basis.  Below the floor, leave it to
                 # SL/DCA — firing the trail there just stop-losses at maker
                 # speed (06-10 −1.40).
-                floor_bp = self._settings.mainnet_trail_profit_floor_bp
+                floor_bp = self._trail_profit_floor_bp(run)
                 if side == "LONG":
-                    if run_id in self._trail_armed and peak is not None:
-                        trail_stop = entry + (peak - entry) * keep
-                        if mark <= trail_stop and mark > entry * (1 + floor_bp / 10_000):
+                    if runner_ready and run_id in self._trail_armed and peak is not None:
+                        if giveback_bp is not None:
+                            peak_bp, current_bp = self._trail_bp_state(side, entry, mark, peak)
+                            trail_stop = self._trail_stop_from_bp(side, entry, peak_bp, giveback_bp)
+                            should_fire = peak_bp - current_bp >= giveback_bp and current_bp >= floor_bp
+                        else:
+                            trail_stop = entry + (peak - entry) * keep
+                            should_fire = mark <= trail_stop and mark > entry * (1 + floor_bp / 10_000)
+                        if should_fire:
                             if await self._fire_trail_exit(run, close_side, position, peak, mark, trail_stop):
                                 return
                             continue
                     new_peak = mark if peak is None else max(peak, mark)
                     self._trail_peak[run_id] = new_peak
+                    await self._maybe_fire_stups_staged_tp1_floor_lock(run, side, close_side, position, entry, mark, new_peak)
+                    if await self._maybe_fire_stups_fast_floor_lock(run, side, close_side, position, entry, mark, new_peak):
+                        return
                     if run_id not in self._trail_armed and (new_peak - entry) / entry >= arm_mfe:
                         self._trail_armed.add(run_id)
                         logger.info("trail_armed_watcher", run_id=run_id, peak=new_peak, entry=entry)
@@ -6678,14 +21396,23 @@ class MainnetOneRunManager:
                             },
                         )
                 else:
-                    if run_id in self._trail_armed and peak is not None:
-                        trail_stop = entry - (entry - peak) * keep
-                        if mark >= trail_stop and mark < entry * (1 - floor_bp / 10_000):
+                    if runner_ready and run_id in self._trail_armed and peak is not None:
+                        if giveback_bp is not None:
+                            peak_bp, current_bp = self._trail_bp_state(side, entry, mark, peak)
+                            trail_stop = self._trail_stop_from_bp(side, entry, peak_bp, giveback_bp)
+                            should_fire = peak_bp - current_bp >= giveback_bp and current_bp >= floor_bp
+                        else:
+                            trail_stop = entry - (entry - peak) * keep
+                            should_fire = mark >= trail_stop and mark < entry * (1 - floor_bp / 10_000)
+                        if should_fire:
                             if await self._fire_trail_exit(run, close_side, position, peak, mark, trail_stop):
                                 return
                             continue
                     new_peak = mark if peak is None else min(peak, mark)
                     self._trail_peak[run_id] = new_peak
+                    await self._maybe_fire_stups_staged_tp1_floor_lock(run, side, close_side, position, entry, mark, new_peak)
+                    if await self._maybe_fire_stups_fast_floor_lock(run, side, close_side, position, entry, mark, new_peak):
+                        return
                     if run_id not in self._trail_armed and (entry - new_peak) / entry >= arm_mfe:
                         self._trail_armed.add(run_id)
                         logger.info("trail_armed_watcher", run_id=run_id, peak=new_peak, entry=entry)
@@ -6761,86 +21488,138 @@ class MainnetOneRunManager:
         The exchange fills it automatically when price reaches the trigger,
         eliminating the 10-second poll lag in fast-moving markets."""
         run_id = run["run_id"]
-        if self._run_uses_codex_v1(run):
+        count = self._recovery_counts.get(run_id, 0)
+        dca_number = count + 1
+        codex_allowed, codex_reason, codex_lane_code = self._codex_recovery_status(run)
+        if not codex_allowed:
+            await self._log_recovery_skip(
+                run,
+                codex_reason or "codex_recovery_blocked",
+                "preplace",
+                position=position,
+                dca_number=dca_number,
+                details={"codex_lane_code": codex_lane_code or None},
+            )
             return
         if not self._settings.mainnet_recovery_enabled:
+            await self._log_recovery_skip(run, "mainnet_recovery_disabled", "preplace", position=position, dca_number=dca_number)
             return
         if not self._dca_enabled:
+            await self._log_recovery_skip(run, "runtime_dca_disabled", "preplace", position=position, dca_number=dca_number)
             return
-        count = self._recovery_counts.get(run_id, 0)
+        if self._dca_basket_loss_blocked(run, position):
+            cap = getattr(self._settings, "mainnet_codex_recovery_max_basket_loss_usdc", 0.0)
+            logger.info("dca_preplace_skipped_basket_loss_cap", run_id=run_id, cap=cap)
+            await self._log_recovery_skip(
+                run,
+                "basket_loss_cap",
+                "preplace",
+                position=position,
+                dca_number=dca_number,
+                details={"cap_usdc": cap},
+            )
+            return
         if count >= self._settings.mainnet_recovery_steps:
+            await self._log_recovery_skip(
+                run,
+                "max_layers_reached",
+                "preplace",
+                position=position,
+                dca_number=dca_number,
+                details={"count": count, "max_layers": self._settings.mainnet_recovery_steps},
+            )
             return
         if run_id in self._partial_exits:
+            await self._log_recovery_skip(run, "partial_exit", "preplace", position=position, dca_number=dca_number)
             return
-        # P0 (06-11): guard fired earlier in this run → DCA banned for the
-        # run's whole life (see __init__: 1W/4L net −5.58 USDC across the 5
-        # post-block fills the 60s cooldown failed to stop).
         if run_id in self._dca_guard_blocked_runs:
             if run_id not in self._dca_guard_blocked_notified:
                 self._dca_guard_blocked_notified.add(run_id)
                 logger.info("dca_blocked_guard_permanent", run_id=run_id, path="preplace")
+            await self._log_recovery_skip(run, "guard_permanent", "preplace", position=position, dca_number=dca_number)
             return
-        # V6.5: scale-aware cap (see _maybe_recovery for rationale).
         scale = self._notional_scale.get(run_id, 1.0)
         entry_notional = self._settings.mainnet_effective_entry_notional_usdc * scale
         cumulative = float(run.get("cumulative_notional_usdc") or entry_notional)
-        if cumulative + entry_notional > self._settings.mainnet_effective_max_cumulative_notional_usdc * scale:
+        cumulative_cap = self._settings.mainnet_effective_max_cumulative_notional_usdc * scale
+        if cumulative + entry_notional > cumulative_cap:
+            await self._log_recovery_skip(
+                run,
+                "max_cumulative_notional_cap",
+                "preplace",
+                position=position,
+                dca_number=dca_number,
+                details={"cumulative_notional_usdc": cumulative, "next_notional_usdc": entry_notional, "cap_usdc": cumulative_cap},
+            )
             return
-        # Load candles once for both DCA gates (Stoch momentum guard + drift gate).
         candles: list[Candle] | None = None
         if self._settings.mainnet_dca_guard_enabled or self._settings.mainnet_dca_drift_gate_bp > 0:
             candles = await self._load_candles(position.symbol)
-        # Guard: don't pre-place if momentum is already adverse
         if self._settings.mainnet_dca_guard_enabled:
             allow, guard_reason = evaluate_dca_guard(candles, position.position_direction)
             if not allow:
-                # P0 (06-11): arm the permanent per-run DCA ban — see __init__.
                 self._dca_guard_blocked_runs.add(run_id)
                 logger.info("dca_preplace_skipped_guard", run_id=run_id, reason=guard_reason)
                 await self._repo.log_event(run_id, "dca_guard_blocked", {
-                    "dca_number": count + 1,
+                    "dca_number": dca_number,
                     "side": position.position_direction,
                     "reason": guard_reason,
                     "mark_price": position.mark_price,
                     "entry_price": position.entry_price,
                     "path": "preplace",
                 })
+                await self._log_recovery_skip(
+                    run,
+                    "dca_guard_blocked",
+                    "preplace",
+                    position=position,
+                    dca_number=dca_number,
+                    details={"guard_reason": guard_reason},
+                )
                 return
-        # P1 (06-11): DCA-only drift gate — dynamic, so the next preplace
-        # attempt (after a later fill or guard pass) re-evaluates and may pass
-        # once the drift fades.  Never feeds the permanent ban set.
         if candles is not None:
             drift_bp = self._dca_drift_blocked(candles)
             if drift_bp is not None:
                 logger.info(
                     "dca_drift_blocked",
                     run_id=run_id,
-                    dca_number=count + 1,
+                    dca_number=dca_number,
                     drift_bp=round(drift_bp, 2),
                     gate_bp=self._settings.mainnet_dca_drift_gate_bp,
                     window_bars=self._settings.mainnet_dca_drift_window_bars,
                     path="preplace",
                 )
-                event_key = (run_id, count + 1)
+                event_key = (run_id, dca_number)
                 if event_key not in self._dca_drift_event_keys:
                     self._dca_drift_event_keys.add(event_key)
                     await self._repo.log_event(run_id, "dca_drift_blocked", {
-                        "dca_number": count + 1,
+                        "dca_number": dca_number,
                         "drift_bp": round(drift_bp, 2),
                         "gate_bp": self._settings.mainnet_dca_drift_gate_bp,
                         "window_bars": self._settings.mainnet_dca_drift_window_bars,
                         "mark_price": position.mark_price,
                         "path": "preplace",
                     })
+                await self._log_recovery_skip(
+                    run,
+                    "drift_gate",
+                    "preplace",
+                    position=position,
+                    dca_number=dca_number,
+                    details={
+                        "drift_bp": round(drift_bp, 2),
+                        "gate_bp": self._settings.mainnet_dca_drift_gate_bp,
+                        "window_bars": self._settings.mainnet_dca_drift_window_bars,
+                    },
+                )
                 return
-        # Cancel any stale pre-placed order first
         old_oid = self._dca_preloaded.pop(run_id, None)
         if old_oid:
             try:
                 await self._client.cancel_order(position.symbol, old_oid)
             except Exception:
                 pass
-        trigger_pct = self._settings.mainnet_recovery_trigger_pct * (count + 1)
+        trigger_pct = self._dca_trigger_pct_for_layer(count, run)
         entry = float(run.get("avg_entry_price") or position.entry_price)
         if position.position_direction == "LONG":
             limit_price = entry * (1 - trigger_pct)
@@ -6858,16 +21637,10 @@ class MainnetOneRunManager:
             limit_price = round(limit_price, 8)
         except Exception:
             pass
-        qty_str = await self._client.format_quantity(
-            position.symbol, entry_notional / max(limit_price, 1e-9)
-        )
-        client_order_id = f"{run_id}_dca{count + 1}_pre"
+        qty_str = await self._client.format_quantity(position.symbol, entry_notional / max(limit_price, 1e-9))
+        client_order_id = f"{run_id}_dca{dca_number}_pre"
         order = None
         try:
-            # GTX so the pre-placed DCA never crosses as taker.  A passive limit
-            # below market (LONG BUY) is normally accepted; -5022 only fires if
-            # price already fell to/through the trigger before the order landed
-            # (06-10: cry3mn_1781065747854 / 64156997 each ate 0.080 taker via GTC).
             order = await self._client.create_limit_order_raw(
                 symbol=position.symbol,
                 side=side,
@@ -6879,15 +21652,9 @@ class MainnetOneRunManager:
             )
         except BinanceAPIException as exc:
             if exc.code == -5022:
-                # Price already at/through the trigger — re-quote GTX at the
-                # passive top-of-book so it still fills on the next downtick, but
-                # as maker (0 fee) instead of crossing.
                 try:
                     book = await self._client.get_book_ticker(position.symbol)
-                    passive_price = round(
-                        float(book["bidPrice"]) if side == "BUY" else float(book["askPrice"]),
-                        8,
-                    )
+                    passive_price = round(float(book["bidPrice"]) if side == "BUY" else float(book["askPrice"]), 8)
                     order = await self._client.create_limit_order_raw(
                         symbol=position.symbol,
                         side=side,
@@ -6897,26 +21664,43 @@ class MainnetOneRunManager:
                         reduce_only=False,
                         client_order_id=client_order_id,
                     )
-                    logger.info(
-                        "dca_preplace_post_only_rejected_requote_book",
-                        run_id=run_id, limit=limit_price, book=passive_price, side=side,
-                    )
+                    logger.info("dca_preplace_post_only_rejected_requote_book", run_id=run_id, limit=limit_price, book=passive_price, side=side)
                     limit_price = passive_price
                 except Exception as requote_exc:  # noqa: BLE001
                     logger.warning("dca_preload_failed", run_id=run_id, error=str(requote_exc)[:200])
+                    await self._log_recovery_skip(
+                        run,
+                        "order_failed",
+                        "preplace",
+                        position=position,
+                        dca_number=dca_number,
+                        details={"error": str(requote_exc)[:300]},
+                    )
                     return
             else:
-                # -2019 margin insufficient (待辦 #12) and other rejects land here.
                 logger.warning("dca_preload_failed", run_id=run_id, error=str(exc)[:200])
+                await self._log_recovery_skip(
+                    run,
+                    "order_failed",
+                    "preplace",
+                    position=position,
+                    dca_number=dca_number,
+                    details={"error": str(exc)[:300]},
+                )
                 return
         except Exception as exc:  # noqa: BLE001
             logger.warning("dca_preload_failed", run_id=run_id, error=str(exc)[:200])
+            await self._log_recovery_skip(
+                run,
+                "order_failed",
+                "preplace",
+                position=position,
+                dca_number=dca_number,
+                details={"error": str(exc)[:300]},
+            )
             return
         order_id = int(order.get("orderId", 0))
         self._dca_preloaded[run_id] = order_id
-        # #25: remember what a FULL fill of this layer looks like so the qty-grew
-        # detector in _run_running can distinguish a partial fill (sync only) from
-        # a complete layer (widen SL, +1 layer, +notional, pre-place next).
         try:
             intended_qty = abs(float(qty_str))
         except (TypeError, ValueError):
@@ -6926,12 +21710,8 @@ class MainnetOneRunManager:
             "intended_qty": intended_qty,
             "base_qty": abs(position.position_amt),
         }
-        await self._repo.log_event(
-            run_id,
-            "dca_preloaded",
-            {"order_id": order_id, "price": limit_price, "qty": qty_str, "step": count + 1},
-        )
-        logger.info("dca_preloaded", run_id=run_id, step=count + 1, price=limit_price, qty=qty_str)
+        await self._repo.log_event(run_id, "dca_preloaded", {"order_id": order_id, "price": limit_price, "qty": qty_str, "step": dca_number})
+        logger.info("dca_preloaded", run_id=run_id, step=dca_number, price=limit_price, qty=qty_str)
 
     def _hit_stop(self, side: str, mark: float, sl_price: float) -> bool:
         hit_sl = mark <= sl_price if side == "LONG" else mark >= sl_price
@@ -6970,9 +21750,31 @@ class MainnetOneRunManager:
             codex_payload = {}
         lane = codex_payload.get("lane")
         lane_code = str(codex_payload.get("lane_code") or "").upper()
+        metrics = codex_payload.get("metrics") if isinstance(codex_payload.get("metrics"), Mapping) else {}
+        market_state = str(
+            metrics.get("market_state")
+            or metrics.get("v143_market_state")
+            or metrics.get("wpr_profile")
+            or codex_payload.get("regime")
+            or ""
+        ).strip()
+        profile_time_lock_enabled = bool(
+            metrics.get("time_profit_lock_enabled")
+            or metrics.get("time_lock_enabled")
+        )
         survival_profile = None
-        if CODEX_V1_VERSION.startswith(("_codex_v1.3.9", "_codex_v1.4")) and lane_code == "CNL-WPR-L":
+        if CODEX_V1_VERSION.startswith("_codex_v1.4") and profile_time_lock_enabled:
+            survival_profile = "v1427_profile_time_lock"
+        elif CODEX_V1_VERSION.startswith(("_codex_v1.3.9", "_codex_v1.4")) and lane_code == "CNL-WPR-L":
             survival_profile = "v139b_wpr_waiting_scratch"
+        elif (
+            CODEX_V1_VERSION.startswith("_codex_v1.4")
+            and lane_code == "STUP-S"
+            and market_state in {"STUP-S:weak_chop", "STUP-S:mixed"}
+            and str(metrics.get("adaptive_tp_engine") or "") not in {"v1419_stups_runner", "v1420_stups_runner_after_clean_gate", "v1420_stups_runner_after_bad_weakzone_block"}
+            and bool(getattr(self._settings, "mainnet_codex_v146_stups_profit_lock_enabled", True))
+        ):
+            survival_profile = "v146_stups_time_profit_lock"
         elif (
             CODEX_V1_VERSION.startswith(("_codex_v1.3.9", "_codex_v1.4"))
             and bool(getattr(self._settings, "mainnet_codex_v139_w1b_survival_enabled", False))
@@ -6981,13 +21783,25 @@ class MainnetOneRunManager:
             survival_profile = "v139_w1b_delayed"
 
         watch_after = float(self._settings.mainnet_codex_survival_watch_after_seconds)
-        if survival_profile == "v139b_wpr_waiting_scratch":
+        if survival_profile in {"v139b_wpr_waiting_scratch", "v146_stups_time_profit_lock", "v1427_profile_time_lock"}:
             watch_after = 0.0
         if age_seconds < watch_after:
             return False
 
+        run_id = run["run_id"]
         current_bp = self._side_pnl_bp(side, entry, mark)
-        peak = self._trail_peak.get(run["run_id"], mark)
+        peak_raw = self._trail_peak.get(run_id)
+        try:
+            peak_prev = float(peak_raw) if peak_raw is not None else entry
+        except (TypeError, ValueError):
+            peak_prev = entry
+        if not math.isfinite(peak_prev) or peak_prev <= 0:
+            peak_prev = entry
+        if side == "LONG":
+            peak = max(entry, mark, peak_prev)
+        else:
+            peak = min(entry, mark, peak_prev)
+        self._trail_peak[run_id] = peak
         mfe_bp = max(0.0, self._side_pnl_bp(side, entry, peak))
 
         if run["run_id"] not in self._codex_survival_watch_notified:
@@ -7004,6 +21818,7 @@ class MainnetOneRunManager:
                     "current_bp": round(current_bp, 4),
                     "lane": lane,
                     "lane_code": lane_code or None,
+                    "market_state": market_state or None,
                     "survival_profile": survival_profile,
                 },
             )
@@ -7014,23 +21829,593 @@ class MainnetOneRunManager:
         damage_loss = float(self._settings.mainnet_codex_survival_damage_loss_bp)
         exit_after = float(self._settings.mainnet_codex_survival_exit_after_seconds)
         force_after = float(self._settings.mainnet_codex_survival_force_after_seconds)
+        profit_lock_mfe = 0.0
+        profit_lock_floor = 0.0
+        profit_lock_giveback = 0.0
+        profile_time_lock_after = 0.0
+        profile_time_lock_min_bp = 0.0
+        profile_time_lock_slope_max_bp = 0.0
+        profile_time_lock_slope_bp: float | None = None
+        stups_profit_lock_after = 0.0
+        stups_profit_lock_force_after = 0.0
+        stups_profit_lock_mfe = 0.0
+        stups_profit_lock_floor = 0.0
+        stups_profit_lock_giveback = 0.0
+        stups_profit_lock_fee_floor = 0.0
+        stups_profit_lock_fee_floor_enabled = False
+        stups_profit_lock_expected_close_fee_bp = 0.0
+        stups_profit_lock_slippage_bp = 0.0
+        stups_profit_lock_net_buffer_bp = 0.0
+        stups_stall_lock_enabled = False
+        stups_stall_lock_after = 0.0
+        stups_stall_lock_floor = 0.0
+        wpr_discount_mixed_scratch_after = 0.0
         if survival_profile == "v139_w1b_delayed":
             exit_after = float(getattr(self._settings, "mainnet_codex_v139_w1b_survival_exit_after_seconds", 900) or 900)
             force_after = float(getattr(self._settings, "mainnet_codex_v139_w1b_survival_force_after_seconds", 900) or 900)
             early_fail_loss = float(getattr(self._settings, "mainnet_codex_v139_w1b_survival_early_fail_loss_bp", 14.0) or 14.0)
             damage_loss = float(getattr(self._settings, "mainnet_codex_v139_w1b_survival_damage_loss_bp", 14.0) or 14.0)
+        elif survival_profile == "v1427_profile_time_lock":
+            profile_time_lock_after = float(self._codex_v143_metric_float(metrics, "time_lock_s") or 60.0)
+            profile_time_lock_min_bp = float(self._codex_v143_metric_float(metrics, "time_lock_min_bp") or 6.0)
+            profile_time_lock_slope_max_bp = float(
+                self._codex_v143_metric_float(metrics, "time_lock_slope_max_bp") or 0.0
+            )
+            profile_time_lock_lookback_s = float(
+                self._codex_v143_metric_float(metrics, "time_lock_lookback_s") or 30.0
+            )
+            now_s = now_ms / 1000.0
+            history = self._codex_time_lock_price_history.setdefault(run_id, [])
+            history.append((now_s, mark))
+            cutoff_s = now_s - max(120.0, profile_time_lock_lookback_s * 2.0)
+            history[:] = [(t, p) for t, p in history if t >= cutoff_s]
+            lookback_s = now_s - profile_time_lock_lookback_s
+            prev_price = entry
+            for timestamp_s, price in history:
+                if timestamp_s >= lookback_s:
+                    prev_price = price
+                    break
+            if history and history[-1][0] == history[0][0]:
+                prev_price = entry
+            profile_time_lock_slope_bp = self._side_slope_bp(side, prev_price, mark)
         elif survival_profile == "v139b_wpr_waiting_scratch":
             min_mfe = float(getattr(self._settings, "mainnet_codex_v139b_wpr_scratch_mfe_bp", 3.0) or 3.0)
             micro_floor = float(getattr(self._settings, "mainnet_codex_v139b_wpr_scratch_floor_bp", 0.5) or 0.5)
             force_after = float(getattr(self._settings, "mainnet_codex_v139b_wpr_force_after_seconds", 240) or 240)
             damage_loss = float(getattr(self._settings, "mainnet_codex_v139b_wpr_damage_loss_bp", 5.0) or 5.0)
+            profile_profit_lock_mfe = self._codex_v143_metric_float(metrics, "profit_lock_mfe_bp")
+            profile_profit_lock_floor = self._codex_v143_metric_float(metrics, "profit_lock_floor_bp")
+            profile_profit_lock_giveback = self._codex_v143_metric_float(metrics, "profit_lock_giveback_bp")
+            profit_lock_mfe = (
+                profile_profit_lock_mfe
+                if profile_profit_lock_mfe is not None and profile_profit_lock_mfe > 0
+                else float(getattr(self._settings, "mainnet_codex_v145_wpr_profit_lock_mfe_bp", 5.0) or 5.0)
+            )
+            profit_lock_floor = (
+                profile_profit_lock_floor
+                if profile_profit_lock_floor is not None and profile_profit_lock_floor > 0
+                else float(getattr(self._settings, "mainnet_codex_v145_wpr_profit_lock_floor_bp", 2.0) or 2.0)
+            )
+            profit_lock_giveback = (
+                profile_profit_lock_giveback
+                if profile_profit_lock_giveback is not None and profile_profit_lock_giveback > 0
+                else 0.0
+            )
+            stups_profit_lock_fee_floor_enabled = bool(
+                market_state
+                in {
+                    "CNL-WPR-L:falling_discount_trap",
+                    "CNL-WPR-L:falling_continuation_probe",
+                    "CNL-WPR-L:discount_mixed",
+                    "CNL-WPR-L:discount_delayed_reclaim",
+                }
+                and getattr(self._settings, "mainnet_codex_v1411_wpr_profit_lock_fee_floor_enabled", True)
+            )
+            if stups_profit_lock_fee_floor_enabled:
+                try:
+                    stups_profit_lock_expected_close_fee_bp = max(
+                        0.0,
+                        float(getattr(self._settings, "mainnet_expected_taker_fee_rate", 0.0004) or 0.0) * 10_000.0,
+                    )
+                except (TypeError, ValueError):
+                    stups_profit_lock_expected_close_fee_bp = 4.0
+                try:
+                    stups_profit_lock_slippage_bp = max(
+                        0.0,
+                        float(getattr(self._settings, "mainnet_codex_v133_estimated_slippage_bp", 0.4) or 0.0),
+                    )
+                except (TypeError, ValueError):
+                    stups_profit_lock_slippage_bp = 0.4
+                try:
+                    stups_profit_lock_net_buffer_bp = max(
+                        0.0,
+                        float(getattr(self._settings, "mainnet_codex_v133_min_net_buffer_bp", 1.5) or 0.0),
+                    )
+                except (TypeError, ValueError):
+                    stups_profit_lock_net_buffer_bp = 1.5
+                try:
+                    configured_floor = max(
+                        0.0,
+                        float(getattr(self._settings, "mainnet_codex_v1411_wpr_profit_lock_min_floor_bp", 6.0) or 0.0),
+                    )
+                except (TypeError, ValueError):
+                    configured_floor = 6.0
+                stups_profit_lock_fee_floor = max(
+                    configured_floor,
+                    stups_profit_lock_expected_close_fee_bp
+                    + stups_profit_lock_slippage_bp
+                    + stups_profit_lock_net_buffer_bp,
+                )
+                profit_lock_floor = max(profit_lock_floor, stups_profit_lock_fee_floor)
+            wpr_discount_mixed_scratch_after = float(
+                getattr(self._settings, "mainnet_codex_v147_wpr_discount_mixed_scratch_after_seconds", 120) or 120
+            )
+        elif survival_profile == "v146_stups_time_profit_lock":
+            stups_profit_lock_after = float(
+                getattr(self._settings, "mainnet_codex_v146_stups_profit_lock_after_seconds", 180) or 180
+            )
+            stups_profit_lock_force_after = float(
+                getattr(self._settings, "mainnet_codex_v146_stups_profit_lock_force_after_seconds", 300) or 300
+            )
+            stups_profit_lock_mfe = float(
+                getattr(self._settings, "mainnet_codex_v146_stups_profit_lock_mfe_bp", 8.0) or 8.0
+            )
+            stups_profit_lock_floor = float(
+                getattr(self._settings, "mainnet_codex_v146_stups_profit_lock_floor_bp", 3.0) or 3.0
+            )
+            stups_profit_lock_giveback = float(
+                getattr(self._settings, "mainnet_codex_v146_stups_profit_lock_giveback_bp", 4.0) or 4.0
+            )
+            stups_stall_lock_enabled = bool(
+                getattr(self._settings, "mainnet_codex_v147_stups_stall_lock_enabled", True)
+            )
+            stups_stall_lock_after = float(
+                getattr(self._settings, "mainnet_codex_v147_stups_stall_lock_after_seconds", 300) or 300
+            )
+            stups_stall_lock_floor = float(
+                getattr(self._settings, "mainnet_codex_v147_stups_stall_lock_floor_bp", 4.5) or 4.5
+            )
+            if market_state == "STUP-S:mixed":
+                stups_profit_lock_after = float(
+                    getattr(self._settings, "mainnet_codex_v1414_stups_mixed_profit_lock_after_seconds", 30) or 30
+                )
+                stups_profit_lock_force_after = float(
+                    getattr(self._settings, "mainnet_codex_v1414_stups_mixed_profit_lock_force_after_seconds", 90) or 90
+                )
+                stups_profit_lock_mfe = float(
+                    getattr(self._settings, "mainnet_codex_v1414_stups_mixed_profit_lock_mfe_bp", 6.0) or 6.0
+                )
+                stups_profit_lock_floor = float(
+                    getattr(self._settings, "mainnet_codex_v1414_stups_mixed_profit_lock_floor_bp", 6.0) or 6.0
+                )
+                stups_profit_lock_giveback = float(
+                    getattr(self._settings, "mainnet_codex_v1414_stups_mixed_profit_lock_giveback_bp", 2.0) or 2.0
+                )
+                stups_stall_lock_after = float(
+                    getattr(self._settings, "mainnet_codex_v1414_stups_mixed_stall_lock_after_seconds", 45) or 45
+                )
+                stups_stall_lock_floor = float(
+                    getattr(self._settings, "mainnet_codex_v1414_stups_mixed_stall_lock_floor_bp", 6.0) or 6.0
+                )
+            stups_profit_lock_fee_floor_enabled = bool(
+                getattr(self._settings, "mainnet_codex_v149_stups_profit_lock_fee_floor_enabled", True)
+            )
+            if stups_profit_lock_fee_floor_enabled:
+                try:
+                    stups_profit_lock_expected_close_fee_bp = max(
+                        0.0,
+                        float(getattr(self._settings, "mainnet_expected_taker_fee_rate", 0.0004) or 0.0) * 10_000.0,
+                    )
+                except (TypeError, ValueError):
+                    stups_profit_lock_expected_close_fee_bp = 4.0
+                try:
+                    stups_profit_lock_slippage_bp = max(
+                        0.0,
+                        float(getattr(self._settings, "mainnet_codex_v133_estimated_slippage_bp", 0.4) or 0.0),
+                    )
+                except (TypeError, ValueError):
+                    stups_profit_lock_slippage_bp = 0.4
+                try:
+                    stups_profit_lock_net_buffer_bp = max(
+                        0.0,
+                        float(getattr(self._settings, "mainnet_codex_v133_min_net_buffer_bp", 1.5) or 0.0),
+                    )
+                except (TypeError, ValueError):
+                    stups_profit_lock_net_buffer_bp = 1.5
+                try:
+                    configured_floor = max(
+                        0.0,
+                        float(getattr(self._settings, "mainnet_codex_v149_stups_profit_lock_min_floor_bp", 6.0) or 0.0),
+                    )
+                except (TypeError, ValueError):
+                    configured_floor = 6.0
+                stups_profit_lock_fee_floor = max(
+                    configured_floor,
+                    stups_profit_lock_expected_close_fee_bp
+                    + stups_profit_lock_slippage_bp
+                    + stups_profit_lock_net_buffer_bp,
+                )
+                stups_profit_lock_floor = max(stups_profit_lock_floor, stups_profit_lock_fee_floor)
+                stups_stall_lock_floor = max(stups_stall_lock_floor, stups_profit_lock_fee_floor)
 
+        v1429_fast_lock_floor_bp = 3.0
+        v1429_previous_side = str(
+            metrics.get("v1427_previous_side")
+            or metrics.get("previous_side")
+            or metrics.get("raw_side")
+            or ""
+        ).upper()
+        v1429_target_side = str(metrics.get("target_side") or signal.get("side") or side or "").upper()
+        v1429_side_override_fast_lock = bool(
+            lane_code == "STUP-S"
+            and market_state in {"STUP-S:mixed", "STUP-S:counter_recoil"}
+            and v1429_previous_side in {"LONG", "SHORT"}
+            and v1429_target_side in {"LONG", "SHORT"}
+            and v1429_previous_side != v1429_target_side
+        )
+        v1437_stups_clean_extension_thin_lock = bool(
+            lane_code == "STUP-S"
+            and side == "SHORT"
+            and market_state == "STUP-S:clean_extension"
+            and bool(getattr(self._settings, "mainnet_codex_v1437_stups_clean_extension_thin_lock_enabled", True))
+        )
+        v1437_thin_lock_after = float(
+            getattr(self._settings, "mainnet_codex_v1437_stups_clean_extension_thin_lock_after_seconds", 50) or 50
+        )
+        v1437_thin_lock_mfe_bp = float(
+            getattr(self._settings, "mainnet_codex_v1437_stups_clean_extension_thin_lock_mfe_bp", 3.5) or 3.5
+        )
+        v1437_thin_lock_floor_bp = float(
+            getattr(self._settings, "mainnet_codex_v1437_stups_clean_extension_thin_lock_floor_bp", 3.5) or 3.5
+        )
+        v1437_thin_lock_slope_max_bp = float(
+            getattr(self._settings, "mainnet_codex_v1437_stups_clean_extension_thin_lock_slope_max_bp", 1.0) or 1.0
+        )
+        v1438_thin_lock_states = {
+            part.strip()
+            for part in str(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1438_stups_thin_lock_states",
+                    "STUP-S:counter_recoil,STUP-S:clean_extension",
+                )
+                or ""
+            ).split(",")
+            if part.strip()
+        }
+        v1438_stups_thin_lock = bool(
+            lane_code == "STUP-S"
+            and side in {"LONG", "SHORT"}
+            and market_state in v1438_thin_lock_states
+            and bool(getattr(self._settings, "mainnet_codex_v1438_stups_thin_lock_enabled", True))
+        )
+        v1438_thin_lock_after = float(
+            getattr(self._settings, "mainnet_codex_v1438_stups_thin_lock_after_seconds", 60) or 60
+        )
+        v1438_thin_lock_mfe_bp = float(
+            getattr(self._settings, "mainnet_codex_v1438_stups_thin_lock_mfe_bp", 5.5) or 5.5
+        )
+        v1438_thin_lock_floor_bp = float(
+            getattr(self._settings, "mainnet_codex_v1438_stups_thin_lock_floor_bp", 5.0) or 5.0
+        )
+        v1438_thin_lock_slope_max_bp = float(
+            getattr(self._settings, "mainnet_codex_v1438_stups_thin_lock_slope_max_bp", 0.0) or 0.0
+        )
+
+        v1439_thin_lock_states = {
+            part.strip()
+            for part in str(
+                getattr(
+                    self._settings,
+                    "mainnet_codex_v1439_stups_shadow_thin_lock_states",
+                    "STUP-S:mixed,STUP-S:weak_chop",
+                )
+                or ""
+            ).split(",")
+            if part.strip()
+        }
+        v1439_shadow_action = str(metrics.get("v1439_shadow_action") or "").upper()
+        v1439_stups_shadow_thin_lock = bool(
+            lane_code == "STUP-S"
+            and side in {"LONG", "SHORT"}
+            and market_state in v1439_thin_lock_states
+            and bool(getattr(self._settings, "mainnet_codex_v1439_stups_shadow_thin_lock_enabled", True))
+            and (not v1439_shadow_action or v1439_shadow_action in {"SHADOW_THIN_LOCK_CANDIDATE", "SHADOW_BLOCK_CANDIDATE", "SHADOW_REVIEW"})
+        )
+        v1439_thin_lock_after = float(
+            getattr(self._settings, "mainnet_codex_v1439_stups_shadow_thin_lock_after_seconds", 60) or 60
+        )
+        v1439_thin_lock_mfe_bp = float(
+            getattr(self._settings, "mainnet_codex_v1439_stups_shadow_thin_lock_mfe_bp", 5.5) or 5.5
+        )
+        v1439_thin_lock_floor_bp = float(
+            getattr(self._settings, "mainnet_codex_v1439_stups_shadow_thin_lock_floor_bp", 5.0) or 5.0
+        )
+        v1439_thin_lock_slope_max_bp = float(
+            getattr(self._settings, "mainnet_codex_v1439_stups_shadow_thin_lock_slope_max_bp", 0.5) or 0.5
+        )
+        v1439_thin_lock_lookback_s = float(
+            getattr(self._settings, "mainnet_codex_v1439_stups_shadow_thin_lock_lookback_seconds", 30) or 30
+        )
+        v1441_selector_action = str(metrics.get("v1441_research_selector_action") or "").upper()
+        v1441_mixed_thin_lock = bool(
+            lane_code == "STUP-S"
+            and side in {"LONG", "SHORT"}
+            and market_state == "STUP-S:mixed"
+            and v1441_selector_action == "ALLOW_THIN_LOCK_PROFILE"
+            and bool(getattr(self._settings, "mainnet_codex_v1441_mixed_thin_lock_enabled", True))
+        )
+        v1441_thin_lock_after = float(
+            getattr(self._settings, "mainnet_codex_v1441_mixed_thin_lock_after_seconds", 45) or 45
+        )
+        v1441_thin_lock_mfe_bp = float(
+            getattr(self._settings, "mainnet_codex_v1441_mixed_thin_lock_mfe_bp", 3.0) or 3.0
+        )
+        v1441_thin_lock_floor_bp = float(
+            getattr(self._settings, "mainnet_codex_v1441_mixed_thin_lock_floor_bp", 2.5) or 2.5
+        )
+        v1441_thin_lock_slope_max_bp = float(
+            getattr(self._settings, "mainnet_codex_v1441_mixed_thin_lock_slope_max_bp", 0.75) or 0.75
+        )
+        v1441_thin_lock_lookback_s = float(
+            getattr(self._settings, "mainnet_codex_v1441_mixed_thin_lock_lookback_seconds", 30) or 30
+        )
+        v1443_clean_reversal_scratch = bool(
+            lane_code == "STUP-S"
+            and side in {"LONG", "SHORT"}
+            and market_state == "STUP-S:clean_extension"
+            and bool(getattr(self._settings, "mainnet_codex_v1443_stups_clean_extension_reversal_scratch_enabled", True))
+        )
+        v1443_clean_reversal_after = float(
+            getattr(self._settings, "mainnet_codex_v1443_stups_clean_extension_reversal_after_seconds", 45) or 45
+        )
+        v1443_clean_reversal_mfe_bp = float(
+            getattr(self._settings, "mainnet_codex_v1443_stups_clean_extension_reversal_mfe_bp", 5.0) or 5.0
+        )
+        v1443_clean_reversal_current_min_bp = float(
+            getattr(self._settings, "mainnet_codex_v1443_stups_clean_extension_reversal_current_min_bp", -2.0) or -2.0
+        )
+        v1443_clean_reversal_current_max_bp = float(
+            getattr(self._settings, "mainnet_codex_v1443_stups_clean_extension_reversal_current_max_bp", 1.5) or 1.5
+        )
+        v1443_clean_reversal_giveback_bp = float(
+            getattr(self._settings, "mainnet_codex_v1443_stups_clean_extension_reversal_giveback_bp", 4.0) or 4.0
+        )
+        v1443_clean_reversal_slope_max_bp = float(
+            getattr(self._settings, "mainnet_codex_v1443_stups_clean_extension_reversal_slope_max_bp", 0.25) or 0.25
+        )
+        v1448_fast_scalp_lock = bool(
+            lane_code == "STUP-S"
+            and side == "SHORT"
+            and market_state == "STUP-S:clean_extension"
+            and bool(getattr(self._settings, "mainnet_codex_v1448_stups_clean_extension_fast_scalp_enabled", True))
+        )
+        v1448_fast_scalp_after = float(
+            getattr(self._settings, "mainnet_codex_v1448_stups_clean_extension_fast_scalp_after_seconds", 10) or 10
+        )
+        v1448_fast_scalp_mfe_bp = float(
+            getattr(self._settings, "mainnet_codex_v1448_stups_clean_extension_fast_scalp_mfe_bp", 6.0) or 6.0
+        )
+        v1448_fast_scalp_floor_bp = self._fee_safe_profit_floor_bp(
+            float(getattr(self._settings, "mainnet_codex_v1448_stups_clean_extension_fast_scalp_floor_bp", 5.0) or 5.0)
+        )
+        v1448_clean_reversal_fee_floor_enabled = bool(
+            getattr(self._settings, "mainnet_codex_v1448_stups_clean_extension_reversal_fee_floor_enabled", True)
+        )
+        v1448_clean_reversal_fee_floor_bp = self._fee_safe_profit_floor_bp(
+            float(getattr(self._settings, "mainnet_codex_v1448_stups_clean_extension_reversal_fee_floor_bp", 5.9) or 5.9)
+        )
+        v1443_clean_reversal_fee_safe = (
+            not v1448_clean_reversal_fee_floor_enabled
+            or current_bp >= v1448_clean_reversal_fee_floor_bp
+        )
+
+        v1444_cnl_wpr_deep_trail_lock = bool(
+            lane_code == "CNL-WPR-L"
+            and side in {"LONG", "SHORT"}
+            and market_state == "CNL-WPR-L:deep_discount_stable"
+            and bool(getattr(self._settings, "mainnet_codex_v1444_cnl_wpr_deep_trail_lock_enabled", True))
+        )
+        v1444_cnl_wpr_deep_trail_after = float(
+            getattr(self._settings, "mainnet_codex_v1444_cnl_wpr_deep_trail_after_seconds", 60) or 60
+        )
+        v1444_cnl_wpr_deep_trail_mfe_bp = float(
+            getattr(self._settings, "mainnet_codex_v1444_cnl_wpr_deep_trail_mfe_bp", 5.5) or 5.5
+        )
+        v1444_cnl_wpr_deep_trail_floor_bp = float(
+            getattr(self._settings, "mainnet_codex_v1444_cnl_wpr_deep_trail_floor_bp", 4.5) or 4.5
+        )
+        v1444_cnl_wpr_deep_trail_slope_max_bp = float(
+            getattr(self._settings, "mainnet_codex_v1444_cnl_wpr_deep_trail_slope_max_bp", 0.0) or 0.0
+        )
+        v1439_thin_lock_slope_bp = profile_time_lock_slope_bp
+        v1441_thin_lock_slope_bp = profile_time_lock_slope_bp
+        v1444_cnl_wpr_deep_trail_slope_bp = profile_time_lock_slope_bp
+        if (v1439_stups_shadow_thin_lock or v1441_mixed_thin_lock) and v1439_thin_lock_slope_bp is None:
+            now_s = now_ms / 1000.0
+            history = self._codex_time_lock_price_history.setdefault(run_id, [])
+            history.append((now_s, mark))
+            lookback_window_s = max(v1439_thin_lock_lookback_s, v1441_thin_lock_lookback_s)
+            cutoff_s = now_s - max(120.0, lookback_window_s * 2.0)
+            history[:] = [(t, p) for t, p in history if t >= cutoff_s]
+            lookback_s = now_s - lookback_window_s
+            prev_price = entry
+            for timestamp_s, price in history:
+                if timestamp_s >= lookback_s:
+                    prev_price = price
+                    break
+            if history and history[-1][0] == history[0][0]:
+                prev_price = entry
+            v1439_thin_lock_slope_bp = self._side_slope_bp(side, prev_price, mark)
+            v1441_thin_lock_slope_bp = v1439_thin_lock_slope_bp
+        if v1444_cnl_wpr_deep_trail_lock and v1444_cnl_wpr_deep_trail_slope_bp is None:
+            now_s = now_ms / 1000.0
+            history = self._codex_time_lock_price_history.setdefault(run_id, [])
+            history.append((now_s, mark))
+            cutoff_s = now_s - 120.0
+            history[:] = [(t, p) for t, p in history if t >= cutoff_s]
+            lookback_s = now_s - float(self._codex_v143_metric_float(metrics, "time_lock_lookback_s") or 30.0)
+            prev_price = entry
+            for timestamp_s, price in history:
+                if timestamp_s >= lookback_s:
+                    prev_price = price
+                    break
+            if history and history[-1][0] == history[0][0]:
+                prev_price = entry
+            v1444_cnl_wpr_deep_trail_slope_bp = self._side_slope_bp(side, prev_price, mark)
         reason: str | None = None
-        if survival_profile == "v139b_wpr_waiting_scratch":
-            if age_seconds >= force_after and current_bp <= -damage_loss:
+        if survival_profile == "v1427_profile_time_lock":
+            if (
+                v1429_side_override_fast_lock
+                and mfe_bp >= v1429_fast_lock_floor_bp
+                and current_bp >= v1429_fast_lock_floor_bp
+            ):
+                reason = "CODEX_V1429_SIDE_OVERRIDE_FAST_LOCK"
+            elif (
+                v1448_fast_scalp_lock
+                and age_seconds >= v1448_fast_scalp_after
+                and mfe_bp >= v1448_fast_scalp_mfe_bp
+                and current_bp >= v1448_fast_scalp_floor_bp
+            ):
+                reason = "CODEX_V1448_STUPS_FAST_SCALP_LOCK"
+            elif (
+                v1437_stups_clean_extension_thin_lock
+                and age_seconds >= v1437_thin_lock_after
+                and mfe_bp >= v1437_thin_lock_mfe_bp
+                and current_bp >= v1437_thin_lock_floor_bp
+                and profile_time_lock_slope_bp is not None
+                and profile_time_lock_slope_bp <= v1437_thin_lock_slope_max_bp
+            ):
+                reason = "CODEX_V1437_STUPS_THIN_LOCK"
+            elif (
+                v1438_stups_thin_lock
+                and age_seconds >= v1438_thin_lock_after
+                and mfe_bp >= v1438_thin_lock_mfe_bp
+                and current_bp >= v1438_thin_lock_floor_bp
+                and profile_time_lock_slope_bp is not None
+                and profile_time_lock_slope_bp <= v1438_thin_lock_slope_max_bp
+            ):
+                reason = "CODEX_V1438_STUPS_THIN_LOCK"
+            elif (
+                v1441_mixed_thin_lock
+                and age_seconds >= v1441_thin_lock_after
+                and mfe_bp >= v1441_thin_lock_mfe_bp
+                and current_bp >= v1441_thin_lock_floor_bp
+                and v1441_thin_lock_slope_bp is not None
+                and v1441_thin_lock_slope_bp <= v1441_thin_lock_slope_max_bp
+            ):
+                reason = "CODEX_V1441_MIXED_THIN_LOCK"
+            elif (
+                v1443_clean_reversal_scratch
+                and age_seconds >= v1443_clean_reversal_after
+                and mfe_bp >= v1443_clean_reversal_mfe_bp
+                and v1443_clean_reversal_current_min_bp <= current_bp <= v1443_clean_reversal_current_max_bp
+                and max(0.0, mfe_bp - current_bp) >= v1443_clean_reversal_giveback_bp
+                and profile_time_lock_slope_bp is not None
+                and profile_time_lock_slope_bp <= v1443_clean_reversal_slope_max_bp
+                and v1443_clean_reversal_fee_safe
+            ):
+                reason = "CODEX_V1443_STUPS_CLEAN_EXTENSION_REVERSAL_SCRATCH"
+            elif (
+                v1439_stups_shadow_thin_lock
+                and age_seconds >= v1439_thin_lock_after
+                and mfe_bp >= v1439_thin_lock_mfe_bp
+                and current_bp >= v1439_thin_lock_floor_bp
+                and v1439_thin_lock_slope_bp is not None
+                and v1439_thin_lock_slope_bp <= v1439_thin_lock_slope_max_bp
+            ):
+                reason = "CODEX_V1439_SHADOW_THIN_LOCK"
+            elif (
+                v1444_cnl_wpr_deep_trail_lock
+                and age_seconds >= v1444_cnl_wpr_deep_trail_after
+                and mfe_bp >= v1444_cnl_wpr_deep_trail_mfe_bp
+                and current_bp >= v1444_cnl_wpr_deep_trail_floor_bp
+                and v1444_cnl_wpr_deep_trail_slope_bp is not None
+                and v1444_cnl_wpr_deep_trail_slope_bp <= v1444_cnl_wpr_deep_trail_slope_max_bp
+            ):
+                reason = "CODEX_V1444_CNL_WPR_DEEP_TRAIL_LOCK"
+            elif (
+                age_seconds >= profile_time_lock_after
+                and current_bp >= profile_time_lock_min_bp
+                and profile_time_lock_slope_bp is not None
+                and profile_time_lock_slope_bp <= profile_time_lock_slope_max_bp
+            ):
+                reason = "CODEX_V1427_TIME_LOCK"
+        elif survival_profile == "v139b_wpr_waiting_scratch":
+            giveback_bp = max(0.0, mfe_bp - current_bp)
+            if profit_lock_giveback > 0:
+                if (
+                    mfe_bp >= profit_lock_mfe
+                    and current_bp >= profit_lock_floor
+                    and giveback_bp >= profit_lock_giveback
+                ):
+                    reason = "CNL_WPR_PROFIT_LOCK"
+            elif mfe_bp >= profit_lock_mfe and current_bp <= profit_lock_floor:
+                reason = "CNL_WPR_PROFIT_LOCK"
+            elif age_seconds >= force_after and current_bp <= -damage_loss:
                 reason = "CNL_WPR_DAMAGE_CONTROL"
-            elif mfe_bp >= min_mfe and current_bp <= micro_floor:
+            elif (
+                mfe_bp >= min_mfe
+                and current_bp <= micro_floor
+                and (market_state != "CNL-WPR-L:discount_mixed" or age_seconds >= wpr_discount_mixed_scratch_after)
+            ):
                 reason = "CNL_WPR_SCRATCH"
+        elif survival_profile == "v146_stups_time_profit_lock":
+            giveback_bp = max(0.0, mfe_bp - current_bp)
+            if (
+                v1448_fast_scalp_lock
+                and age_seconds >= v1448_fast_scalp_after
+                and mfe_bp >= v1448_fast_scalp_mfe_bp
+                and current_bp >= v1448_fast_scalp_floor_bp
+            ):
+                reason = "CODEX_V1448_STUPS_FAST_SCALP_LOCK"
+            elif (
+                v1441_mixed_thin_lock
+                and age_seconds >= v1441_thin_lock_after
+                and mfe_bp >= v1441_thin_lock_mfe_bp
+                and current_bp >= v1441_thin_lock_floor_bp
+                and v1441_thin_lock_slope_bp is not None
+                and v1441_thin_lock_slope_bp <= v1441_thin_lock_slope_max_bp
+            ):
+                reason = "CODEX_V1441_MIXED_THIN_LOCK"
+            elif (
+                v1443_clean_reversal_scratch
+                and age_seconds >= v1443_clean_reversal_after
+                and mfe_bp >= v1443_clean_reversal_mfe_bp
+                and v1443_clean_reversal_current_min_bp <= current_bp <= v1443_clean_reversal_current_max_bp
+                and max(0.0, mfe_bp - current_bp) >= v1443_clean_reversal_giveback_bp
+                and profile_time_lock_slope_bp is not None
+                and profile_time_lock_slope_bp <= v1443_clean_reversal_slope_max_bp
+                and v1443_clean_reversal_fee_safe
+            ):
+                reason = "CODEX_V1443_STUPS_CLEAN_EXTENSION_REVERSAL_SCRATCH"
+            elif (
+                v1439_stups_shadow_thin_lock
+                and age_seconds >= v1439_thin_lock_after
+                and mfe_bp >= v1439_thin_lock_mfe_bp
+                and current_bp >= v1439_thin_lock_floor_bp
+                and v1439_thin_lock_slope_bp is not None
+                and v1439_thin_lock_slope_bp <= v1439_thin_lock_slope_max_bp
+            ):
+                reason = "CODEX_V1439_SHADOW_THIN_LOCK"
+            elif (
+                age_seconds >= stups_profit_lock_after
+                and mfe_bp >= stups_profit_lock_mfe
+                and current_bp >= stups_profit_lock_floor
+                and (
+                    giveback_bp >= stups_profit_lock_giveback
+                    or age_seconds >= stups_profit_lock_force_after
+                )
+            ):
+                reason = "STUPS_TIME_PROFIT_LOCK"
+            elif (
+                stups_stall_lock_enabled
+                and age_seconds >= stups_stall_lock_after
+                and current_bp >= stups_stall_lock_floor
+            ):
+                reason = "STUPS_STALL_PROFIT_LOCK"
+            elif age_seconds >= force_after and current_bp <= -damage_loss:
+                reason = "CODEX_DAMAGE_CONTROL"
         elif (
             age_seconds >= exit_after
             and mfe_bp >= min_mfe
@@ -7042,6 +22427,120 @@ class MainnetOneRunManager:
         elif age_seconds >= force_after and current_bp <= -damage_loss:
             reason = "CODEX_DAMAGE_CONTROL"
 
+        regime_overlay_mode = str(
+            metrics.get("v1459_regime_mode") or ""
+        ).lower()
+        regime_state = str(
+            metrics.get("v1459_regime_state") or ""
+        ).upper()
+        enforced_exit_mode = (
+            str(metrics.get("exit_mode") or "").upper()
+            if regime_overlay_mode == "enforcement"
+            else ""
+        )
+        regime_routing = bool(
+            self._v1459_profile_enforcement_active()
+            and enforced_exit_mode in {"RUNNER", "EARLY_FAIL"}
+        )
+        legacy_stup_routing = bool(
+            not regime_routing and lane_code == "STUP-S"
+        )
+        if self._v1459_profile_candidate_active(run) and (
+            regime_routing or legacy_stup_routing
+        ):
+            profile_config = build_profile_config(self._settings)
+            profile_flags = profile_config.flags
+            if regime_routing:
+                profile_flags = replace(
+                    profile_flags,
+                    runner_enabled=bool(
+                        profile_flags.runner_enabled
+                        and enforced_exit_mode == "RUNNER"
+                        and regime_state != "RANGE"
+                    ),
+                    early_fail_enabled=bool(
+                        profile_flags.early_fail_enabled
+                        and enforced_exit_mode == "EARLY_FAIL"
+                    ),
+                )
+                profile_config = replace(
+                    profile_config,
+                    flags=profile_flags,
+                )
+            if profile_flags.runner_enabled or profile_flags.early_fail_enabled:
+                hard_sl_present = await self._v1459_owned_hard_sl_present(
+                    run, position
+                )
+                giveback_bp = max(0.0, mfe_bp - current_bp)
+                fee_safe_floor_bp = self._fee_safe_profit_floor_bp(0.0)
+                runner_giveback_cap_bp = max(
+                    fee_safe_floor_bp,
+                    micro_floor,
+                    profit_lock_giveback,
+                    stups_profit_lock_giveback,
+                )
+                adverse_markout = current_bp <= -early_fail_loss
+                runner_reason_eligible = (
+                    reason in V1459_RUNNER_SOFT_EXIT_REASONS
+                    and run_id not in self._v1459_runner_extension_used
+                )
+                follow_through_valid = bool(
+                    current_bp >= fee_safe_floor_bp
+                    and giveback_bp <= runner_giveback_cap_bp
+                )
+                profile_facts = {
+                    "position_open": abs(float(position.position_amt)) > 0.0,
+                    "hard_sl_present": hard_sl_present,
+                    "early_window_open": age_seconds >= exit_after,
+                    "minimum_mfe_met": mfe_bp >= min_mfe,
+                    "adverse_markout": adverse_markout,
+                    "direction_still_valid": not adverse_markout,
+                    "causal_mfe_covers_cost": mfe_bp >= fee_safe_floor_bp,
+                    "follow_through_valid": follow_through_valid,
+                    "runner_guards_present": runner_reason_eligible,
+                    "age_seconds": round(age_seconds, 3),
+                    "mfe_bp": round(mfe_bp, 6),
+                    "current_bp": round(current_bp, 6),
+                    "giveback_bp": round(giveback_bp, 6),
+                    "fee_safe_floor_bp": round(fee_safe_floor_bp, 6),
+                    "runner_giveback_cap_bp": round(
+                        runner_giveback_cap_bp, 6
+                    ),
+                    "v1459_regime_mode": regime_overlay_mode or None,
+                    "v1459_regime_state": regime_state or None,
+                    "exit_mode": enforced_exit_mode or None,
+                    "regime_routing": regime_routing,
+                    "lane_code": lane_code,
+                    "market_state": market_state or None,
+                }
+                profile_decision = select_exit_profile(
+                    ExitPolicyInput(
+                        position_open=profile_facts["position_open"],
+                        hard_sl_present=profile_facts["hard_sl_present"],
+                        early_window_open=profile_facts["early_window_open"],
+                        minimum_mfe_met=profile_facts["minimum_mfe_met"],
+                        adverse_markout=profile_facts["adverse_markout"],
+                        direction_still_valid=profile_facts[
+                            "direction_still_valid"
+                        ],
+                        causal_mfe_covers_cost=profile_facts[
+                            "causal_mfe_covers_cost"
+                        ],
+                        follow_through_valid=profile_facts[
+                            "follow_through_valid"
+                        ],
+                        runner_guards_present=profile_facts[
+                            "runner_guards_present"
+                        ],
+                    ),
+                    profile_config,
+                )
+                reason = await self._v1459_apply_exit_profile(
+                    run,
+                    decision=profile_decision,
+                    incumbent_reason=reason,
+                    facts=profile_facts,
+                )
         if not reason:
             return False
 
@@ -7056,14 +22555,82 @@ class MainnetOneRunManager:
                 "mark": mark,
                 "mfe_bp": round(mfe_bp, 4),
                 "current_bp": round(current_bp, 4),
+                "giveback_bp": round(max(0.0, mfe_bp - current_bp), 4),
                 "qty": qty,
                 "lane": lane,
                 "lane_code": lane_code or None,
+                "market_state": market_state or None,
                 "survival_profile": survival_profile,
+                "profit_lock_fee_floor_enabled": stups_profit_lock_fee_floor_enabled,
+                "profit_lock_fee_floor_bp": round(stups_profit_lock_fee_floor, 4),
+                "profit_lock_expected_close_fee_bp": round(stups_profit_lock_expected_close_fee_bp, 4),
+                "profit_lock_slippage_bp": round(stups_profit_lock_slippage_bp, 4),
+                "profit_lock_net_buffer_bp": round(stups_profit_lock_net_buffer_bp, 4),
+                "profile_time_lock_s": round(profile_time_lock_after, 1) if survival_profile == "v1427_profile_time_lock" else None,
+                "profile_time_lock_min_bp": round(profile_time_lock_min_bp, 4) if survival_profile == "v1427_profile_time_lock" else None,
+                "profile_time_lock_slope_max_bp": round(profile_time_lock_slope_max_bp, 4) if survival_profile == "v1427_profile_time_lock" else None,
+                "profile_time_lock_slope_bp": round(profile_time_lock_slope_bp, 4) if profile_time_lock_slope_bp is not None else None,
+                "v1429_side_override_fast_lock": v1429_side_override_fast_lock,
+                "v1429_previous_side": v1429_previous_side or None,
+                "v1429_target_side": v1429_target_side or None,
+                "v1429_fast_lock_floor_bp": v1429_fast_lock_floor_bp if v1429_side_override_fast_lock else None,
+                "v1437_stups_clean_extension_thin_lock": v1437_stups_clean_extension_thin_lock,
+                "v1437_thin_lock_after_seconds": v1437_thin_lock_after if v1437_stups_clean_extension_thin_lock else None,
+                "v1437_thin_lock_mfe_bp": v1437_thin_lock_mfe_bp if v1437_stups_clean_extension_thin_lock else None,
+                "v1437_thin_lock_floor_bp": v1437_thin_lock_floor_bp if v1437_stups_clean_extension_thin_lock else None,
+                "v1437_thin_lock_slope_max_bp": v1437_thin_lock_slope_max_bp if v1437_stups_clean_extension_thin_lock else None,
+                "v1438_stups_thin_lock": v1438_stups_thin_lock,
+                "v1438_thin_lock_states": sorted(v1438_thin_lock_states) if v1438_stups_thin_lock else None,
+                "v1438_thin_lock_after_seconds": v1438_thin_lock_after if v1438_stups_thin_lock else None,
+                "v1438_thin_lock_mfe_bp": v1438_thin_lock_mfe_bp if v1438_stups_thin_lock else None,
+                "v1438_thin_lock_floor_bp": v1438_thin_lock_floor_bp if v1438_stups_thin_lock else None,
+                "v1438_thin_lock_slope_max_bp": v1438_thin_lock_slope_max_bp if v1438_stups_thin_lock else None,
+                "v1439_stups_shadow_thin_lock": v1439_stups_shadow_thin_lock,
+                "v1439_shadow_action": v1439_shadow_action or None,
+                "v1439_thin_lock_states": sorted(v1439_thin_lock_states) if v1439_stups_shadow_thin_lock else None,
+                "v1439_thin_lock_after_seconds": v1439_thin_lock_after if v1439_stups_shadow_thin_lock else None,
+                "v1439_thin_lock_mfe_bp": v1439_thin_lock_mfe_bp if v1439_stups_shadow_thin_lock else None,
+                "v1439_thin_lock_floor_bp": v1439_thin_lock_floor_bp if v1439_stups_shadow_thin_lock else None,
+                "v1439_thin_lock_slope_max_bp": v1439_thin_lock_slope_max_bp if v1439_stups_shadow_thin_lock else None,
+                "v1439_thin_lock_slope_bp": round(v1439_thin_lock_slope_bp, 4) if v1439_thin_lock_slope_bp is not None else None,
+                "v1444_cnl_wpr_deep_trail_lock": v1444_cnl_wpr_deep_trail_lock,
+                "v1444_cnl_wpr_deep_trail_after_seconds": v1444_cnl_wpr_deep_trail_after if v1444_cnl_wpr_deep_trail_lock else None,
+                "v1444_cnl_wpr_deep_trail_mfe_bp": v1444_cnl_wpr_deep_trail_mfe_bp if v1444_cnl_wpr_deep_trail_lock else None,
+                "v1444_cnl_wpr_deep_trail_floor_bp": v1444_cnl_wpr_deep_trail_floor_bp if v1444_cnl_wpr_deep_trail_lock else None,
+                "v1444_cnl_wpr_deep_trail_slope_max_bp": v1444_cnl_wpr_deep_trail_slope_max_bp if v1444_cnl_wpr_deep_trail_lock else None,
+                "v1444_cnl_wpr_deep_trail_slope_bp": round(v1444_cnl_wpr_deep_trail_slope_bp, 4) if v1444_cnl_wpr_deep_trail_slope_bp is not None else None,
+                "v1441_mixed_thin_lock": v1441_mixed_thin_lock,
+                "v1441_selector_action": v1441_selector_action or None,
+                "v1441_thin_lock_after_seconds": v1441_thin_lock_after if v1441_mixed_thin_lock else None,
+                "v1441_thin_lock_mfe_bp": v1441_thin_lock_mfe_bp if v1441_mixed_thin_lock else None,
+                "v1441_thin_lock_floor_bp": v1441_thin_lock_floor_bp if v1441_mixed_thin_lock else None,
+                "v1441_thin_lock_slope_max_bp": v1441_thin_lock_slope_max_bp if v1441_mixed_thin_lock else None,
+                "v1441_thin_lock_slope_bp": round(v1441_thin_lock_slope_bp, 4) if v1441_thin_lock_slope_bp is not None else None,
+                "v1443_clean_reversal_scratch": v1443_clean_reversal_scratch,
+                "v1443_clean_reversal_after_seconds": v1443_clean_reversal_after if v1443_clean_reversal_scratch else None,
+                "v1443_clean_reversal_mfe_bp": v1443_clean_reversal_mfe_bp if v1443_clean_reversal_scratch else None,
+                "v1443_clean_reversal_current_min_bp": v1443_clean_reversal_current_min_bp if v1443_clean_reversal_scratch else None,
+                "v1443_clean_reversal_current_max_bp": v1443_clean_reversal_current_max_bp if v1443_clean_reversal_scratch else None,
+                "v1443_clean_reversal_giveback_bp": v1443_clean_reversal_giveback_bp if v1443_clean_reversal_scratch else None,
+                "v1443_clean_reversal_slope_max_bp": v1443_clean_reversal_slope_max_bp if v1443_clean_reversal_scratch else None,
+                "v1448_stups_fast_scalp_lock": v1448_fast_scalp_lock,
+                "v1448_fast_scalp_after_seconds": v1448_fast_scalp_after if v1448_fast_scalp_lock else None,
+                "v1448_fast_scalp_mfe_bp": v1448_fast_scalp_mfe_bp if v1448_fast_scalp_lock else None,
+                "v1448_fast_scalp_floor_bp": round(v1448_fast_scalp_floor_bp, 4) if v1448_fast_scalp_lock else None,
+                "v1448_clean_reversal_fee_floor_enabled": v1448_clean_reversal_fee_floor_enabled,
+                "v1448_clean_reversal_fee_floor_bp": round(v1448_clean_reversal_fee_floor_bp, 4),
+                "v1443_clean_reversal_fee_safe": v1443_clean_reversal_fee_safe,
             },
         )
-        await self._close_position(position.symbol, close_side, qty, reason, run)
-        return True
+        return await self._close_position(position.symbol, close_side, qty, reason, run)
+
+    @staticmethod
+    def _side_slope_bp(side: str, old_price: float, new_price: float) -> float:
+        if old_price <= 0 or new_price <= 0:
+            return 0.0
+        if side == "SHORT":
+            return (old_price - new_price) / old_price * 10_000.0
+        return (new_price - old_price) / old_price * 10_000.0
 
     @staticmethod
     def _side_pnl_bp(side: str, entry: float, price: float) -> float:
@@ -7075,6 +22642,153 @@ class MainnetOneRunManager:
             return (entry - price) / entry * 10_000.0
         return 0.0
 
+    def _fee_safe_profit_floor_bp(self, configured_floor: float) -> float:
+        try:
+            close_fee_bp = max(
+                0.0,
+                float(getattr(self._settings, "mainnet_expected_taker_fee_rate", 0.0004) or 0.0) * 10_000.0,
+            )
+        except (TypeError, ValueError):
+            close_fee_bp = 4.0
+        try:
+            slippage_bp = max(
+                0.0,
+                float(getattr(self._settings, "mainnet_codex_v133_estimated_slippage_bp", 0.4) or 0.0),
+            )
+        except (TypeError, ValueError):
+            slippage_bp = 0.4
+        try:
+            buffer_bp = max(
+                0.0,
+                float(getattr(self._settings, "mainnet_codex_v133_min_net_buffer_bp", 1.5) or 0.0),
+            )
+        except (TypeError, ValueError):
+            buffer_bp = 1.5
+        return max(0.0, configured_floor, close_fee_bp + slippage_bp + buffer_bp)
+
+    def _survival_maker_profit_floor_bp(self, reason: str, run: Mapping[str, Any]) -> float | None:
+        try:
+            trail_floor = max(0.0, float(getattr(self._settings, "mainnet_trail_profit_floor_bp", 1.5) or 0.0))
+        except (TypeError, ValueError):
+            trail_floor = 1.5
+        if reason in {"TRAIL", "CODEX_MICRO_TRAIL"}:
+            return self._trail_profit_floor_bp(run)
+
+        if reason in BE_SL_EXIT_REASONS:
+            be_floor: float | None = None
+            try:
+                signal = json.loads(str(run.get("signal_json") or "{}"))
+            except (TypeError, json.JSONDecodeError):
+                signal = {}
+            if isinstance(signal, Mapping):
+                be_meta = signal.get("breakeven_sl")
+                if isinstance(be_meta, Mapping):
+                    be_floor = self._codex_v143_metric_float(be_meta, "offset_bp")
+                if be_floor is None:
+                    codex = signal.get("codex_v1") if isinstance(signal.get("codex_v1"), Mapping) else {}
+                    metrics = codex.get("metrics") if isinstance(codex.get("metrics"), Mapping) else {}
+                    be_floor = self._codex_v143_metric_float(metrics, "be_bp")
+            return max(0.0, float(be_floor) if be_floor is not None else trail_floor)
+
+        if reason == "CODEX_V1427_TIME_LOCK":
+            codex = self._codex_v1_signal_meta(run)
+            metrics = codex.get("metrics") if isinstance(codex.get("metrics"), Mapping) else {}
+            lane_code = str(codex.get("lane_code") or "").upper()
+            market_state = str(
+                metrics.get("market_state")
+                or metrics.get("v143_market_state")
+                or metrics.get("wpr_profile")
+                or ""
+            )
+            if lane_code == "CNL-WPR-L" and market_state == "CNL-WPR-L:deep_discount_stable":
+                configured_floor = float(
+                    getattr(self._settings, "mainnet_codex_v1444_cnl_wpr_deep_time_lock_floor_bp", 4.5) or 4.5
+                )
+                return max(trail_floor, configured_floor)
+            profile_floor = self._codex_v143_metric_float(metrics, "time_lock_min_bp")
+            if profile_floor is None or profile_floor <= 0:
+                profile_floor = 6.0
+            return max(trail_floor, float(profile_floor))
+
+        if reason == "CODEX_V1429_SIDE_OVERRIDE_FAST_LOCK":
+            return max(trail_floor, 3.0)
+
+        if reason == "CODEX_V1437_STUPS_THIN_LOCK":
+            configured_floor = float(getattr(self._settings, "mainnet_codex_v1437_stups_clean_extension_thin_lock_floor_bp", 3.5) or 3.5)
+            return max(trail_floor, configured_floor)
+
+        if reason == "CODEX_V1438_STUPS_THIN_LOCK":
+            configured_floor = float(getattr(self._settings, "mainnet_codex_v1438_stups_thin_lock_floor_bp", 5.0) or 5.0)
+            return max(trail_floor, configured_floor)
+
+        if reason == "CODEX_V1448_STUPS_FAST_SCALP_LOCK":
+            configured_floor = float(
+                getattr(self._settings, "mainnet_codex_v1448_stups_clean_extension_fast_scalp_floor_bp", 5.0) or 5.0
+            )
+            return self._fee_safe_profit_floor_bp(max(trail_floor, configured_floor))
+
+        if reason == "CODEX_V1443_STUPS_CLEAN_EXTENSION_REVERSAL_SCRATCH":
+            configured_floor = float(
+                getattr(self._settings, "mainnet_codex_v1448_stups_clean_extension_reversal_fee_floor_bp", 5.9) or 5.9
+            )
+            return self._fee_safe_profit_floor_bp(max(trail_floor, configured_floor))
+
+        if reason == "CODEX_V1439_SHADOW_THIN_LOCK":
+            configured_floor = float(getattr(self._settings, "mainnet_codex_v1439_stups_shadow_thin_lock_floor_bp", 5.0) or 5.0)
+            return max(trail_floor, configured_floor)
+        if reason == "CODEX_V1441_MIXED_THIN_LOCK":
+            configured_floor = float(getattr(self._settings, "mainnet_codex_v1441_mixed_thin_lock_floor_bp", 2.5) or 2.5)
+            return max(trail_floor, configured_floor)
+        if reason == "CODEX_V1444_CNL_WPR_DEEP_TRAIL_LOCK":
+            configured_floor = float(getattr(self._settings, "mainnet_codex_v1444_cnl_wpr_deep_trail_floor_bp", 4.5) or 4.5)
+            return max(trail_floor, configured_floor)
+        if reason == "CODEX_FULL_TP_TOUCH_LOCK":
+            configured_floor = float(getattr(self._settings, "mainnet_codex_full_tp_touch_min_floor_bp", 6.0) or 6.0)
+            return self._fee_safe_profit_floor_bp(max(trail_floor, configured_floor))
+
+        if reason == "CODEX_MAX_HOLD_PROFIT_LOCK":
+            codex = self._codex_v1_signal_meta(run)
+            v1442_floor_bp = self._codex_v1442_cnl_wpr_max_hold_floor_bp(codex)
+            if v1442_floor_bp is not None:
+                return max(trail_floor, v1442_floor_bp)
+            configured_floor = float(getattr(self._settings, "mainnet_codex_max_hold_profit_min_floor_bp", 5.0) or 5.0)
+            return self._fee_safe_profit_floor_bp(max(trail_floor, configured_floor))
+        if reason == "CODEX_STUPS_FAST_FLOOR_LOCK":
+            codex = self._codex_v1_signal_meta(run)
+            metrics = codex.get("metrics") if isinstance(codex.get("metrics"), Mapping) else {}
+            profile_floor = self._codex_v143_metric_float(metrics, "trail_floor_bp")
+            if profile_floor is None or profile_floor <= 0:
+                profile_floor = float(getattr(self._settings, "mainnet_codex_v1434_stups_fast_floor_floor_bp", 5.0) or 5.0)
+            return max(trail_floor, float(profile_floor))
+        if reason == "CNL_WPR_PROFIT_LOCK":
+            codex = self._codex_v1_signal_meta(run)
+            metrics = codex.get("metrics") if isinstance(codex.get("metrics"), Mapping) else {}
+            profile_floor = self._codex_v143_metric_float(metrics, "profit_lock_floor_bp")
+            if profile_floor is None or profile_floor <= 0:
+                profile_floor = float(getattr(self._settings, "mainnet_codex_v145_wpr_profit_lock_floor_bp", 2.0) or 2.0)
+            if bool(getattr(self._settings, "mainnet_codex_v1411_wpr_profit_lock_fee_floor_enabled", True)):
+                configured_floor = max(
+                    float(profile_floor),
+                    float(getattr(self._settings, "mainnet_codex_v1411_wpr_profit_lock_min_floor_bp", 6.0) or 0.0),
+                )
+                return self._fee_safe_profit_floor_bp(configured_floor)
+            return max(trail_floor, float(profile_floor))
+
+        if reason in {"STUPS_TIME_PROFIT_LOCK", "STUPS_STALL_PROFIT_LOCK"}:
+            if reason == "STUPS_STALL_PROFIT_LOCK":
+                configured_floor = float(getattr(self._settings, "mainnet_codex_v147_stups_stall_lock_floor_bp", 4.5) or 4.5)
+            else:
+                configured_floor = float(getattr(self._settings, "mainnet_codex_v146_stups_profit_lock_floor_bp", 3.0) or 3.0)
+            if bool(getattr(self._settings, "mainnet_codex_v149_stups_profit_lock_fee_floor_enabled", True)):
+                configured_floor = max(
+                    configured_floor,
+                    float(getattr(self._settings, "mainnet_codex_v149_stups_profit_lock_min_floor_bp", 6.0) or 0.0),
+                )
+                return self._fee_safe_profit_floor_bp(configured_floor)
+            return max(trail_floor, configured_floor)
+
+        return None
+
     async def _close_position(self, symbol: str, side: str, qty: float, reason: str, run: dict) -> bool:
         """Cancel all open SL/TP orders then market-close the position.
         The STOP_MARKET order armed at entry handles normal SL execution on
@@ -7082,8 +22796,8 @@ class MainnetOneRunManager:
         MAX_HOLD, or _hit_stop fallback).
 
         Returns True when the close was submitted (or the position is already
-        gone).  Returns False ONLY on the TRAIL anchor-gate abort below — in
-        that case nothing was cancelled and the caller must keep managing the
+        gone).  Returns False when an anchor-floor gate aborts before any
+        protective order is cancelled; the caller must keep managing the
         position (no market fallback).
         """
         run_id = run["run_id"]
@@ -7096,7 +22810,7 @@ class MainnetOneRunManager:
                     "close_skipped_position_flat",
                     {"reason": reason, "side": side},
                 )
-                if reason.startswith("CODEX_") or reason in {"CNL_WPR_SCRATCH", "CNL_WPR_DAMAGE_CONTROL"}:
+                if reason.startswith("CODEX_") or reason in {"CNL_WPR_SCRATCH", "CNL_WPR_DAMAGE_CONTROL", "CNL_WPR_PROFIT_LOCK", "STUPS_TIME_PROFIT_LOCK", "STUPS_STALL_PROFIT_LOCK"} or reason in BE_SL_EXIT_REASONS:
                     await self._repo.log_event(
                         run_id,
                         "survival_exit_done",
@@ -7105,7 +22819,18 @@ class MainnetOneRunManager:
                 return True
         except Exception as exc:  # noqa: BLE001
             logger.warning("close_position_flat_check_failed", run_id=run_id, reason=reason, error=str(exc)[:200])
-        if reason == "TRAIL":
+        pre_cancel_floor_bp = self._survival_maker_profit_floor_bp(reason, run)
+        pre_cancel_floor_reasons = {"TRAIL", "CODEX_V1427_TIME_LOCK", "CODEX_V1429_SIDE_OVERRIDE_FAST_LOCK", "CODEX_V1437_STUPS_THIN_LOCK", "CODEX_V1438_STUPS_THIN_LOCK", "CODEX_V1448_STUPS_FAST_SCALP_LOCK", "CODEX_V1439_SHADOW_THIN_LOCK", "CODEX_V1441_MIXED_THIN_LOCK", "CODEX_V1444_CNL_WPR_DEEP_TRAIL_LOCK", "CODEX_FULL_TP_TOUCH_LOCK", "CODEX_MAX_HOLD_PROFIT_LOCK", "CODEX_STUPS_FAST_FLOOR_LOCK", "CNL_WPR_PROFIT_LOCK", "STUPS_TIME_PROFIT_LOCK", "STUPS_STALL_PROFIT_LOCK", *BE_SL_EXIT_REASONS}
+        be_pre_cancel_floor_enabled = (
+            reason in BE_SL_EXIT_REASONS
+            and bool(getattr(self._settings, "mainnet_codex_be_maker_first_enabled", True))
+        )
+        pre_cancel_floor_enabled = reason == "TRAIL" or be_pre_cancel_floor_enabled or (
+            reason in pre_cancel_floor_reasons
+            and reason not in BE_SL_EXIT_REASONS
+            and bool(getattr(self._settings, "mainnet_codex_survival_exit_use_maker", False))
+        )
+        if pre_cancel_floor_bp is not None and pre_cancel_floor_enabled:
             # E3 anchor gate: the trigger checks the MARK price, but the maker
             # exit executes against the BOOK (SELL rests at the bid).  In a
             # fast dump the bid can already sit below cost basis while mark is
@@ -7123,32 +22848,36 @@ class MainnetOneRunManager:
                 )
                 book = await self._client.get_book_ticker(symbol)
                 anchor = float(book["bidPrice"]) if side == "SELL" else float(book["askPrice"])
-                floor_bp = self._settings.mainnet_trail_profit_floor_bp
                 floor_price = (
-                    cost_basis * (1 + floor_bp / 10_000)
+                    cost_basis * (1 + pre_cancel_floor_bp / 10_000)
                     if side == "SELL"
-                    else cost_basis * (1 - floor_bp / 10_000)
+                    else cost_basis * (1 - pre_cancel_floor_bp / 10_000)
                 )
                 if cost_basis > 0 and (
                     (side == "SELL" and anchor < floor_price)
                     or (side == "BUY" and anchor > floor_price)
                 ):
-                    self._trail_exiting.discard(run_id)
+                    if reason == "TRAIL":
+                        self._trail_exiting.discard(run_id)
                     logger.info(
-                        "trail_fire_aborted_anchor_floor",
+                        "close_aborted_anchor_profit_floor",
                         run_id=run_id,
+                        reason=reason,
                         anchor=anchor,
                         cost_basis=cost_basis,
                         floor_price=floor_price,
+                        floor_bp=pre_cancel_floor_bp,
                         side=side,
                     )
                     await self._repo.log_event(
                         run_id,
-                        "trail_fire_aborted_anchor_floor",
+                        "trail_fire_aborted_anchor_floor" if reason == "TRAIL" else "be_sl_maker_aborted_anchor_floor" if reason in BE_SL_EXIT_REASONS else "survival_profit_lock_aborted_anchor_floor",
                         {
+                            "reason": reason,
                             "anchor": anchor,
                             "cost_basis": cost_basis,
                             "floor_price": floor_price,
+                            "floor_bp": pre_cancel_floor_bp,
                             "side": side,
                         },
                     )
@@ -7156,7 +22885,7 @@ class MainnetOneRunManager:
             except Exception as exc:  # noqa: BLE001
                 # Gate is best-effort: if the book/position fetch fails, the
                 # trigger's mark-based floor already passed, so proceed.
-                logger.warning("trail_anchor_gate_check_failed", run_id=run_id, error=str(exc)[:200])
+                logger.warning("close_anchor_profit_floor_check_failed", run_id=run_id, reason=reason, error=str(exc)[:200])
         # Cancel any pre-placed DCA limit on EVERY exit path.  A resting GTC/GTX
         # DCA can otherwise fill DURING the close and re-open a position nobody
         # manages — run cry3mn_1781063317906 exited via TRAIL while its DCA
@@ -7168,37 +22897,195 @@ class MainnetOneRunManager:
                 await self._client.cancel_order(symbol, dca_oid)
             except Exception:  # noqa: BLE001 — already gone / filled is fine
                 pass
+        qty_str = await self._client.format_quantity(symbol, qty)
+        if await self._maybe_codex_v1443_near_flat_maker_scratch(symbol, side, qty_str, reason, run):
+            return True
+
+        maker_only_reasons = {"CODEX_V1427_TIME_LOCK", "CODEX_V1437_STUPS_THIN_LOCK", "CODEX_V1438_STUPS_THIN_LOCK", "CODEX_V1448_STUPS_FAST_SCALP_LOCK", "CODEX_V1439_SHADOW_THIN_LOCK", "CODEX_V1441_MIXED_THIN_LOCK", "CODEX_V1444_CNL_WPR_DEEP_TRAIL_LOCK", "CODEX_FULL_TP_TOUCH_LOCK", "CODEX_MAX_HOLD_PROFIT_LOCK", "CODEX_STUPS_FAST_FLOOR_LOCK"}
+        maker_only_enabled = False
+        if reason == "CODEX_V1427_TIME_LOCK":
+            maker_only_enabled = bool(getattr(self._settings, "mainnet_codex_v1427_time_lock_maker_only_enabled", True))
+            ttl_setting = "mainnet_codex_v1427_time_lock_maker_ttl_seconds"
+            adverse_setting = "mainnet_codex_v1427_time_lock_adverse_break_bp"
+            fallback_ttl = getattr(self._settings, "mainnet_codex_survival_exit_maker_ttl_seconds", 5)
+        elif reason == "CODEX_V1437_STUPS_THIN_LOCK":
+            maker_only_enabled = bool(getattr(self._settings, "mainnet_codex_v1437_stups_clean_extension_thin_lock_enabled", True))
+            ttl_setting = "mainnet_codex_v1437_stups_clean_extension_thin_lock_maker_ttl_seconds"
+            adverse_setting = "mainnet_codex_v1437_stups_clean_extension_thin_lock_adverse_break_bp"
+            fallback_ttl = getattr(self._settings, "mainnet_codex_survival_exit_maker_ttl_seconds", 5)
+        elif reason == "CODEX_V1438_STUPS_THIN_LOCK":
+            maker_only_enabled = bool(getattr(self._settings, "mainnet_codex_v1438_stups_thin_lock_enabled", True))
+            ttl_setting = "mainnet_codex_v1438_stups_thin_lock_maker_ttl_seconds"
+            adverse_setting = "mainnet_codex_v1438_stups_thin_lock_adverse_break_bp"
+            fallback_ttl = getattr(self._settings, "mainnet_codex_survival_exit_maker_ttl_seconds", 5)
+        elif reason == "CODEX_V1448_STUPS_FAST_SCALP_LOCK":
+            maker_only_enabled = bool(getattr(self._settings, "mainnet_codex_v1448_stups_clean_extension_fast_scalp_enabled", True))
+            ttl_setting = "mainnet_codex_v1448_stups_clean_extension_fast_scalp_maker_ttl_seconds"
+            adverse_setting = "mainnet_codex_v1448_stups_clean_extension_fast_scalp_adverse_break_bp"
+            fallback_ttl = getattr(self._settings, "mainnet_codex_survival_exit_maker_ttl_seconds", 5)
+        elif reason == "CODEX_V1439_SHADOW_THIN_LOCK":
+            maker_only_enabled = bool(getattr(self._settings, "mainnet_codex_v1439_stups_shadow_thin_lock_enabled", True))
+            ttl_setting = "mainnet_codex_v1439_stups_shadow_thin_lock_maker_ttl_seconds"
+            adverse_setting = "mainnet_codex_v1439_stups_shadow_thin_lock_adverse_break_bp"
+            fallback_ttl = getattr(self._settings, "mainnet_codex_survival_exit_maker_ttl_seconds", 5)
+        elif reason == "CODEX_V1441_MIXED_THIN_LOCK":
+            maker_only_enabled = bool(getattr(self._settings, "mainnet_codex_v1441_mixed_thin_lock_enabled", True))
+            ttl_setting = "mainnet_codex_v1441_mixed_thin_lock_maker_ttl_seconds"
+            adverse_setting = "mainnet_codex_v1441_mixed_thin_lock_adverse_break_bp"
+            fallback_ttl = getattr(self._settings, "mainnet_codex_survival_exit_maker_ttl_seconds", 5)
+        elif reason == "CODEX_V1444_CNL_WPR_DEEP_TRAIL_LOCK":
+            maker_only_enabled = bool(getattr(self._settings, "mainnet_codex_v1444_cnl_wpr_deep_trail_lock_enabled", True))
+            ttl_setting = "mainnet_codex_v1444_cnl_wpr_deep_trail_maker_ttl_seconds"
+            adverse_setting = "mainnet_codex_v1444_cnl_wpr_deep_trail_adverse_break_bp"
+            fallback_ttl = getattr(self._settings, "mainnet_codex_survival_exit_maker_ttl_seconds", 5)
+        elif reason == "CODEX_FULL_TP_TOUCH_LOCK":
+            maker_only_enabled = bool(getattr(self._settings, "mainnet_codex_full_tp_touch_maker_only_enabled", True))
+            ttl_setting = "mainnet_codex_full_tp_touch_maker_ttl_seconds"
+            adverse_setting = "mainnet_codex_full_tp_touch_adverse_break_bp"
+            fallback_ttl = getattr(self._settings, "mainnet_codex_survival_exit_maker_ttl_seconds", 5)
+        elif reason == "CODEX_MAX_HOLD_PROFIT_LOCK":
+            maker_only_enabled = bool(getattr(self._settings, "mainnet_codex_max_hold_profit_maker_only_enabled", True))
+            ttl_setting = "mainnet_codex_max_hold_profit_maker_ttl_seconds"
+            adverse_setting = "mainnet_codex_max_hold_profit_adverse_break_bp"
+            fallback_ttl = getattr(self._settings, "mainnet_codex_survival_exit_maker_ttl_seconds", 5)
+        elif reason == "CODEX_STUPS_FAST_FLOOR_LOCK":
+            maker_only_enabled = bool(getattr(self._settings, "mainnet_codex_v1434_stups_fast_floor_maker_only_enabled", True))
+            ttl_setting = "mainnet_codex_v1434_stups_fast_floor_maker_ttl_seconds"
+            adverse_setting = "mainnet_codex_v1434_stups_fast_floor_adverse_break_bp"
+            fallback_ttl = getattr(self._settings, "mainnet_codex_survival_exit_maker_ttl_seconds", 5)
+        else:
+            ttl_setting = "mainnet_codex_survival_exit_maker_ttl_seconds"
+            adverse_setting = "mainnet_codex_survival_exit_adverse_break_bp"
+            fallback_ttl = getattr(self._settings, "mainnet_codex_survival_exit_maker_ttl_seconds", 5)
+        maker_only_close = (
+            reason in maker_only_reasons
+            and bool(getattr(self._settings, "mainnet_codex_survival_exit_use_maker", False))
+            and maker_only_enabled
+        )
+        if maker_only_close:
+            maker_ttl = max(0, int(getattr(self._settings, ttl_setting, fallback_ttl) or 0))
+            profit_floor_bp = self._survival_maker_profit_floor_bp(reason, run)
+            adverse_break_bp = float(
+                getattr(
+                    self._settings,
+                    adverse_setting,
+                    getattr(self._settings, "mainnet_codex_survival_exit_adverse_break_bp", 1.5),
+                )
+                or 0.0
+            )
+            if await self._try_trail_maker_exit(
+                symbol,
+                side,
+                qty_str,
+                run,
+                reason=reason,
+                ttl_seconds=maker_ttl,
+                enforce_profit_floor=profit_floor_bp is not None,
+                profit_floor_bp=profit_floor_bp,
+                adverse_break_bp=adverse_break_bp,
+                fallback_market_on_failure=False,
+            ):
+                await self._cancel_take_profit_orders(symbol, run_id)
+                await self._cancel_stop_loss_order(symbol, run_id)
+                return True
+            deferred_event = (
+                "time_lock_maker_only_deferred"
+                if reason == "CODEX_V1427_TIME_LOCK"
+                else "full_tp_touch_maker_only_deferred"
+                if reason == "CODEX_FULL_TP_TOUCH_LOCK"
+                else "max_hold_profit_maker_only_deferred"
+                if reason == "CODEX_MAX_HOLD_PROFIT_LOCK"
+                else "stups_thin_lock_maker_only_deferred"
+                if reason == "CODEX_V1437_STUPS_THIN_LOCK"
+                else "stups_v1438_thin_lock_maker_only_deferred"
+                if reason == "CODEX_V1438_STUPS_THIN_LOCK"
+                else "stups_v1448_fast_scalp_maker_only_deferred"
+                if reason == "CODEX_V1448_STUPS_FAST_SCALP_LOCK"
+                else "stups_v1439_shadow_thin_lock_maker_only_deferred"
+                if reason == "CODEX_V1439_SHADOW_THIN_LOCK"
+                else "stups_v1441_mixed_thin_lock_maker_only_deferred"
+                if reason == "CODEX_V1441_MIXED_THIN_LOCK"
+                else "cnl_wpr_deep_trail_maker_only_deferred" if reason == "CODEX_V1444_CNL_WPR_DEEP_TRAIL_LOCK" else "stups_fast_floor_maker_only_deferred"
+            )
+            await self._repo.log_event(
+                run_id,
+                deferred_event,
+                {
+                    "reason": reason,
+                    "ttl_seconds": maker_ttl,
+                    "profit_floor_bp": profit_floor_bp,
+                    "adverse_break_bp": adverse_break_bp,
+                },
+            )
+            return False
+
         # For TRAIL exits, keep TP orders alive so a price bounce back to the TP
         # level can still capture profit while the maker reprice loop is running.
         # SL / ADVERSE / MAX_HOLD cancel everything first (hard close path).
         if reason != "TRAIL":
             await self._cancel_take_profit_orders(symbol, run_id)
         await self._cancel_stop_loss_order(symbol, run_id)
-        qty_str = await self._client.format_quantity(symbol, qty)
 
         # Maker-first exits are allowed only for timed/profit-lock software
         # exits. Emergency stop-style exits still go straight to market.
-        survival_maker_reasons = {"CODEX_MICRO_TRAIL", "CODEX_EARLY_FAIL", "CODEX_DAMAGE_CONTROL", "CNL_WPR_SCRATCH", "CNL_WPR_DAMAGE_CONTROL"}
+        survival_maker_reasons = {"CODEX_MICRO_TRAIL", "CODEX_EARLY_FAIL", "CODEX_DAMAGE_CONTROL", "CODEX_V1427_TIME_LOCK", "CODEX_V1429_SIDE_OVERRIDE_FAST_LOCK", "CODEX_V1437_STUPS_THIN_LOCK", "CODEX_V1438_STUPS_THIN_LOCK", "CODEX_V1448_STUPS_FAST_SCALP_LOCK", "CODEX_V1439_SHADOW_THIN_LOCK", "CODEX_V1441_MIXED_THIN_LOCK", "CODEX_V1444_CNL_WPR_DEEP_TRAIL_LOCK", "CODEX_FULL_TP_TOUCH_LOCK", "CODEX_MAX_HOLD_PROFIT_LOCK", "CODEX_STUPS_FAST_FLOOR_LOCK", "CODEX_V1443_STUPS_CLEAN_EXTENSION_REVERSAL_SCRATCH", "CNL_WPR_SCRATCH", "CNL_WPR_DAMAGE_CONTROL", "CNL_WPR_PROFIT_LOCK", "STUPS_TIME_PROFIT_LOCK", "STUPS_STALL_PROFIT_LOCK", *BE_SL_EXIT_REASONS}
         no_bounce_maker_reason = "w6a_no_bounce_soft_exit_v2"
         no_bounce_reasons = {no_bounce_maker_reason, "w6a_no_bounce_market_fallback"}
         use_maker_exit = (
             reason == "TRAIL" and self._settings.mainnet_trail_exit_use_maker
         ) or (
+            reason in BE_SL_EXIT_REASONS
+            and bool(getattr(self._settings, "mainnet_codex_be_maker_first_enabled", True))
+        ) or (
             reason in survival_maker_reasons
+            and reason not in BE_SL_EXIT_REASONS
             and self._settings.mainnet_codex_survival_exit_use_maker
         ) or (
             reason == no_bounce_maker_reason
             and getattr(self._settings, "mainnet_codex_v137_w6a_no_bounce_exit_live", True)
         )
         if use_maker_exit:
-            if reason in survival_maker_reasons:
+            if reason in BE_SL_EXIT_REASONS:
+                maker_ttl = max(0, int(getattr(self._settings, "mainnet_codex_be_maker_ttl_seconds", 2) or 2))
+            elif reason == "CODEX_V1448_STUPS_FAST_SCALP_LOCK":
+                maker_ttl = max(
+                    0,
+                    int(getattr(self._settings, "mainnet_codex_v1448_stups_clean_extension_fast_scalp_maker_ttl_seconds", 8) or 8),
+                )
+            elif reason == "CODEX_V1443_STUPS_CLEAN_EXTENSION_REVERSAL_SCRATCH":
+                maker_ttl = max(
+                    0,
+                    int(getattr(self._settings, "mainnet_codex_v1443_stups_clean_extension_reversal_maker_ttl_seconds", 3) or 3),
+                )
+            elif reason in survival_maker_reasons:
                 maker_ttl = self._settings.mainnet_codex_survival_exit_maker_ttl_seconds
             elif reason == no_bounce_maker_reason:
                 maker_ttl = getattr(self._settings, "mainnet_codex_v137_w6a_no_bounce_maker_ttl_seconds", 5)
             else:
                 maker_ttl = None
-            enforce_profit_floor = reason in {"TRAIL", "CODEX_MICRO_TRAIL"}
-            if reason in survival_maker_reasons or reason == no_bounce_maker_reason:
+            profit_floor_bp = self._survival_maker_profit_floor_bp(reason, run)
+            enforce_profit_floor = profit_floor_bp is not None
+            if reason in BE_SL_EXIT_REASONS:
+                adverse_break_bp = float(getattr(self._settings, "mainnet_codex_be_maker_adverse_break_bp", 1.0) or 1.0)
+            elif reason == "CODEX_V1448_STUPS_FAST_SCALP_LOCK":
+                adverse_break_bp = float(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v1448_stups_clean_extension_fast_scalp_adverse_break_bp",
+                        self._settings.mainnet_codex_survival_exit_adverse_break_bp,
+                    )
+                    or 0.0
+                )
+            elif reason == "CODEX_V1443_STUPS_CLEAN_EXTENSION_REVERSAL_SCRATCH":
+                adverse_break_bp = float(
+                    getattr(
+                        self._settings,
+                        "mainnet_codex_v1443_stups_clean_extension_reversal_adverse_break_bp",
+                        self._settings.mainnet_codex_survival_exit_adverse_break_bp,
+                    )
+                    or 0.0
+                )
+            elif reason in survival_maker_reasons or reason == no_bounce_maker_reason:
                 adverse_break_bp = self._settings.mainnet_codex_survival_exit_adverse_break_bp
             else:
                 adverse_break_bp = None
@@ -7210,6 +23097,7 @@ class MainnetOneRunManager:
                 reason=reason,
                 ttl_seconds=maker_ttl,
                 enforce_profit_floor=enforce_profit_floor,
+                profit_floor_bp=profit_floor_bp,
                 adverse_break_bp=adverse_break_bp,
             ):
                 return True
@@ -7273,9 +23161,11 @@ class MainnetOneRunManager:
         reason: str = "TRAIL",
         ttl_seconds: int | None = None,
         enforce_profit_floor: bool = True,
+        profit_floor_bp: float | None = None,
         adverse_break_bp: float | None = None,
+        fallback_market_on_failure: bool = True,
     ) -> bool:
-        """Lock a trailing/survival exit at maker fee, falling back to market on timeout.
+        """Lock a trailing/survival exit at maker fee, optionally deferring on timeout.
 
         Places a reduce-only POST_ONLY limit at the passive top-of-book and,
         for up to mainnet_trail_exit_maker_ttl_seconds, re-prices it every
@@ -7284,15 +23174,21 @@ class MainnetOneRunManager:
         because the single static quote never re-anchored after the bid moved).
         Returns True if the position went flat (maker filled — 0 fee).  On
         timeout or placement rejection, cancels the resting order and returns
-        False so the caller market-closes whatever remains (reduce_only caps
-        the qty, so a partial maker fill is handled safely). Profit-floor
+        False. Callers that pass fallback_market_on_failure=False keep the
+        protective TP/SL path armed and retry in the next manage cycle. Profit-floor
         enforcement stays on for profit-lock exits, but is disabled for damage
         control exits that are already intentionally accepting a small loss.
         """
         run_id = run["run_id"]
         is_no_bounce_exit = reason == "w6a_no_bounce_soft_exit_v2"
-        client_order_id = f"{run_id}_no_bounce" if is_no_bounce_exit else f"{run_id}_trail"
-        is_survival_exit = reason.startswith("CODEX_") or reason in {"CNL_WPR_SCRATCH", "CNL_WPR_DAMAGE_CONTROL"}
+        is_be_sl_exit = reason in BE_SL_EXIT_REASONS
+        if is_no_bounce_exit:
+            client_order_id = f"{run_id}_no_bounce"
+        elif is_be_sl_exit:
+            client_order_id = f"{run_id}_be"
+        else:
+            client_order_id = f"{run_id}_trail"
+        is_survival_exit = reason.startswith("CODEX_") or reason in {"CNL_WPR_SCRATCH", "CNL_WPR_DAMAGE_CONTROL", "CNL_WPR_PROFIT_LOCK", "STUPS_TIME_PROFIT_LOCK", "STUPS_STALL_PROFIT_LOCK"} or is_be_sl_exit
 
         async def _log_survival_fallback(fallback_reason: str, details: dict | None = None) -> None:
             if not is_survival_exit:
@@ -7300,7 +23196,8 @@ class MainnetOneRunManager:
             payload = {"reason": reason, "fallback_reason": fallback_reason}
             if details:
                 payload.update(details)
-            await self._repo.log_event(run_id, "survival_maker_fallback_market", payload)
+            event_type = "survival_maker_fallback_market" if fallback_market_on_failure else "survival_maker_deferred"
+            await self._repo.log_event(run_id, event_type, payload)
 
         async def _log_no_bounce_fallback(fallback_reason: str, details: dict | None = None) -> None:
             if not is_no_bounce_exit:
@@ -7378,7 +23275,11 @@ class MainnetOneRunManager:
 
         floor_price: float | None = None
         if enforce_profit_floor:
-            floor_bp = self._settings.mainnet_trail_profit_floor_bp
+            try:
+                floor_bp = float(profit_floor_bp) if profit_floor_bp is not None else float(self._settings.mainnet_trail_profit_floor_bp)
+            except (TypeError, ValueError):
+                floor_bp = float(self._settings.mainnet_trail_profit_floor_bp)
+            floor_bp = max(0.0, floor_bp)
             floor_price = (
                 cost_basis * (1 + floor_bp / 10_000)
                 if side == "SELL"
@@ -7435,6 +23336,7 @@ class MainnetOneRunManager:
                     "adverse_break_bp": adverse_break_bp,
                     "adverse_break_base_bp": adverse_break_base_bp,
                     "enforce_profit_floor": enforce_profit_floor,
+                    "profit_floor_bp": profit_floor_bp,
                 },
             )
         order = await _place(anchor)
@@ -7608,7 +23510,8 @@ class MainnetOneRunManager:
                     )
         # TTL elapsed without a full fill — cancel the resting maker order and
         # let the caller market-close the remainder (reduce_only caps the qty).
-        logger.info("trail_maker_timeout_fallback_market", run_id=run_id, ttl_seconds=ttl)
+        timeout_event = "trail_maker_timeout_fallback_market" if fallback_market_on_failure else "trail_maker_timeout_deferred"
+        logger.info(timeout_event, run_id=run_id, ttl_seconds=ttl)
         await self._repo.log_event(run_id, "trail_maker_timeout", {"ttl_seconds": ttl, "reason": reason})
         await _log_survival_fallback("timeout", {"ttl_seconds": ttl})
         await _log_no_bounce_fallback("timeout", {"ttl_seconds": ttl})
@@ -7637,6 +23540,7 @@ class MainnetOneRunManager:
                 side=side,
                 quantity=qty_str,
                 stop_price=sl_price,
+                client_order_id=f"{run_id}_sl",
             )
         except BinanceAPIException as exc:
             logger.warning("sl_stop_market_place_failed_fallback_market", run_id=run_id, error=str(exc)[:200])
@@ -7651,7 +23555,7 @@ class MainnetOneRunManager:
             )
             return
 
-        await self._repo.log_event(run_id, "sl_placed", {"order": order, "sl_price": sl_price})
+        await self._repo.log_event(run_id, "sl_placed", {"order": order, "sl_price": sl_price, "reason": reason})
         codex_note = self._codex_v1_telegram_note(run)
         await self._notify(
             f"🛑 <b>Stop-Loss 已掛</b>\n"
@@ -7712,6 +23616,26 @@ class MainnetOneRunManager:
         # Also sweep the STOP_MARKET SL, which is an algo order on a separate endpoint.
         await self._cancel_stop_loss_order(symbol, run_id)
 
+    async def _sync_fill_v1_events(self, run: dict, trigger: str) -> int:
+        """Persist newly observed exchange fills without affecting run control."""
+        try:
+            count = await emit_fill_v1_events(
+                repo=self._repo, client=self._client, trade_repo=self._trade_repo, run=run
+            )
+        except Exception as exc:  # noqa: BLE001 - telemetry cannot block trading
+            logger.warning(
+                "fill_v1_emit_failed",
+                run_id=run.get("run_id"),
+                trigger=trigger,
+                error=str(exc)[:200],
+            )
+            return 0
+        if count:
+            logger.info(
+                "fill_v1_synced", run_id=run.get("run_id"), trigger=trigger, emitted=count
+            )
+        return count
+
     async def _finish_flat_run(self, run: dict, reason: str) -> None:
         # Cancel all residual orders (SL STOP_MARKET, TP, etc.) for this run.
         # Use the broad sweep (_cancel_all_run_orders) first so we never leave
@@ -7731,8 +23655,11 @@ class MainnetOneRunManager:
         if watch_task is not None and not watch_task.done():
             watch_task.cancel()
         self._trail_exiting.discard(run["run_id"])
+        self._stups_fast_floor_lock_attempted.discard(run["run_id"])
+        self._stups_tp1_floor_lock_attempted.discard(run["run_id"])
         self._w6a_no_bounce_exiting.discard(run["run_id"])
         self._w6a_price_history.pop(run["run_id"], None)
+        self._codex_time_lock_price_history.pop(run["run_id"], None)
         self._w6a_stop_tightened_runs.pop(run["run_id"], None)
         self._tp1_audit_recorded.discard(run["run_id"])
         self._w6a_post_tp_probe_recorded = {
@@ -7756,13 +23683,14 @@ class MainnetOneRunManager:
         self._dca_guard_blocked_runs.discard(run["run_id"])
         self._dca_guard_blocked_notified.discard(run["run_id"])
         self._dca_drift_event_keys = {k for k in self._dca_drift_event_keys if k[0] != run["run_id"]}
+        self._recovery_skip_event_keys = {k for k in self._recovery_skip_event_keys if k[0] != run["run_id"]}
+        await self._sync_fill_v1_events(run, "terminalization")
         summary = await self._build_run_summary(run)
         terminal_candles: list[Candle] = []
         try:
             terminal_candles = await self._load_candles(run["symbol"])
         except Exception as exc:  # noqa: BLE001 - terminalization is audit-only
             logger.warning("codex_v133_tp_terminalization_candles_failed", run_id=run["run_id"], error=str(exc)[:200])
-        await self._terminalize_codex_v132_tp_policy_samples(run, summary, terminal_candles)
         # Determine exit_reason.  Priority:
         #   1. Explicit reason already written by _close_position (SL/TRAIL/ADVERSE_EXIT/MAX_HOLD_*)
         #   2. If flat_detected (exchange-side close we didn't initiate), check algo
@@ -7775,13 +23703,81 @@ class MainnetOneRunManager:
             exit_reason = reason
         else:
             inferred = summary["exit_reason"]
-            if summary["realized_pnl_usdc"] < -1e-6:
+            stop_loss_reason = None
+            try:
+                signal = json.loads(str(run.get("signal_json") or "{}"))
+                stop_loss_reason = str(signal.get("stop_loss_reason") or "") if isinstance(signal, Mapping) else None
+            except (TypeError, json.JSONDecodeError):
+                stop_loss_reason = None
+            if inferred == "TP":
+                exit_reason = "TP"
+            elif stop_loss_reason in BE_SL_EXIT_REASONS:
+                exit_reason = stop_loss_reason
+            elif summary["realized_pnl_usdc"] < -1e-6:
                 # flat_detected with a loss is almost always a STOP_MARKET fill
                 # (algo order, clientOrderId mismatch) that _infer_flat_exit_reason
                 # can't see. Override to SL regardless of inferred value.
                 exit_reason = "SL"
             else:
                 exit_reason = inferred or reason
+
+        reconciliation_result = await self._v1459_reconcile_terminal_run(run)
+        reconciliation = None
+        reconciliation_blocked = False
+        funding_usdc = 0.0
+        if reconciliation_result is not None:
+            reconciliation = reconciliation_result.reconciliation
+            if reconciliation_result.continue_live and reconciliation is not None:
+                if (
+                    reconciliation.reconciliation_status == "COMPLETE"
+                    and reconciliation.eligible_for_wr_ev
+                    and reconciliation.gross_realized_pnl_usdc is not None
+                    and reconciliation.commission_usdc is not None
+                    and reconciliation.funding_usdc is not None
+                    and reconciliation.net_pnl_usdc is not None
+                ):
+                    summary["realized_pnl_usdc"] = float(
+                        reconciliation.gross_realized_pnl_usdc
+                    )
+                    summary["commission_usdc"] = float(
+                        reconciliation.commission_usdc
+                    )
+                    funding_usdc = float(reconciliation.funding_usdc)
+                else:
+                    reconciliation_result = self._v1459_reconciliation_hook.fail_closed(
+                        status="INVALID_COMPLETE_RECONCILIATION",
+                        reason="ineligible_or_missing_financial_totals",
+                    )
+            elif reconciliation_result.continue_live and reconciliation_result.status != "DISABLED":
+                reconciliation_result = self._v1459_reconciliation_hook.fail_closed(
+                    status="INVALID_RECONCILIATION_RESULT",
+                    reason="missing_reconciliation_payload",
+                )
+            reconciliation_blocked = not reconciliation_result.continue_live
+
+        summary["funding_usdc"] = funding_usdc
+        if reconciliation_blocked:
+            await self._drop_codex_v132_tp_policy_samples(
+                str(run.get("run_id") or ""),
+                "v1459_reconciliation_incomplete",
+            )
+        else:
+            try:
+                await self._terminalize_codex_v132_tp_policy_samples(
+                    run, summary, terminal_candles
+                )
+            except Exception as exc:  # noqa: BLE001 - flat-run completion first
+                self._v132_terminal_reconcile_needed = True
+                logger.warning(
+                    "codex_v132_flat_terminalization_failed",
+                    run_id=run.get("run_id"),
+                    error=str(exc)[:200],
+                )
+        _net_pnl = (
+            float(summary["realized_pnl_usdc"])
+            - float(summary["commission_usdc"])
+            - funding_usdc
+        )
         await self._repo.update_run(
             run["run_id"],
             qty=summary["qty"],
@@ -7789,22 +23785,80 @@ class MainnetOneRunManager:
             commission_usdc=summary["commission_usdc"],
         )
         await self._repo.complete_run(run["run_id"], "COMPLETED", exit_reason)
+        completed_details = {
+            "exit_event_type": "completed",
+            "reason": exit_reason,
+            "exit_reason_final": exit_reason,
+            "total_qty": summary["qty"],
+            "gross_pnl": summary["realized_pnl_usdc"],
+            "total_commission": summary["commission_usdc"],
+            "net_pnl": _net_pnl,
+            "has_tp1": await self._repo.get_first_event_time(run["run_id"], "partial_exit") is not None,
+            "has_trail": exit_reason == "TRAIL",
+            "has_soft_exit": str(exit_reason).startswith("w6a_no_bounce"),
+        }
+        if reconciliation_result is not None:
+            completed_details.update(
+                {
+                    "funding_usdc": funding_usdc,
+                    "reconciliation_status": (
+                        reconciliation.reconciliation_status
+                        if reconciliation is not None
+                        else reconciliation_result.status
+                    ),
+                    "eligible_for_wr_ev": bool(
+                        reconciliation is not None
+                        and reconciliation.eligible_for_wr_ev
+                        and reconciliation_result.continue_live
+                    ),
+                }
+            )
         await self._repo.log_event(
             run["run_id"],
             "completed",
-            {
-                "exit_event_type": "completed",
-                "reason": exit_reason,
-                "exit_reason_final": exit_reason,
-                "total_qty": summary["qty"],
-                "gross_pnl": summary["realized_pnl_usdc"],
-                "total_commission": summary["commission_usdc"],
-                "net_pnl": float(summary["realized_pnl_usdc"]) - float(summary["commission_usdc"]),
-                "has_tp1": await self._repo.get_first_event_time(run["run_id"], "partial_exit") is not None,
-                "has_trail": exit_reason == "TRAIL",
-                "has_soft_exit": str(exit_reason).startswith("w6a_no_bounce"),
-            },
+            completed_details,
         )
+        if reconciliation_blocked:
+            if self._adaptive_session is not None:
+                self._adaptive_session["rearm_enabled"] = False
+                self._adaptive_session["stop_requested"] = True
+                self._adaptive_session["safety_halt_reason"] = (
+                    "incomplete_reconciliation"
+                )
+                counters = self._adaptive_counters()
+                if counters is not None:
+                    counters["incomplete_reconciliations"] = int(
+                        counters.get("incomplete_reconciliations") or 0
+                    ) + 1
+            await self._repo.log_event(
+                run["run_id"],
+                "v1459_reconciliation_paused",
+                {
+                    "status": reconciliation_result.status,
+                    "reason": reconciliation_result.reason,
+                    "eligible_for_wr_ev": False,
+                },
+            )
+            await self._notify(
+                "⛔ <b>v1.4.59 結算證據不完整，已停止自動 re-arm</b>\n"
+                f"Run：<code>{escape(run['run_id'])}</code>\n"
+                f"原因：<code>{escape(str(reconciliation_result.reason or reconciliation_result.status))}</code>\n"
+                "此 run 已平倉，但不計入 WR、PnL 或 EV。"
+            )
+            if self._v1460_config_selected() and self._adaptive_session is not None:
+                await self._stop_adaptive_session(
+                    run,
+                    "incomplete_reconciliation",
+                    unexpected=False,
+                )
+            return
+        if completed_details.get("eligible_for_wr_ev") is True:
+            await self._v1464_record_paid_terminal(
+                run,
+                net_pnl_usdc=_net_pnl,
+                reason=str(exit_reason),
+                terminal_at_ms=int(time.time() * 1000),
+            )
         # Loop progress: increment completed and compute position label.
         in_loop = self._loop_total > 0
         if in_loop:
@@ -7821,7 +23875,6 @@ class MainnetOneRunManager:
         # Loss is judged on NET PnL (realized − commission), not exit_reason: a
         # TRAIL that fires below cost basis is a real loss too, and tonight those
         # were the bulk of the bleed but never tripped the SL-only cooldown.
-        _net_pnl = float(summary["realized_pnl_usdc"]) - float(summary["commission_usdc"])
         _is_loss_exit = _net_pnl < 0
         if from_loop_chain and _is_loss_exit:
             self._loss_streak += 1
@@ -7845,6 +23898,12 @@ class MainnetOneRunManager:
         elif from_loop_chain and not _is_loss_exit:
             # Net win — reset the escalation.
             self._loss_streak = 0
+
+        await self._maybe_arm_codex_state_throttle_from_completed_run(
+            run,
+            _net_pnl,
+            int(time.time() * 1000),
+        )
 
         # Option A: direction consecutive-loss throttle.  Runs always (not
         # just in loops) because regime state is market-wide, not loop-scoped.
@@ -7948,6 +24007,11 @@ class MainnetOneRunManager:
             else "\n自動交易已回到待命，不會自動開下一單。"
         )
         codex_note = self._codex_v1_telegram_note(run)
+        funding_note = (
+            f"\n資金費成本：<b>${funding_usdc:.4f}</b>"
+            if reconciliation is not None
+            else ""
+        )
         await self._notify(
             f"🏁 <b>Mainnet one-run 已完成{position_label}</b>\n"
             f"Run：<code>{escape(run['run_id'])}</code>\n"
@@ -7955,10 +24019,20 @@ class MainnetOneRunManager:
             f"最大倉位：<code>{summary['qty']:.6f}</code>\n"
             f"已實現損益：<b>${summary['realized_pnl_usdc']:.4f}</b>\n"
             f"手續費：<b>${summary['commission_usdc']:.4f}</b>"
+            f"{funding_note}"
             f"{codex_note}"
             f"{standby_line}"
             f"{loop_footer}"
         )
+        if await self._adaptive_after_terminal(
+            run,
+            _net_pnl,
+            str(exit_reason),
+            gross_pnl=float(summary["realized_pnl_usdc"]),
+            commission=float(summary["commission_usdc"]),
+            funding=funding_usdc,
+        ):
+            return
         # If loop continues, auto-arm the next run.  This must happen AFTER
         # the COMPLETED notification so the user sees the prior run's
         # summary first.  The new run will be ARMED; it will wait for the
@@ -8064,6 +24138,7 @@ class MainnetOneRunManager:
         self._codex_survival_watch_notified.discard(run["run_id"])
         self._w6a_no_bounce_exiting.discard(run["run_id"])
         self._w6a_price_history.pop(run["run_id"], None)
+        self._codex_time_lock_price_history.pop(run["run_id"], None)
         self._w6a_stop_tightened_runs.pop(run["run_id"], None)
         self._tp1_audit_recorded.discard(run["run_id"])
         self._w6a_post_tp_probe_recorded = {
@@ -8075,6 +24150,21 @@ class MainnetOneRunManager:
         self._dca_guard_blocked_runs.discard(run["run_id"])
         self._dca_guard_blocked_notified.discard(run["run_id"])
         self._dca_drift_event_keys = {k for k in self._dca_drift_event_keys if k[0] != run["run_id"]}
+        self._recovery_skip_event_keys = {k for k in self._recovery_skip_event_keys if k[0] != run["run_id"]}
+        await self._sync_fill_v1_events(run, "entry_failure")
+        if self._is_adaptive_run(run):
+            counters = self._adaptive_counters()
+            if counters is not None and reason == "entry_ttl_expired":
+                counters["ttl_expired"] = int(counters.get("ttl_expired") or 0) + 1
+            await self._adaptive_after_terminal(
+                run,
+                0.0,
+                reason,
+                gross_pnl=0.0,
+                commission=0.0,
+                paid_closed_fill=False,
+            )
+            return
         if self._loop_total <= 0:
             return  # single run, nothing to chain
         self._loop_completed += 1
@@ -8139,6 +24229,23 @@ class MainnetOneRunManager:
                     "prev_run_id": prev_run_id,
                     "resume_at_ms": cooldown_until,
                 }
+                try:
+                    await self._repo.log_event(
+                        prev_run_id,
+                        LOOP_COOLDOWN_PENDING_EVENT,
+                        {
+                            **self._loop_resume,
+                            "completed": self._loop_completed,
+                            "total": self._loop_total,
+                            "loop_net_pnl": self._loop_net_pnl,
+                        },
+                    )
+                except Exception as exc:  # noqa: BLE001 - in-memory cooldown still protects this process
+                    logger.warning(
+                        "mainnet_one_run_loop_cooldown_pending_persist_failed",
+                        run_id=prev_run_id,
+                        error=str(exc)[:200],
+                    )
                 logger.info(
                     "mainnet_one_run_loop_cooldown_skip",
                     side=side,
@@ -8184,6 +24291,9 @@ class MainnetOneRunManager:
                 "maker_first": True,
                 "loop_count": self._loop_total,
                 "loop_index": next_index,
+                "loop_authority_id": self._loop_authority_id,
+                "loop_rearm_authorized": True,
+                "loop_authority_updated_ms": int(time.time() * 1000),
             }
             await self._repo.create_run(
                 {
@@ -8247,6 +24357,270 @@ class MainnetOneRunManager:
         await self._try_arm_next_loop_run(
             pending["side"], pending["strategy"], pending["prev_run_id"]
         )
+
+    @staticmethod
+    def _v1459_event_order_evidence(
+        run: Mapping[str, Any],
+        events: Sequence[Mapping[str, Any]],
+    ) -> tuple[list[dict[str, Any]], tuple[str, ...], tuple[str, ...], dict[str, str]]:
+        """Extract run-owned order evidence from rows already scoped by run_id."""
+
+        id_fields = {
+            "orderId",
+            "order_id",
+            "actualOrderId",
+            "algoId",
+            "old_order_id",
+            "new_order_id",
+            "entry_order_id",
+        }
+        client_fields = {
+            "clientOrderId",
+            "client_order_id",
+            "clientAlgoId",
+            "newClientOrderId",
+            "origClientOrderId",
+            "new_client_order_id",
+        }
+        order_records: list[dict[str, Any]] = []
+        event_order_ids: set[str] = set()
+        explicit_sl_order_ids: set[str] = set()
+        order_role_candidates: dict[str, set[str]] = {}
+        client_role_candidates: dict[str, set[str]] = {}
+
+        def identifier(value: Any) -> str | None:
+            if value is None or isinstance(value, bool):
+                return None
+            text = str(value).strip()
+            return text or None
+
+        def add_role(candidates: dict[str, set[str]], value: Any, role: str | None) -> None:
+            item_id = identifier(value)
+            if item_id is not None and role is not None:
+                candidates.setdefault(item_id, set()).add(role)
+
+        def walk(value: Any, *, explicit_sl: bool, event_role: str | None) -> None:
+            if isinstance(value, Mapping):
+                if any(key in value for key in id_fields | client_fields):
+                    order_records.append(dict(value))
+                for key, child in value.items():
+                    if key in id_fields:
+                        order_id = identifier(child)
+                        if order_id is not None:
+                            event_order_ids.add(order_id)
+                            if explicit_sl:
+                                explicit_sl_order_ids.add(order_id)
+                        add_role(order_role_candidates, child, event_role)
+                    if key in client_fields:
+                        add_role(client_role_candidates, child, event_role)
+                    walk(child, explicit_sl=explicit_sl, event_role=event_role)
+                return
+            if isinstance(value, Sequence) and not isinstance(
+                value, (str, bytes, bytearray)
+            ):
+                for child in value:
+                    walk(child, explicit_sl=explicit_sl, event_role=event_role)
+
+        entry_order_id = identifier(run.get("entry_order_id"))
+        if entry_order_id is not None:
+            event_order_ids.add(entry_order_id)
+        for event in events:
+            raw_details = event.get("details_json")
+            if isinstance(raw_details, str):
+                try:
+                    details = json.loads(raw_details)
+                except json.JSONDecodeError as exc:
+                    raise ValueError("invalid mainnet_run_events details_json") from exc
+            else:
+                details = raw_details
+            event_type = str(event.get("event_type") or "")
+            event_role = (
+                "ENTRY"
+                if event_type == "entry_placed"
+                else "EXIT"
+                if event_type in {"sl_placed", "close_submitted"}
+                else None
+            )
+            walk(
+                details,
+                explicit_sl=event_type == "sl_placed",
+                event_role=event_role,
+            )
+        for record in order_records:
+            matching_roles: set[str] = set()
+            for field in client_fields:
+                matching_roles.update(
+                    client_role_candidates.get(str(record.get(field) or "").strip(), set())
+                )
+            if len(matching_roles) != 1:
+                continue
+            for field in id_fields:
+                add_role(order_role_candidates, record.get(field), next(iter(matching_roles)))
+        event_owned_order_roles = {
+            order_id: next(iter(candidates))
+            for order_id, candidates in order_role_candidates.items()
+            if len(candidates) == 1
+        }
+        return (
+            order_records,
+            tuple(sorted(event_order_ids)),
+            tuple(sorted(explicit_sl_order_ids)),
+            event_owned_order_roles,
+        )
+
+    @staticmethod
+    def _v1459_exchange_evidence_record(raw: Any, *, endpoint: str) -> dict[str, Any]:
+        if isinstance(raw, Mapping):
+            record = dict(raw)
+        elif callable(getattr(raw, "to_dict", None)):
+            record = dict(raw.to_dict())
+        else:
+            record = asdict(raw)
+        source = dict(record.get("source") or {}) if isinstance(record.get("source"), Mapping) else {}
+        source.update(
+            {
+                "endpoint": endpoint,
+                "symbol": record.get("symbol"),
+                "time_ms": record.get("time_ms", record.get("time")),
+                "order_id": record.get("order_id", record.get("orderId")),
+            }
+        )
+        record["source"] = source
+        return record
+
+    async def _v1459_reconcile_terminal_run(self, run: Mapping[str, Any]):
+        """Collect exact paid-fill settlement only for enabled adaptive v1.4.59."""
+
+        hook = self._v1459_reconciliation_hook
+        if not self._is_adaptive_run(run) or not hook.enabled:
+            return None
+        page_limit = 1000
+        run_id = str(run.get("run_id") or "")
+        symbol = str(run.get("symbol") or "")
+        start_time = int(run.get("armed_at_ms") or 0)
+        try:
+            if not run_id or not symbol or start_time <= 0:
+                raise ValueError("missing terminal reconciliation scope")
+            orders = await self._client.get_all_orders(
+                symbol, start_time=start_time, limit=page_limit
+            )
+            trades = await self._client.get_user_trades(
+                symbol, start_time=start_time, limit=page_limit
+            )
+            events = await self._repo.get_events(run_id, limit=page_limit)
+            if len(orders) >= page_limit:
+                raise RuntimeError("allOrders page may be truncated")
+            if len(trades) >= page_limit:
+                raise RuntimeError("userTrades page may be truncated")
+            if len(events) >= page_limit:
+                raise RuntimeError("run events page may be truncated")
+
+            event_records, event_order_ids, explicit_sl_order_ids, event_owned_order_roles = (
+                self._v1459_event_order_evidence(run, events)
+            )
+            trade_records = tuple(
+                self._v1459_exchange_evidence_record(
+                    trade, endpoint="fapi_user_trades"
+                )
+                for trade in trades
+            )
+            scoped_orders = tuple(orders) + tuple(event_records)
+            preliminary = build_reconciliation_payloads(
+                run_id=run_id,
+                orders=scoped_orders,
+                trades=trade_records,
+                event_owned_order_ids=event_order_ids,
+                explicit_sl_order_ids=explicit_sl_order_ids,
+                event_owned_order_roles=event_owned_order_roles,
+            )
+            entry_payloads = tuple(
+                row for row in preliminary.persistence_trades
+                if row.get("role") == "ENTRY"
+            )
+            exit_payloads = tuple(
+                row for row in preliminary.persistence_trades
+                if row.get("role") == "EXIT"
+            )
+            income_records: tuple[dict[str, Any], ...] = ()
+            funding_start_ms = None
+            funding_end_ms = None
+            if entry_payloads and exit_payloads:
+                try:
+                    entry_times = tuple(
+                        int(row["source"]["time_ms"]) for row in entry_payloads
+                    )
+                    exit_times = tuple(
+                        int(row["source"]["time_ms"]) for row in exit_payloads
+                    )
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise ValueError("owned trade is missing exchange time") from exc
+                funding_start_ms = min(entry_times)
+                funding_end_ms = max(exit_times)
+                if funding_end_ms < funding_start_ms:
+                    raise ValueError("exit fill predates entry fill")
+                incomes = await self._client.get_income_history(
+                    income_type="FUNDING_FEE",
+                    symbol=symbol,
+                    start_time=funding_start_ms,
+                    end_time=funding_end_ms,
+                    limit=page_limit,
+                )
+                if len(incomes) >= page_limit:
+                    raise RuntimeError("income page may be truncated")
+                normalized_incomes: list[dict[str, Any]] = []
+                for income in incomes:
+                    row = self._v1459_exchange_evidence_record(
+                        income, endpoint="fapi_income_history"
+                    )
+                    income_type = str(
+                        row.get("income_type", row.get("incomeType")) or ""
+                    ).upper()
+                    income_symbol = str(row.get("symbol") or "")
+                    income_time = int(row.get("time_ms", row.get("time")) or 0)
+                    if income_type != "FUNDING_FEE":
+                        raise ValueError("income endpoint returned non-funding row")
+                    if income_symbol and income_symbol != symbol:
+                        raise ValueError("income endpoint returned foreign symbol")
+                    if not funding_start_ms <= income_time <= funding_end_ms:
+                        raise ValueError("income endpoint returned out-of-window row")
+                    row["owned"] = True
+                    normalized_incomes.append(row)
+                income_records = tuple(normalized_incomes)
+
+            payloads = build_reconciliation_payloads(
+                run_id=run_id,
+                orders=scoped_orders,
+                trades=trade_records,
+                funding_incomes=income_records,
+                event_owned_order_ids=event_order_ids,
+                explicit_sl_order_ids=explicit_sl_order_ids,
+                event_owned_order_roles=event_owned_order_roles,
+            )
+            return await hook.record(
+                **payloads.as_record_reconciliation_kwargs(),
+                run_id=run_id,
+                reconciliation_revision=0,
+                reconciled_at_ms=int(time.time() * 1000),
+                source={
+                    "collector": "v1459_live_terminal",
+                    "orders_count": len(orders),
+                    "trades_count": len(trades),
+                    "funding_count": len(income_records),
+                    "funding_start_ms": funding_start_ms,
+                    "funding_end_ms": funding_end_ms,
+                    "page_limit": page_limit,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - settlement must fail closed
+            logger.error(
+                "v1459_terminal_reconciliation_collection_failed",
+                run_id=run_id,
+                error=str(exc)[:200],
+            )
+            return hook.fail_closed(
+                status="COLLECTION_ERROR",
+                reason=f"{type(exc).__name__}:{str(exc)[:120]}",
+            )
 
     async def _build_run_summary(self, run: dict) -> dict[str, float | str | None]:
         orders, trades = await self._load_run_orders_and_trades(run)
@@ -8431,6 +24805,19 @@ class MainnetOneRunManager:
                 InlineKeyboardButton("啟動 30 runs", callback_data="mainnet:arm:30"),
             ],
             [
+                InlineKeyboardButton("啟動 50 runs", callback_data="mainnet:arm:50"),
+            ],
+            [
+                InlineKeyboardButton("Adaptive loop", callback_data="mainnet:adaptive:start"),
+                InlineKeyboardButton("Adaptive 狀態", callback_data="mainnet:adaptive:status"),
+            ],
+            [
+                InlineKeyboardButton("Adaptive review", callback_data="mainnet:adaptive:review"),
+            ],
+            [
+                InlineKeyboardButton("📊 Lane Monitor", callback_data="mainnet:lanes"),
+            ],
+            [
                 InlineKeyboardButton(n_label(v), callback_data=f"mainnet:notional:{v}")
                 for v in NOTIONAL_CHOICES
             ],
@@ -8456,8 +24843,9 @@ class MainnetOneRunManager:
                 rows = [
                     [InlineKeyboardButton("查詢 one-run 狀態", callback_data="mainnet:status")],
                     [InlineKeyboardButton("取消目前 one-run", callback_data="mainnet:cancel")],
+                    [InlineKeyboardButton("📊 Lane Monitor", callback_data="mainnet:lanes")],
                 ]
-                if self._loop_total > 0:
+                if self._loop_total > 0 or self._adaptive_session:
                     rows.append(
                         [InlineKeyboardButton("⏹ 停止 loop（不取消目前 run）", callback_data="mainnet:stop_loop")]
                     )

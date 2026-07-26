@@ -77,6 +77,14 @@ class BinanceFuturesClient:
             raise RuntimeError("Binance client not connected. Call connect() first.")
         return self._client
 
+    @property
+    def is_testnet(self) -> bool:
+        return bool(self._settings.binance_testnet)
+
+    @property
+    def exchange_endpoint(self) -> str:
+        return "https://testnet.binancefuture.com" if self.is_testnet else "https://fapi.binance.com"
+
     # ── Market Data ──────────────────────────────────────────────────
 
     @async_retry(max_attempts=3, base_delay=1.0, exceptions=(Exception,))
@@ -91,6 +99,27 @@ class BinanceFuturesClient:
     async def get_klines(self, symbol: str, interval: str = "1h", limit: int = 24) -> list[list]:
         """GET /fapi/v1/klines"""
         return await self.client.futures_klines(symbol=symbol, interval=interval, limit=limit)
+
+    @async_retry(max_attempts=3, base_delay=1.0, exceptions=(Exception,))
+    async def get_agg_trades(
+        self,
+        symbol: str,
+        *,
+        start_time: int | None = None,
+        end_time: int | None = None,
+        from_id: int | None = None,
+        limit: int = 1000,
+    ) -> list[dict]:
+        """GET /fapi/v1/aggTrades for read-only execution shadow telemetry."""
+        params: dict[str, object] = {"symbol": symbol, "limit": max(1, min(int(limit), 1000))}
+        if start_time is not None:
+            params["startTime"] = int(start_time)
+        if end_time is not None:
+            params["endTime"] = int(end_time)
+        if from_id is not None:
+            params["fromId"] = int(from_id)
+            params.pop("startTime", None)
+        return await self.client.futures_aggregate_trades(**params)
 
     @async_retry(max_attempts=3, base_delay=1.0, exceptions=(Exception,))
     async def get_mark_price(self, symbol: str) -> dict:
@@ -114,6 +143,21 @@ class BinanceFuturesClient:
         """GET /fapi/v2/account — margin balances and risk info"""
         data = await self.client.futures_account()
         return AccountInfo.from_api(data)
+
+    @async_retry(max_attempts=3, base_delay=1.0, exceptions=(Exception,))
+    async def get_position_mode(self) -> str:
+        """Read Binance dual-side mode without changing account state."""
+        payload = await self.client.futures_get_position_mode()
+        if not isinstance(payload, dict) or not isinstance(payload.get("dualSidePosition"), bool):
+            raise RuntimeError("Binance position mode response is incomplete")
+        return "HEDGE" if payload["dualSidePosition"] else "ONE_WAY"
+
+    @async_retry(max_attempts=3, base_delay=1.0, exceptions=(Exception,))
+    async def get_asset_balance(self, asset: str) -> dict | None:
+        """Return one futures margin-asset balance row."""
+        balances = await self.client.futures_account_balance()
+        target = asset.upper()
+        return next((row for row in balances if str(row.get("asset") or "").upper() == target), None)
 
     @async_retry(max_attempts=3, base_delay=1.0, exceptions=(Exception,))
     async def get_position(self, symbol: str) -> PositionInfo | None:
@@ -299,7 +343,11 @@ class BinanceFuturesClient:
             "priceProtect": "TRUE",
         }
         if client_order_id:
-            params["newClientOrderId"] = client_order_id
+            # python-binance routes conditional futures orders through the
+            # algo-order endpoint and removes ``newClientOrderId``. Supplying
+            # the native algo identifier keeps STOP_MARKET fills attributable
+            # to the owning run instead of replacing it with a random x- id.
+            params["clientAlgoId"] = client_order_id
         return await self.client.futures_create_order(**params)
 
     async def create_stop_limit_sl_order(

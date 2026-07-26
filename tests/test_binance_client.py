@@ -28,6 +28,9 @@ class FakeAsyncBinanceClient:
         self.cancel_params = params
         return {"status": "CANCELED", **params}
 
+    async def futures_get_position_mode(self):
+        return {"dualSidePosition": False}
+
 
 @pytest.mark.asyncio
 async def test_conditional_close_order_uses_quantity_reduce_only_and_tick_price():
@@ -54,6 +57,26 @@ async def test_conditional_close_order_uses_quantity_reduce_only_and_tick_price(
 
 
 @pytest.mark.asyncio
+async def test_stop_market_sl_preserves_explicit_client_algo_id():
+    client = BinanceFuturesClient(
+        Settings(binance_api_key="key", binance_api_secret="secret")
+    )
+    fake = FakeAsyncBinanceClient()
+    client._client = fake
+
+    await client.create_stop_market_sl_order(
+        symbol="ETHUSDC",
+        side="SELL",
+        stop_price=2070.12345,
+        quantity="0.069",
+        client_order_id="cry3mn_exact_sl",
+    )
+
+    assert fake.order_params["clientAlgoId"] == "cry3mn_exact_sl"
+    assert "newClientOrderId" not in fake.order_params
+
+
+@pytest.mark.asyncio
 async def test_cancel_algo_order_treats_unknown_order_as_already_closed():
     class UnknownOrderClient(FakeAsyncBinanceClient):
         async def futures_cancel_algo_order(self, **params):
@@ -69,6 +92,21 @@ async def test_cancel_algo_order_treats_unknown_order_as_already_closed():
 
     assert fake.cancel_params == {"symbol": "ETHUSDC", "algoId": 123}
     assert result["status"] == "ALREADY_CLOSED"
+
+
+@pytest.mark.asyncio
+async def test_read_only_runtime_identity_properties_and_position_mode():
+    mainnet = BinanceFuturesClient(
+        Settings(binance_api_key="key", binance_api_secret="secret", binance_testnet=False)
+    )
+    mainnet._client = FakeAsyncBinanceClient()
+    assert mainnet.is_testnet is False
+    assert mainnet.exchange_endpoint == "https://fapi.binance.com"
+    assert await mainnet.get_position_mode() == "ONE_WAY"
+
+    testnet = BinanceFuturesClient(Settings(binance_testnet=True))
+    assert testnet.is_testnet is True
+    assert testnet.exchange_endpoint == "https://testnet.binancefuture.com"
 
 
 @pytest.mark.asyncio
