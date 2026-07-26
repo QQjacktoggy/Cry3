@@ -798,6 +798,68 @@ class V1469ArmObservationRepository:
                     await self._db.conn.rollback()
                 raise
 
+    async def load_observation_bundle(
+        self,
+        opportunity_id: str,
+    ) -> dict[str, Any] | None:
+        """Load the exact durable opportunity and its ordered candidates."""
+
+        durable_id = str(opportunity_id or "").strip()
+        if not durable_id:
+            raise ValueError("opportunity_id must be non-empty")
+        async with self._write_lock:
+            opportunity = await self._db.fetchone(
+                """SELECT * FROM v1469_market_opportunities
+                WHERE opportunity_id = ?""",
+                (durable_id,),
+            )
+            if opportunity is None:
+                return None
+            candidates = await self._db.fetchall(
+                """SELECT * FROM v1469_lane_candidates
+                WHERE opportunity_id = ?
+                ORDER BY
+                    CASE WHEN selection_rank IS NULL THEN 1 ELSE 0 END,
+                    selection_rank,
+                    candidate_id""",
+                (durable_id,),
+            )
+
+        raw_snapshot = opportunity.pop("feature_snapshot_json", None)
+        try:
+            feature_snapshot = json.loads(str(raw_snapshot))
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ArmObservationPersistenceError(
+                "durable feature_snapshot_json is invalid"
+            ) from exc
+        if not isinstance(feature_snapshot, Mapping):
+            raise ArmObservationPersistenceError(
+                "durable feature snapshot must be an object"
+            )
+        opportunity["feature_snapshot"] = dict(feature_snapshot)
+
+        decoded_candidates: list[dict[str, Any]] = []
+        for candidate in candidates:
+            raw_annotations = candidate.pop("annotations_json", None)
+            try:
+                annotations = json.loads(str(raw_annotations))
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise ArmObservationPersistenceError(
+                    "durable candidate annotations_json is invalid"
+                ) from exc
+            if not isinstance(annotations, Mapping):
+                raise ArmObservationPersistenceError(
+                    "durable candidate annotations must be an object"
+                )
+            candidate["annotations"] = dict(annotations)
+            candidate["is_selected"] = bool(candidate["is_selected"])
+            candidate["data_complete"] = bool(candidate["data_complete"])
+            decoded_candidates.append(candidate)
+        return {
+            "opportunity": opportunity,
+            "candidates": tuple(decoded_candidates),
+        }
+
     async def append_evidence(self, payload: Mapping[str, Any]) -> bool:
         """Append one pending arm evaluation; exact retries are no-ops."""
 
@@ -812,6 +874,10 @@ class V1469ArmObservationRepository:
                 payload, "execution_profile_hash"
             ),
         }
+        if profile["execution_profile_id"] == "LEGACY_CONTROL":
+            raise ValueError(
+                "LEGACY_CONTROL requires append_evidence_bundle sidecar"
+            )
         source_type = _enum(payload, "source_type", _SOURCE_TYPES)
         observed = _integer(payload, "observed_at_ms")
         created = _integer(payload, "created_at_ms", minimum=observed)
@@ -1104,6 +1170,28 @@ class V1469ArmObservationRepository:
                             )
                         continue
                     seen[row["evidence_id"]] = row
+
+                    if row["execution_profile_id"] == "LEGACY_CONTROL":
+                        existing_legacy = await self._db.fetchone(
+                            """SELECT evidence_id, execution_profile_hash
+                            FROM v1469_arm_evidence
+                            WHERE candidate_id = ?
+                              AND execution_profile_id = 'LEGACY_CONTROL'
+                              AND source_type = ?""",
+                            (
+                                row["candidate_id"],
+                                row["source_type"],
+                            ),
+                        )
+                        if (
+                            existing_legacy is not None
+                            and existing_legacy["evidence_id"]
+                            != row["evidence_id"]
+                        ):
+                            raise ArmEvidenceConflictError(
+                                "candidate already has a different "
+                                "LEGACY_CONTROL evidence snapshot"
+                            )
 
                     existing = await self._db.fetchone(
                         """SELECT * FROM v1469_arm_evidence
@@ -1437,6 +1525,7 @@ class V1469ArmObservationRepository:
                 e.evidence_id, e.opportunity_id, e.candidate_id, e.arm_key,
                 e.execution_profile_id, e.execution_profile_schema,
                 e.execution_profile_hash, e.source_type,
+                p.canonical_payload_json AS execution_profile_payload_json,
                 e.diagnostic_only, e.observed_at_ms, e.status,
                 e.terminal_at_ms, e.outcome, e.fill_status,
                 e.data_complete, e.ambiguous, e.reward_net_bp,
@@ -1444,12 +1533,15 @@ class V1469ArmObservationRepository:
                 e.terminal_payload_json, e.evidence_hash,
                 c.lane_code, c.effective_side, c.strategy,
                 c.safety_status AS candidate_status,
-                o.coarse_regime, o.feature_at_ms, o.data_quality
+                o.coarse_regime, o.feature_at_ms, o.data_quality,
+                o.feature_snapshot_json
             FROM v1469_arm_evidence e
             JOIN v1469_lane_candidates c
               ON c.candidate_id = e.candidate_id
             JOIN v1469_market_opportunities o
               ON o.opportunity_id = e.opportunity_id
+            LEFT JOIN v1469_arm_evidence_profile_payloads p
+              ON p.evidence_id = e.evidence_id
             WHERE e.source_type = 'SHADOW'
               AND e.status IN ('TERMINAL', 'DROPPED')
               AND o.environment = ? AND o.symbol = ?
@@ -1467,6 +1559,17 @@ class V1469ArmObservationRepository:
         )
         scope_complete = len(rows) <= bounded_limit
         visible = rows[:bounded_limit]
+        for row in visible:
+            raw_snapshot = row.pop("feature_snapshot_json", "{}")
+            try:
+                snapshot = json.loads(str(raw_snapshot or "{}"))
+            except json.JSONDecodeError:
+                snapshot = {"__v1469_corrupt_json__": True}
+            row["feature_snapshot"] = (
+                snapshot
+                if isinstance(snapshot, Mapping)
+                else {"__v1469_corrupt_json__": True}
+            )
         return {
             "rows": visible,
             "scope_complete": scope_complete,

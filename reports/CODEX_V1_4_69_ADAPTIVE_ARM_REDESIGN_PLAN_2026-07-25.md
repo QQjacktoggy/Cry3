@@ -2,7 +2,7 @@
 
 日期：2026-07-25  
 對象：Cry3 Live Mainnet Adaptive  
-狀態：**R0、R1-B、R1-C1 與 R1-D2 完成；R1-D authority/order-boundary wiring 尚未完成／部署**
+狀態：**R1-C shadow-only release candidate；R1-D paid authority deferred；尚未部署**
 
 ## 0. 2026-07-26 implementation checkpoint
 
@@ -29,6 +29,14 @@ fresh exact identity/revision/regime，不依 UTC date 或 manual promotion。en
 authoritative TP/SL/cap/risk wiring，以及 two-runner/crash/reconciliation acceptance tests。以上皆為
 deployment gates；完成後仍須 human review。
 
+2026-07-26 paid-boundary audit 確認：production 尚無 rolling-arbiter invocation，paid
+adapter 只有 dependency injection 而未包住兩種 entry submit callable；claim 未綁 lease
+generation/evidence revision/regime/risk-policy hash，startup 亦無 bounded nonterminal-claim
+enumeration/reconciliation，daily-risk reservation 與 claim 尚非同一原子交易。因此本次 release
+只允許 shadow observation；保留 `mainnet_codex_v1469_live_enforcement_enabled=false` 與
+enforcement startup rejection。Legacy v1.4.60/既有 gate 仍是唯一 paid authority，v1.4.69 不得
+建立 paid lease、claim 或 order。
+
 R1-D 本次安全 checkpoint 已由 `App` 使用同一 DB 建立並注入 observation、lease、daily-risk、
 paid-claim repositories 與 paid-execution adapter；arbiter/enforcement flag 啟用時，會在任何
 Binance connect 前驗證 exact 30s/15m/45m/180m/freshness/lease settings 及 016–020 所有 owner
@@ -45,6 +53,33 @@ adaptive-only evidence。TP geometry 現在直接遵循 live executor 的 partia
 sequencing（包括 W6A 100% partial、final fallback 與 runner），global DCA cap 亦使用相同 entry
 notional scale。snapshot 使用
 同一 selected candidate identity 與 raw signal reference，effective total offset 僅編碼一次。
+accepted deferred context 採 per-evaluator UUID token；`finally` 只釋放本次 evaluator 的
+in-flight marker。固定 30 秒 bucket 的絕對 close timer 會自行封存，不依下一次 selector call；
+但同一 run/dedup 若仍有 sibling exact evaluator 或 exact persistence writer in flight，舊 reject
+的 timer 與 capacity eviction 都不得先贏得 immutable first-snapshot identity。exact dedup ownership 以同一 identity 的 reference count 持有到所有 exact writers 真正完成；
+即使 caller 的 5 秒 barrier 已 timeout，writer 成功 callback 也會先清除
+同 bucket 舊 sibling 再釋放 ownership，避免「先擋、後放行」永久失去 `LEGACY_CONTROL` evidence。
+timer 在 writer backlog 滿時採 bounded backoff，保留唯一 staged copy，且不把可重試 enqueue 誤計為
+dropped。
+
+source replay 必須載入 repository 的 durable first bundle；只要帶 exact legacy snapshot，就要求
+durable opportunity 為 `COMPLETE`、market identity 恰好匹配一個 durable candidate，且
+`signal_reference_price` 與 legacy snapshot reference 完全相容；restart rehydrate 會重驗同一條件。
+exact path 若 paired runtime 缺席或未回報至少一筆 durable evidence，一律 fail closed。每一 durable
+candidate/source 只允許一份 `LEGACY_CONTROL` identity；不同 hash 在同一 transaction fail closed，
+單筆 `append_evidence()` 也不得繞過 sidecar。paired evidence 與 legacy sidecar 先 atomic durable，才
+檢查 process-local capacity；capacity drop 會回傳 barrier failure 並使同一 runtime 可重新 rehydrate，
+不會回報假 paired success；若 exact bundle 已 durable，callback 會先清除同 bucket degraded sibling，
+restart rehydrate 仍會重新驗證 durable feature snapshot、legacy reference 與 sidecar identity。
+
+adaptive-only payload 使用 schema-valid `DATA_INCOMPLETE` opportunity，並在每個
+`DATA_BLOCKED` candidate 的 durable annotations 保存 exact reason，不更動 feature hash。
+writer 採 32 inflight + 256 bounded backlog；durability barrier task 一律納入同一 tracked set，5 秒
+barrier timeout 只回傳「尚未 durable」而不回傳 opportunity ID。shutdown 先 latch producer，再以
+同一 writer 上限分批 drain staged/backlog，不再瞬間建立數百個 SQLite task；正常 App shutdown
+不設內部 5 秒 deadline，會完整排空已接受 work。只有測試／forced teardown 顯式傳入 timeout 時才
+允許取消，且 cancelled/undispatched 數會明確進 telemetry。此補強不改 legacy authority/order
+sequencing，亦不啟用 enforcement。
 
 **R1-D2 已完成；R1-D 與 deployment 仍未完成。** 真實 `_place_entry` 中、所有既有 S2／Codex／lane overlays
 完成後凍結實際被選 paid legacy lane 的
@@ -52,7 +87,7 @@ immutable `LEGACY_CONTROL` snapshot。snapshot 包含實際 entry/TTL/reprice、
 SL/hold/BE/trail/runner/early-fail/DCA、effective notional/caps 與 canonical policy hashes，並附在
 同一 durable opportunity 後送進 paired-shadow runtime；只有 selected lane 取得一個 legacy arm，
 其餘 overlap candidates 仍各自取得 adaptive arms。無法精確建構時只把明確
-`exact_snapshot_data_blocked` 原因寫入 observation，legacy paid path 不受影響。
+`exact_snapshot_data_blocked` 原因寫入 candidate durable annotations，legacy paid path 不受影響。
 **R1-D2 完成後仍不代表 R1-D 完成：** lease/arbiter authority、paid claim/order adapter 與真實 order
 submission boundary 仍未接線，enforcement 仍維持 OFF 且 startup rejection 保留。
 

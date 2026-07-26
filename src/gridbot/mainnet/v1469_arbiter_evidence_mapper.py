@@ -16,7 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
-from math import isfinite
+from math import isclose, isfinite
 from typing import Any, Mapping, Sequence
 
 from src.gridbot.mainnet.v1469_adaptive_identity import (
@@ -30,10 +30,15 @@ from src.gridbot.mainnet.v1469_arm_arbiter import (
     normalize_evidence_outcome,
 )
 from src.gridbot.mainnet.v1469_arm_profiles import (
+    ArmProfileDefinition,
     PASSIVE_BALANCED,
     RANGE_SCALP,
     TREND_PARTIAL,
     get_arm_profile,
+)
+from src.gridbot.mainnet.v1469_legacy_control import (
+    LEGACY_CONTROL,
+    LegacyExecutionSnapshot,
 )
 from src.gridbot.mainnet.v1469_paired_evaluator import TERMINAL_RESULT_SCHEMA
 
@@ -101,6 +106,8 @@ class _ParsedRow:
     contract: Mapping[str, Any] | None
     identity: ArmIdentity
     evidence: ArmEvidence
+    profile_definition: ArmProfileDefinition
+    legacy_snapshot: LegacyExecutionSnapshot | None
 
 
 def _canonical_json(value: Any) -> str:
@@ -185,14 +192,145 @@ def paired_group_identity(
     )
 
 
-def _profile_deadline(observed_at_ms: int, profile_id: str) -> int:
-    definition = get_arm_profile(profile_id)
+def _profile_definition_for_row(
+    row: Mapping[str, Any],
+) -> tuple[ArmProfileDefinition, LegacyExecutionSnapshot | None]:
+    profile_id = _text(row.get("execution_profile_id")).upper()
+    if profile_id != LEGACY_CONTROL:
+        return get_arm_profile(profile_id), None
+
+    raw_payload = row.get(
+        "execution_profile_payload",
+        row.get("execution_profile_payload_json"),
+    )
+    if raw_payload is None:
+        raise ValueError("LEGACY_CONTROL execution profile sidecar is missing")
+    if isinstance(raw_payload, str):
+        try:
+            parsed_payload = json.loads(raw_payload)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                "LEGACY_CONTROL execution profile sidecar is corrupt"
+            ) from exc
+        if raw_payload != _canonical_json(parsed_payload):
+            raise ValueError(
+                "LEGACY_CONTROL execution profile sidecar is not canonical"
+            )
+        raw_payload = parsed_payload
+    if not isinstance(raw_payload, Mapping):
+        raise ValueError(
+            "LEGACY_CONTROL execution profile sidecar must be an object"
+        )
+    try:
+        snapshot = LegacyExecutionSnapshot.from_payload(raw_payload)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "LEGACY_CONTROL execution profile sidecar is corrupt:"
+            f"{exc}"
+        ) from exc
+    return snapshot.profile_definition, snapshot
+
+
+def _verify_legacy_invariants(
+    row: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    snapshot: LegacyExecutionSnapshot,
+) -> None:
+    feature_snapshot = row.get("feature_snapshot")
+    if not isinstance(feature_snapshot, Mapping):
+        raise ValueError("LEGACY_CONTROL durable feature snapshot is missing")
+    reference_price = _finite_or_none(feature_snapshot.get("signal_reference_price"))
+    if (
+        reference_price is None
+        or reference_price <= 0
+        or not isclose(
+            reference_price,
+            float(snapshot.reference_price),
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        )
+    ):
+        raise ValueError("LEGACY_CONTROL durable reference price mismatch")
+
+    identity = snapshot.market_identity
+    mismatches: list[str] = []
+    if identity.lane_code != _text(row.get("lane_code")):
+        mismatches.append("lane_code")
+    if identity.effective_side != _text(
+        row.get("effective_side")
+    ).upper():
+        mismatches.append("effective_side")
+    if identity.strategy != _text(row.get("strategy")):
+        mismatches.append("strategy")
+    if identity.coarse_regime != _text(row.get("coarse_regime")).upper():
+        mismatches.append("coarse_regime")
+    if mismatches:
+        raise ValueError(
+            "LEGACY_CONTROL market identity mismatch:"
+            + ",".join(mismatches)
+        )
+    if _text(payload.get("market_state_hash")) != identity.identity_hash:
+        raise ValueError("LEGACY_CONTROL market state hash mismatch")
+
+    entry_limit = _finite_or_none(payload.get("entry_limit_price"))
+    if entry_limit is None or entry_limit <= 0:
+        raise ValueError(
+            "LEGACY_CONTROL terminal entry limit price is missing"
+        )
+    offset = float(snapshot.entry_offset_bp) / 10_000.0
+    factor = (
+        1.0 - offset
+        if identity.effective_side == "LONG"
+        else 1.0 + offset
+    )
+    expected_limit = float(snapshot.reference_price) * factor
+    if (
+        factor <= 0
+        or not isclose(
+            entry_limit,
+            expected_limit,
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        )
+    ):
+        raise ValueError("LEGACY_CONTROL reference price invariant mismatch")
+
+
+def _profile_deadline(
+    observed_at_ms: int,
+    definition: ArmProfileDefinition,
+) -> int:
     execution = definition.execution_profile
     if execution is None:
         raise ValueError("risk-off profile has no evidence deadline")
     return observed_at_ms + (
         int(execution.entry_ttl_s) + int(execution.max_hold_s)
     ) * 1_000
+
+
+def _expected_group_profiles(
+    members: Sequence[_ParsedRow],
+) -> dict[str, ArmProfileDefinition]:
+    regimes = {item.identity.regime for item in members}
+    if len(regimes) != 1:
+        raise ValueError("paired group regime identity differs")
+    profiles = {
+        profile_id: get_arm_profile(profile_id)
+        for profile_id in expected_profile_ids(next(iter(regimes)))
+    }
+    legacy_members = [
+        item
+        for item in members
+        if item.identity.execution_profile_id == LEGACY_CONTROL
+    ]
+    if len(legacy_members) > 1:
+        raise ValueError("paired group has duplicate LEGACY_CONTROL rows")
+    if legacy_members:
+        legacy = legacy_members[0]
+        if legacy.legacy_snapshot is None:
+            raise ValueError("LEGACY_CONTROL sidecar was not resolved")
+        profiles[LEGACY_CONTROL] = legacy.profile_definition
+    return dict(sorted(profiles.items()))
 
 
 def _expected_arm_key(row: Mapping[str, Any]) -> str:
@@ -342,7 +480,9 @@ def _parse_individual_row(row: Mapping[str, Any]) -> _ParsedRow:
     if not _flag(row.get("data_complete")) or _flag(row.get("ambiguous")):
         raise ValueError("terminal evidence is incomplete or ambiguous")
     profile_id = _text(row.get("execution_profile_id")).upper()
-    definition = get_arm_profile(profile_id)
+    definition, legacy_snapshot = _profile_definition_for_row(
+        row
+    )
     if (
         definition.execution_profile is None
         or _text(row.get("execution_profile_schema"))
@@ -351,7 +491,10 @@ def _parse_individual_row(row: Mapping[str, Any]) -> _ParsedRow:
         != definition.execution_profile_hash
     ):
         raise ValueError("execution profile identity mismatch")
-    if profile_id not in expected_profile_ids(row.get("coarse_regime")):
+    if (
+        profile_id != LEGACY_CONTROL
+        and profile_id not in expected_profile_ids(row.get("coarse_regime"))
+    ):
         raise ValueError("profile is not legal for coarse regime")
     arm_key = _text(row.get("arm_key"))
     if arm_key != _expected_arm_key(row):
@@ -372,6 +515,8 @@ def _parse_individual_row(row: Mapping[str, Any]) -> _ParsedRow:
     payload, payload_json = _terminal_payload(row)
     _verify_evidence_hash(row, payload_json)
     _verify_terminal_result(row, payload)
+    if legacy_snapshot is not None:
+        _verify_legacy_invariants(row, payload, legacy_snapshot)
     terminal_reason = _text(row.get("terminal_reason")).upper()
     if terminal_reason not in _TERMINAL_REASONS:
         raise ValueError("invalid terminal reason")
@@ -385,7 +530,7 @@ def _parse_individual_row(row: Mapping[str, Any]) -> _ParsedRow:
         execution_profile_id=profile_id,
         execution_profile_hash=_text(row.get("execution_profile_hash")),
     )
-    placeholder_deadline = _profile_deadline(observed, profile_id)
+    placeholder_deadline = _profile_deadline(observed, definition)
     evidence = ArmEvidence(
         arm_key=arm_key,
         opportunity_id=_text(row.get("opportunity_id")),
@@ -413,11 +558,14 @@ def _parse_individual_row(row: Mapping[str, Any]) -> _ParsedRow:
         contract=contract if isinstance(contract, Mapping) else None,
         identity=identity,
         evidence=evidence,
+        profile_definition=definition,
+        legacy_snapshot=legacy_snapshot,
     )
 
 
 def _contract_fingerprint(
     item: _ParsedRow,
+    expected_profiles: Mapping[str, ArmProfileDefinition],
 ) -> tuple[Any, ...]:
     contract = item.contract
     if contract is None:
@@ -426,7 +574,7 @@ def _contract_fingerprint(
     if _text(contract.get("schema")) != PAIRED_CONTRACT_SCHEMA:
         raise ValueError("paired contract schema mismatch")
     profile_id = item.identity.execution_profile_id
-    expected = expected_profile_ids(item.identity.regime)
+    expected = tuple(sorted(expected_profiles))
     raw_profiles = contract.get("expected_profile_ids")
     if isinstance(raw_profiles, (str, bytes)) or not isinstance(
         raw_profiles, Sequence
@@ -473,9 +621,13 @@ def _contract_fingerprint(
         <= decision_at
     ):
         raise ValueError("paired contract coverage ordering is invalid")
-    expected_deadline = _profile_deadline(observed, profile_id)
+    expected_deadline = _profile_deadline(
+        observed,
+        item.profile_definition,
+    )
     expected_group_deadline = max(
-        _profile_deadline(observed, value) for value in expected
+        _profile_deadline(observed, definition)
+        for definition in expected_profiles.values()
     )
     if (
         profile_deadline != expected_deadline
@@ -630,7 +782,19 @@ def map_durable_paired_evidence(
     envelope_by_group: dict[tuple[str, str], str] = {}
     for group_key, members in sorted(group_rows.items()):
         opportunity_id, candidate_id = group_key
-        expected = expected_profile_ids(members[0].identity.regime)
+        try:
+            expected_profiles = _expected_group_profiles(members)
+        except (TypeError, ValueError) as exc:
+            issues.append(
+                EvidenceMappingIssue(
+                    code="incomplete_paired_profile_group",
+                    opportunity_id=opportunity_id,
+                    candidate_id=candidate_id,
+                    detail=str(exc),
+                )
+            )
+            continue
+        expected = tuple(expected_profiles)
         actual = tuple(
             sorted(item.identity.execution_profile_id for item in members)
         )
@@ -650,7 +814,8 @@ def map_durable_paired_evidence(
             continue
         try:
             fingerprints = tuple(
-                _contract_fingerprint(item) for item in members
+                _contract_fingerprint(item, expected_profiles)
+                for item in members
             )
             if len(set(fingerprints)) != 1:
                 raise ValueError("paired contract differs across profiles")

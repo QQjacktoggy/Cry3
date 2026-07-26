@@ -8,8 +8,9 @@ paired results atomically.  Pending rows can be reconstructed after restart.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
-from math import ceil, isfinite
+from math import ceil, isclose, isfinite
 import time
 from typing import Any, Mapping, Sequence
 
@@ -145,6 +146,7 @@ class V1469PairedShadowRuntime:
             raise ValueError("max_active_evidence must be positive")
         self._repository = repository
         self._max_active_evidence = int(max_active_evidence)
+        self._start_lock = asyncio.Lock()
         self._active: dict[str, PendingPairedCandidate] = {}
         self._rehydrated_runs: set[str] = set()
 
@@ -164,9 +166,34 @@ class V1469PairedShadowRuntime:
         opportunity: Mapping[str, Any],
         candidates: Sequence[Mapping[str, Any]],
     ) -> dict[str, int]:
+        """Serialize durable start so capacity and active ownership are exact."""
+
+        async with self._start_lock:
+            return await self._start_observation_unlocked(
+                opportunity,
+                candidates,
+            )
+
+    async def _start_observation_unlocked(
+        self,
+        opportunity: Mapping[str, Any],
+        candidates: Sequence[Mapping[str, Any]],
+    ) -> dict[str, int]:
         """Start all eligible matched candidates as one durable bundle."""
 
+        legacy_snapshot = opportunity.get("legacy_execution_snapshot")
+        if legacy_snapshot is not None and not isinstance(
+            legacy_snapshot, LegacyExecutionSnapshot
+        ):
+            raise TypeError(
+                "legacy_execution_snapshot must be LegacyExecutionSnapshot"
+            )
+        exact_requested = legacy_snapshot is not None
         if str(opportunity.get("data_quality") or "").upper() != "COMPLETE":
+            if exact_requested:
+                raise ValueError(
+                    "legacy control requires COMPLETE durable opportunity"
+                )
             return {
                 "candidates_started": 0,
                 "evidence_started": 0,
@@ -181,7 +208,11 @@ class V1469PairedShadowRuntime:
         )
         try:
             signal_price = _float(snapshot.get("signal_reference_price"))
-        except ValueError:
+        except ValueError as exc:
+            if exact_requested:
+                raise ValueError(
+                    "legacy control requires durable signal reference price"
+                ) from exc
             return {
                 "candidates_started": 0,
                 "evidence_started": 0,
@@ -199,9 +230,19 @@ class V1469PairedShadowRuntime:
         payloads: list[dict[str, Any]] = []
         skipped = 0
         observed_at_ms = int(opportunity.get("observed_at_ms") or 0)
-        legacy_snapshot = opportunity.get("legacy_execution_snapshot")
-        if legacy_snapshot is not None and not isinstance(legacy_snapshot, LegacyExecutionSnapshot):
-            raise TypeError("legacy_execution_snapshot must be LegacyExecutionSnapshot")
+        if (
+            legacy_snapshot is not None
+            and not isclose(
+                signal_price,
+                float(legacy_snapshot.reference_price),
+                rel_tol=1e-12,
+                abs_tol=1e-12,
+            )
+        ):
+            raise ValueError(
+                "legacy control reference price does not match durable opportunity"
+            )
+        legacy_matches = 0
         for candidate in candidates:
             status = str(
                 candidate.get("safety_status") or ""
@@ -225,6 +266,7 @@ class V1469PairedShadowRuntime:
                 )
                 legacy_profile = None
                 if (legacy_snapshot is not None and legacy_snapshot.market_identity == market_identity):
+                    legacy_matches += 1
                     legacy_profile = legacy_snapshot.profile_definition
                 profiles = _tradable_profiles(market_identity, status, legacy_profile)
             except (TypeError, ValueError):
@@ -265,6 +307,10 @@ class V1469PairedShadowRuntime:
                     }
                 )
 
+        if legacy_snapshot is not None and legacy_matches != 1:
+            raise ValueError(
+                "legacy control must match exactly one durable candidate"
+            )
         if not payloads:
             return {
                 "candidates_started": 0,
@@ -272,18 +318,34 @@ class V1469PairedShadowRuntime:
                 "skipped": skipped,
                 "capacity_dropped": 0,
             }
+        durable = await self._repository.append_evidence_bundle(payloads)
+        # Active capacity is in-memory only; evidence must survive a restart.
         if (
             self.active_evidence_count + len(payloads)
             > self._max_active_evidence
         ):
+            # The evidence bundle (including LEGACY_CONTROL sidecar) is already
+            # durable.  Invalidate prior rehydrate scans so this same runtime
+            # will retry once older active groups release memory capacity.
+            environment = str(
+                opportunity.get("environment") or ""
+            ).strip().upper()
+            symbol = str(opportunity.get("symbol") or "").strip().upper()
+            source_run_id = str(
+                opportunity.get("source_run_id") or ""
+            ).strip()
+            self._rehydrated_runs.discard(
+                f"scope:{environment}:{symbol}"
+            )
+            if source_run_id:
+                self._rehydrated_runs.discard(f"run:{source_run_id}")
             return {
                 "candidates_started": 0,
-                "evidence_started": 0,
+                "evidence_started": len(payloads),
                 "skipped": skipped,
                 "capacity_dropped": len(payloads),
             }
 
-        durable = await self._repository.append_evidence_bundle(payloads)
         durable_by_candidate: dict[str, dict[str, str]] = {}
         for row in durable["evidence"]:
             durable_by_candidate.setdefault(
@@ -402,13 +464,26 @@ class V1469PairedShadowRuntime:
                     )
                     if legacy_snapshot.market_identity != identity:
                         raise ValueError("durable legacy market identity mismatch")
+                signal_price = _float(
+                    snapshot.get("signal_reference_price")
+                )
+                if (
+                    legacy_snapshot is not None
+                    and not isclose(
+                        signal_price,
+                        float(legacy_snapshot.reference_price),
+                        rel_tol=1e-12,
+                        abs_tol=1e-12,
+                    )
+                ):
+                    raise ValueError(
+                        "durable legacy reference price mismatch"
+                    )
                 arm_opportunity = MatchedArmOpportunity(
                     opportunity_id=str(first["opportunity_id"]),
                     candidate_status=status,
                     market_identity=identity,
-                    signal_price=_float(
-                        snapshot.get("signal_reference_price")
-                    ),
+                    signal_price=signal_price,
                     legacy_profile=(legacy_snapshot.profile_definition
                                     if legacy_snapshot is not None else None),
                 )

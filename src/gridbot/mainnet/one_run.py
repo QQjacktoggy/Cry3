@@ -419,6 +419,8 @@ class MainnetOneRunManager:
     V1469_AGGTRADE_CACHE_MAX_ROWS = 50_000
     V1469_AGGTRADE_CACHE_TTL_MS = 2 * 60 * 60 * 1000
     V1469_PENDING_PAID_MAX = 256
+    V1469_OBSERVATION_BACKLOG_MAX = 256
+    V1469_DURABILITY_BARRIER_SECONDS = 5.0
     CODEX_V1_SHADOW_SAMPLE_COOLDOWN_S = 90
     CODEX_V1_SHADOW_ENTRY_REF_MOVE_BP = 5.0
     CODEX_V1_SHADOW_MAX_SAMPLES_PER_RUN = 12
@@ -492,13 +494,25 @@ class MainnetOneRunManager:
         # These contain bucket-level dedup keys, not durable opportunity IDs.
         self._v1469_observed_opportunity_ids: set[str] = set()
         self._v1469_observation_inflight_ids: set[str] = set()
-        self._v1469_observation_tasks: set[asyncio.Task[None]] = set()
+        self._v1469_observation_tasks: set[
+            asyncio.Task[dict[str, Any] | None]
+        ] = set()
         self._v1469_observation_dropped = 0
         self._v1469_observation_repo_missing_logged = False
-        # Accepted observations are held only until _place_entry has resolved
-        # every legacy overlay.  This lets the exact paid control join the same
-        # durable opportunity without changing the legacy order path.
-        self._v1469_pending_paid_observations: dict[str, tuple[str, dict[str, Any], tuple[dict[str, Any], ...]]] = {}
+        # Real paid-path observations stay mutable in memory until exact entry
+        # finalization or their statistical bucket closes.  Persisting a reject
+        # earlier would make the immutable first snapshot block a later retry.
+        self._v1469_pending_paid_observations: dict[
+            str, tuple[str, str, dict[str, Any], tuple[dict[str, Any], ...]]
+        ] = {}
+        self._v1469_paid_path_inflight_tokens: set[str] = set()
+        self._v1469_exact_persistence_owners: dict[tuple[str, str], int] = {}
+        self._v1469_paid_token_by_task: dict[int, str] = {}
+        self._v1469_bucket_finalizer_tasks: dict[
+            str, asyncio.Task[None]
+        ] = {}
+        self._v1469_observation_backlog: list[tuple[Any, ...]] = []
+        self._v1469_observation_shutdown = False
         self._v1469_paired_shadow_runtime = (
             V1469PairedShadowRuntime(arm_observation_repo)
             if arm_observation_repo is not None
@@ -1657,11 +1671,13 @@ class MainnetOneRunManager:
         effective_decision: CodexV1Decision,
         reference_price: float | None = None,
         regime_market_state: str | None = None,
-    ) -> None:
-        """Queue all compatible lanes without waiting on the paid path."""
+    ) -> str | None:
+        """Stage paid snapshots or queue passive all-lane observations."""
 
+        if getattr(self, "_v1469_observation_shutdown", False):
+            return None
         if not self._v1469_observation_active(run):
-            return
+            return None
         repository = self._v1469_arm_observation_repo
         if repository is None:
             if not self._v1469_observation_repo_missing_logged:
@@ -1691,6 +1707,7 @@ class MainnetOneRunManager:
             )
             return
 
+        self._v1469_finalize_expired_pending(observed_at_ms)
         try:
             observation_features = dict(features)
             detailed_state = str(
@@ -1762,6 +1779,12 @@ class MainnetOneRunManager:
             if (
                 dedup_key in self._v1469_observed_opportunity_ids
                 or dedup_key in self._v1469_observation_inflight_ids
+                or int(
+                    getattr(
+                        self, "_v1469_exact_persistence_owners", {}
+                    ).get((str(run.get("run_id") or ""), dedup_key))
+                    or 0
+                ) > 0
             ):
                 return
         except Exception as exc:  # noqa: BLE001 - observation has no paid authority
@@ -1772,62 +1795,398 @@ class MainnetOneRunManager:
             )
             return
 
-        # The real paid path always supplies its resolved signal reference.
-        # Observation-only/unit callers that omit it retain the original
-        # immediate, non-blocking behavior.
-        if (
-            effective_decision.accepted
-            and reference_price is not None
+        # A paid evaluator owns one immutable staging token.  Tokens, rather
+        # than run IDs, prevent overlapping evaluator cycles from attaching
+        # one cycle's legacy geometry to another cycle's feature snapshot.
+        run_id = str(run.get("run_id") or "")
+        pending = getattr(self, "_v1469_pending_paid_observations", None)
+        if pending is None:
+            pending = {}
+            self._v1469_pending_paid_observations = pending
+        stage_for_paid_path = bool(
+            reference_price is not None
             and math.isfinite(normalized_reference_price)
             and normalized_reference_price > 0
-        ):
-            pending = getattr(self, "_v1469_pending_paid_observations", None)
-            if pending is None:
-                pending = {}
-                self._v1469_pending_paid_observations = pending
-            if (str(run.get("run_id") or "") not in pending and
-                    len(pending) >= self.V1469_PENDING_PAID_MAX):
-                # Never allow deferred paid context to grow without bound.
-                # The oldest insertion is immediately degraded to an
-                # adaptive-only observation rather than disappearing.
-                oldest_run_id = next(iter(pending))
-                evicted = pending.pop(oldest_run_id)
-                old_key, old_opportunity, old_candidates = evicted
-                self._v1469_schedule_observation(
-                    repository, str(old_opportunity.get("source_run_id") or ""),
-                    old_key, old_opportunity, old_candidates,
+        )
+        if stage_for_paid_path:
+            inflight = getattr(
+                self, "_v1469_paid_path_inflight_tokens", set()
+            )
+            if len(pending) >= self.V1469_PENDING_PAID_MAX:
+                evict_token = next(
+                    (
+                        token
+                        for token, item in pending.items()
+                        if token not in inflight
+                        and not self._v1469_bucket_identity_owned(
+                            item[0],
+                            item[1],
+                            exclude_token=token,
+                        )
+                    ),
+                    None,
                 )
-            pending[str(run.get("run_id") or "")] = (
+                if evict_token is None:
+                    self._v1469_observation_dropped += 1
+                    logger.error(
+                        "v1469_pending_paid_capacity_all_inflight",
+                        run_id=run_id,
+                        pending=len(pending),
+                        dropped=self._v1469_observation_dropped,
+                    )
+                    return None
+                (
+                    old_run_id,
+                    old_key,
+                    old_opportunity,
+                    old_candidates,
+                ) = pending[evict_token]
+                old_payload = self._v1469_clean_staged_opportunity(
+                    old_opportunity
+                )
+                scheduled = self._v1469_start_adaptive_only_observation(
+                    repository,
+                    old_run_id,
+                    old_key,
+                    old_payload,
+                    old_candidates,
+                    reason=(
+                        "exact_snapshot_data_blocked:"
+                        "deferred_capacity_evicted"
+                    ),
+                )
+                if not scheduled:
+                    # Keep the only staged copy.  The new observation is
+                    # explicitly dropped rather than silently losing both.
+                    return None
+                pending.pop(evict_token, None)
+                self._v1469_cancel_bucket_finalizer(evict_token)
+                self._v1469_forget_paid_token(evict_token)
+
+            token = uuid.uuid4().hex
+            staged_opportunity = dict(batch.opportunity)
+            bucket_ms = bucket_seconds * 1000
+            bucket_end_ms = (
+                observed_at_ms - (observed_at_ms % bucket_ms) + bucket_ms
+            )
+            staged_opportunity["_v1469_bucket_end_ms"] = bucket_end_ms
+            pending[token] = (
+                run_id,
                 dedup_key,
-                dict(batch.opportunity),
+                staged_opportunity,
                 tuple(dict(item) for item in batch.candidates),
             )
-            return
+            inflight.add(token)
+            task = asyncio.current_task()
+            if task is not None:
+                task_key = id(task)
+                previous = getattr(
+                    self, "_v1469_paid_token_by_task", {}
+                ).get(task_key)
+                if previous:
+                    inflight.discard(previous)
+                self._v1469_paid_token_by_task[task_key] = token
+            self._v1469_schedule_bucket_finalizer(
+                token,
+                bucket_end_ms=bucket_end_ms,
+            )
+            return token
 
         self._v1469_schedule_observation(
-            repository, str(run.get("run_id") or ""), dedup_key,
-            dict(batch.opportunity), tuple(dict(item) for item in batch.candidates),
+            repository,
+            run_id,
+            dedup_key,
+            dict(batch.opportunity),
+            tuple(dict(item) for item in batch.candidates),
+        )
+        return None
+
+    @staticmethod
+    def _v1469_clean_staged_opportunity(
+        opportunity: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        payload = dict(opportunity)
+        payload.pop("_v1469_bucket_end_ms", None)
+        payload.pop("_v1469_deferred_reason", None)
+        return payload
+
+    def _v1469_forget_paid_token(self, token: str) -> None:
+        bindings = getattr(self, "_v1469_paid_token_by_task", {})
+        for task_key, bound_token in tuple(bindings.items()):
+            if bound_token == token:
+                bindings.pop(task_key, None)
+
+    def _v1469_current_paid_token(self, run_id: str) -> str | None:
+        task = asyncio.current_task()
+        if task is None:
+            return None
+        token = getattr(
+            self, "_v1469_paid_token_by_task", {}
+        ).get(id(task))
+        item = getattr(
+            self, "_v1469_pending_paid_observations", {}
+        ).get(str(token or ""))
+        if item is None or item[0] != run_id:
+            return None
+        return str(token)
+
+    def _v1469_acquire_exact_persistence_owner(
+        self,
+        identity: tuple[str, str],
+    ) -> None:
+        owners = getattr(
+            self, "_v1469_exact_persistence_owners", None
+        )
+        if owners is None:
+            owners = {}
+            self._v1469_exact_persistence_owners = owners
+        owners[identity] = int(owners.get(identity) or 0) + 1
+
+    def _v1469_release_exact_persistence_owner(
+        self,
+        identity: tuple[str, str],
+    ) -> None:
+        owners = getattr(
+            self, "_v1469_exact_persistence_owners", {}
+        )
+        remaining = int(owners.get(identity) or 0) - 1
+        if remaining > 0:
+            owners[identity] = remaining
+        else:
+            owners.pop(identity, None)
+
+    def _v1469_bucket_identity_owned(
+        self,
+        run_id: str,
+        dedup_key: str,
+        *,
+        exclude_token: str | None = None,
+    ) -> bool:
+        identity = (str(run_id), str(dedup_key))
+        if int(
+            getattr(
+                self, "_v1469_exact_persistence_owners", {}
+            ).get(identity)
+            or 0
+        ) > 0:
+            return True
+        pending = getattr(
+            self, "_v1469_pending_paid_observations", {}
+        )
+        inflight = getattr(
+            self, "_v1469_paid_path_inflight_tokens", set()
+        )
+        return any(
+            token != exclude_token
+            and item[0] == identity[0]
+            and item[1] == identity[1]
+            and token in inflight
+            for token, item in pending.items()
         )
 
+    def _v1469_discard_pending_bucket_siblings(
+        self,
+        run_id: str,
+        dedup_key: str,
+    ) -> None:
+        pending = getattr(
+            self, "_v1469_pending_paid_observations", {}
+        )
+        for sibling_token, sibling in tuple(pending.items()):
+            if sibling[0] != run_id or sibling[1] != dedup_key:
+                continue
+            pending.pop(sibling_token, None)
+            getattr(
+                self, "_v1469_paid_path_inflight_tokens", set()
+            ).discard(sibling_token)
+            self._v1469_cancel_bucket_finalizer(sibling_token)
+            self._v1469_forget_paid_token(sibling_token)
+
+    def _v1469_cancel_bucket_finalizer(self, token: str) -> None:
+        task = getattr(
+            self, "_v1469_bucket_finalizer_tasks", {}
+        ).pop(token, None)
+        if task is None or task.done():
+            return
+        try:
+            current = asyncio.current_task()
+        except RuntimeError:
+            current = None
+        if task is not current:
+            task.cancel()
+
+    def _v1469_schedule_bucket_finalizer(
+        self,
+        token: str,
+        *,
+        bucket_end_ms: int,
+    ) -> None:
+        tasks = getattr(self, "_v1469_bucket_finalizer_tasks", None)
+        if tasks is None:
+            tasks = {}
+            self._v1469_bucket_finalizer_tasks = tasks
+        if token in tasks:
+            return
+
+        async def finalize_at_boundary() -> None:
+            delay = max(
+                0.0,
+                (int(bucket_end_ms) - int(time.time() * 1000)) / 1000.0,
+            )
+            if delay > 0:
+                await asyncio.sleep(delay)
+            retry_delay = 0.1
+            while token in getattr(
+                self, "_v1469_pending_paid_observations", {}
+            ) and not getattr(self, "_v1469_observation_shutdown", False):
+                finalized = self._v1469_finalize_expired_pending(
+                    max(int(bucket_end_ms), int(time.time() * 1000)),
+                    only_token=token,
+                )
+                if finalized or token not in self._v1469_pending_paid_observations:
+                    return
+                # An evaluator may still own the token, or the bounded writer
+                # backlog may be full.  Retry without losing the staged copy.
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(1.0, retry_delay * 2.0)
+
+        task = asyncio.create_task(
+            finalize_at_boundary(),
+            name=f"cry3-v1469-bucket-close-{token[-12:]}",
+        )
+        tasks[token] = task
+
+        def retire(completed: asyncio.Task[None]) -> None:
+            if tasks.get(token) is completed:
+                tasks.pop(token, None)
+            try:
+                completed.exception()
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:  # noqa: BLE001 - observation only
+                logger.error(
+                    "v1469_bucket_finalizer_failed",
+                    token=token[-12:],
+                    error=str(exc)[:300],
+                )
+
+        task.add_done_callback(retire)
+
+    def _v1469_finalize_expired_pending(
+        self,
+        now_ms: int,
+        *,
+        only_token: str | None = None,
+    ) -> int:
+        """Persist staged snapshots only after their fixed bucket closes."""
+
+        repository = getattr(self, "_v1469_arm_observation_repo", None)
+        if repository is None:
+            return 0
+        pending = getattr(self, "_v1469_pending_paid_observations", {})
+        inflight = getattr(
+            self, "_v1469_paid_path_inflight_tokens", set()
+        )
+        finalized = 0
+        for token in tuple(pending):
+            if only_token is not None and token != only_token:
+                continue
+            if token in inflight:
+                continue
+            item = pending.get(token)
+            if item is None:
+                continue
+            run_id, dedup_key, opportunity, candidates = item
+            if self._v1469_bucket_identity_owned(
+                run_id,
+                dedup_key,
+                exclude_token=token,
+            ):
+                # A newer evaluator for the same immutable bucket identity may
+                # still attach exact LEGACY_CONTROL.  No rejected sibling may
+                # win the repository's first-snapshot race before it resolves.
+                continue
+            bucket_end_ms = int(
+                opportunity.get("_v1469_bucket_end_ms") or 0
+            )
+            if bucket_end_ms <= 0 or int(now_ms) < bucket_end_ms:
+                continue
+            reason = str(
+                opportunity.get("_v1469_deferred_reason")
+                or (
+                    "exact_snapshot_data_blocked:"
+                    "bucket_closed_without_paid_finalization"
+                )
+            )
+            scheduled = self._v1469_start_adaptive_only_observation(
+                repository,
+                run_id,
+                dedup_key,
+                self._v1469_clean_staged_opportunity(opportunity),
+                candidates,
+                reason=reason,
+                count_full_as_drop=False,
+            )
+            if not scheduled:
+                # Retain the only copy for shutdown or a later retry.
+                continue
+            pending.pop(token, None)
+            self._v1469_cancel_bucket_finalizer(token)
+            self._v1469_forget_paid_token(token)
+            finalized += 1
+        return finalized
     def _v1469_schedule_observation(
         self, repository: V1469ArmObservationRepository, run_id: str,
         dedup_key: str, opportunity: Mapping[str, Any],
-        candidates: Sequence[Mapping[str, Any]],
-    ) -> None:
-        """Schedule passive persistence; never raise into paid legacy flow."""
+        candidates: Sequence[Mapping[str, Any]], *,
+        count_full_as_drop: bool = True,
+    ) -> bool:
+        """Schedule passive persistence in a bounded in-memory backlog."""
 
-        if (
-            len(self._v1469_observation_tasks)
-            >= self.V1469_OBSERVATION_MAX_INFLIGHT
-        ):
+        if getattr(self, "_v1469_observation_shutdown", False):
             self._v1469_observation_dropped += 1
             logger.warning(
-                "v1469_lane_observation_queue_full",
+                "v1469_lane_observation_after_shutdown",
                 run_id=run_id,
-                inflight=len(self._v1469_observation_tasks),
                 dropped=self._v1469_observation_dropped,
             )
-            return
+            return False
+        tasks = self._v1469_observation_tasks
+        backlog = getattr(self, "_v1469_observation_backlog", None)
+        if backlog is None:
+            backlog = []
+            self._v1469_observation_backlog = backlog
+        item = (
+            repository,
+            run_id,
+            dedup_key,
+            dict(opportunity),
+            tuple(dict(candidate) for candidate in candidates),
+        )
+        if len(tasks) >= self.V1469_OBSERVATION_MAX_INFLIGHT:
+            if len(backlog) >= self.V1469_OBSERVATION_BACKLOG_MAX:
+                if count_full_as_drop:
+                    self._v1469_observation_dropped += 1
+                    logger.error(
+                        "v1469_lane_observation_backlog_full",
+                        run_id=run_id,
+                        inflight=len(tasks),
+                        backlog=len(backlog),
+                        dropped=self._v1469_observation_dropped,
+                    )
+                return False
+            self._v1469_observation_inflight_ids.add(dedup_key)
+            backlog.append(item)
+            return True
+        self._v1469_start_observation_task(*item)
+        return True
+
+    def _v1469_start_observation_task(
+        self, repository: V1469ArmObservationRepository, run_id: str,
+        dedup_key: str, opportunity: Mapping[str, Any],
+        candidates: Sequence[Mapping[str, Any]], *, raise_on_error: bool = False,
+    ) -> asyncio.Task[dict[str, Any] | None]:
+        """Start one tracked writer; exact barriers may exceed the pool by one."""
 
         self._v1469_observation_inflight_ids.add(dedup_key)
         task = asyncio.create_task(
@@ -1837,11 +2196,93 @@ class MainnetOneRunManager:
                 dedup_key=dedup_key,
                 opportunity=opportunity,
                 candidates=candidates,
+                raise_on_error=raise_on_error,
             ),
-            name=f"cry3-v1469-observation-{str(opportunity.get('opportunity_id') or '')[-12:]}",
+            name=(
+                "cry3-v1469-observation-"
+                f"{str(opportunity.get('opportunity_id') or '')[-12:]}"
+            ),
         )
         self._v1469_observation_tasks.add(task)
-        task.add_done_callback(self._v1469_observation_tasks.discard)
+        task.add_done_callback(self._v1469_observation_task_done)
+        return task
+
+    def _v1469_observation_task_done(
+        self, task: asyncio.Task[dict[str, Any] | None]
+    ) -> None:
+        self._v1469_observation_tasks.discard(task)
+        try:
+            error = task.exception()
+        except asyncio.CancelledError:
+            error = None
+        if error is not None:
+            logger.error(
+                "v1469_observation_background_task_failed",
+                error=str(error)[:300],
+            )
+        self._v1469_drain_observation_backlog()
+
+    def _v1469_drain_observation_backlog(self) -> None:
+        if getattr(self, "_v1469_observation_shutdown", False):
+            return
+        backlog = getattr(self, "_v1469_observation_backlog", [])
+        while (
+            backlog
+            and len(self._v1469_observation_tasks)
+            < self.V1469_OBSERVATION_MAX_INFLIGHT
+        ):
+            self._v1469_start_observation_task(*backlog.pop(0))
+
+    @staticmethod
+    def _v1469_degraded_observation_payload(
+        opportunity: Mapping[str, Any],
+        candidates: Sequence[Mapping[str, Any]],
+        *, reason: str,
+    ) -> tuple[dict[str, Any], tuple[dict[str, Any], ...]]:
+        """Return schema-valid blocked payloads without changing feature identity."""
+
+        degraded_opportunity = dict(opportunity)
+        degraded_opportunity["data_quality"] = "DATA_INCOMPLETE"
+        degraded_candidates: list[dict[str, Any]] = []
+        for source in candidates:
+            candidate = dict(source)
+            raw_annotations = candidate.get(
+                "annotations", candidate.get("annotations_json", {})
+            )
+            if isinstance(raw_annotations, str):
+                try:
+                    raw_annotations = json.loads(raw_annotations)
+                except json.JSONDecodeError:
+                    raw_annotations = {}
+            annotations = (
+                dict(raw_annotations) if isinstance(raw_annotations, Mapping) else {}
+            )
+            annotations["exact_snapshot_data_blocked"] = reason
+            candidate["annotations"] = annotations
+            candidate["safety_status"] = "DATA_BLOCKED"
+            candidate["data_complete"] = False
+            degraded_candidates.append(candidate)
+        return degraded_opportunity, tuple(degraded_candidates)
+
+    def _v1469_start_adaptive_only_observation(
+        self, repository: V1469ArmObservationRepository, run_id: str,
+        dedup_key: str, opportunity: Mapping[str, Any],
+        candidates: Sequence[Mapping[str, Any]], *, reason: str,
+        count_full_as_drop: bool = True,
+    ) -> bool:
+        """Persist a deferred observation without inventing exact geometry."""
+
+        degraded, blocked_candidates = self._v1469_degraded_observation_payload(
+            opportunity, candidates, reason=reason
+        )
+        return self._v1469_schedule_observation(
+            repository,
+            run_id,
+            dedup_key,
+            degraded,
+            blocked_candidates,
+            count_full_as_drop=count_full_as_drop,
+        )
 
     async def _v1469_persist_lane_observation(
         self,
@@ -1851,43 +2292,114 @@ class MainnetOneRunManager:
         dedup_key: str,
         opportunity: Mapping[str, Any],
         candidates: Sequence[Mapping[str, Any]],
-    ) -> None:
-        """Persist one bundle off the scheduler/order critical path."""
+        raise_on_error: bool = False,
+    ) -> dict[str, Any] | None:
+        """Persist one bundle and repair paired evidence from durable identity."""
 
         try:
+            incoming_opportunity = self._v1469_clean_staged_opportunity(
+                opportunity
+            )
+            incoming_candidates = tuple(
+                dict(candidate) for candidate in candidates
+            )
             persistence_result = await repository.insert_observation(
-                opportunity,
-                tuple(candidates),
+                incoming_opportunity,
+                incoming_candidates,
             )
-            paired_runtime = getattr(
-                self, "_v1469_paired_shadow_runtime", None
+            durable_opportunity_id = str(
+                (
+                    persistence_result.get("durable_opportunity_id")
+                    if isinstance(persistence_result, Mapping)
+                    else None
+                )
+                or incoming_opportunity.get("opportunity_id")
+                or ""
             )
+            if not durable_opportunity_id:
+                raise RuntimeError("durable opportunity identity unavailable")
+
+            paired_opportunity = incoming_opportunity
+            paired_candidates = incoming_candidates
             source_replay = bool(
                 isinstance(persistence_result, Mapping)
                 and persistence_result.get("source_replay")
             )
-            if source_replay and str(persistence_result.get(
-                "durable_opportunity_id") or "") != str(
-                    opportunity.get("opportunity_id") or ""):
-                raise RuntimeError("source replay opportunity identity mismatch")
-            # A source replay can mean the prior process committed the
-            # opportunity/candidates and crashed before starting evidence.
-            # append_evidence_bundle is idempotent, so always repair it.
-            if paired_runtime is not None:
-                paired_summary = (
-                    await paired_runtime.start_observation(
-                        opportunity,
-                        tuple(candidates),
-                    )
+            if source_replay:
+                durable_bundle = await repository.load_observation_bundle(
+                    durable_opportunity_id
                 )
-                if int(paired_summary.get("capacity_dropped") or 0) > 0:
+                if not isinstance(durable_bundle, Mapping):
+                    raise RuntimeError(
+                        "durable source replay bundle unavailable"
+                    )
+                loaded_opportunity = durable_bundle.get("opportunity")
+                loaded_candidates = durable_bundle.get("candidates")
+                if not isinstance(loaded_opportunity, Mapping) or not isinstance(
+                    loaded_candidates, (list, tuple)
+                ):
+                    raise RuntimeError(
+                        "durable source replay bundle malformed"
+                    )
+                paired_opportunity = dict(loaded_opportunity)
+                paired_candidates = tuple(
+                    dict(candidate) for candidate in loaded_candidates
+                )
+                legacy_snapshot = incoming_opportunity.get(
+                    "legacy_execution_snapshot"
+                )
+                if legacy_snapshot is not None:
+                    if str(
+                        paired_opportunity.get("data_quality") or ""
+                    ).upper() != "COMPLETE":
+                        raise RuntimeError(
+                            "durable source replay cannot accept exact legacy "
+                            "snapshot from an incomplete first snapshot"
+                        )
+                    paired_opportunity[
+                        "legacy_execution_snapshot"
+                    ] = legacy_snapshot
+
+            exact_requested = (
+                paired_opportunity.get("legacy_execution_snapshot") is not None
+            )
+            paired_complete = not exact_requested
+            capacity_dropped = 0
+            paired_runtime = getattr(
+                self, "_v1469_paired_shadow_runtime", None
+            )
+            if paired_runtime is None and exact_requested:
+                raise RuntimeError(
+                    "exact legacy evidence requires paired shadow runtime"
+                )
+            if paired_runtime is not None:
+                paired_summary = await paired_runtime.start_observation(
+                    paired_opportunity,
+                    paired_candidates,
+                )
+                capacity_dropped = int(
+                    paired_summary.get("capacity_dropped") or 0
+                )
+                evidence_started = int(
+                    paired_summary.get("evidence_started") or 0
+                )
+                paired_complete = capacity_dropped == 0 and (
+                    not exact_requested or evidence_started > 0
+                )
+                if capacity_dropped > 0:
                     logger.error(
                         "v1469_paired_shadow_capacity_dropped",
                         run_id=run_id,
-                        opportunity_id=opportunity.get(
-                            "opportunity_id"
-                        ),
+                        opportunity_id=durable_opportunity_id,
                         **paired_summary,
+                    )
+                    # The paired runtime persists the exact evidence/sidecar
+                    # atomically before reporting an in-memory capacity drop.
+                    # Return the durable summary so the exact-writer callback
+                    # can retire degraded siblings while rehydrate repairs it.
+                if exact_requested and evidence_started <= 0:
+                    raise RuntimeError(
+                        "paired shadow did not persist exact legacy evidence"
                     )
             if (
                 len(self._v1469_observed_opportunity_ids)
@@ -1896,7 +2408,15 @@ class MainnetOneRunManager:
                 # Durable IDs are immutable and repository writes idempotent.
                 # Clearing this fast-path cache merely permits a later no-op.
                 self._v1469_observed_opportunity_ids.clear()
-            self._v1469_observed_opportunity_ids.add(dedup_key)
+            if paired_complete:
+                self._v1469_observed_opportunity_ids.add(dedup_key)
+            return {
+                "durable_opportunity_id": durable_opportunity_id,
+                "observation_durable": True,
+                "paired_complete": paired_complete,
+                "capacity_dropped": capacity_dropped,
+                "source_replay": source_replay,
+            }
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - no paid authority
@@ -1905,43 +2425,134 @@ class MainnetOneRunManager:
                 run_id=run_id,
                 error=str(exc)[:300],
             )
+            if raise_on_error:
+                raise
+            return None
         finally:
             self._v1469_observation_inflight_ids.discard(dedup_key)
-
     async def shutdown_v1469_observation_writer(
         self,
         *,
-        timeout_seconds: float = 5.0,
+        timeout_seconds: float | None = None,
     ) -> None:
-        """Drain observation writes before DB close, then cancel safely."""
+        """Latch producers and completely drain accepted work by default.
 
-        pending = {
-            task for task in self._v1469_observation_tasks if not task.done()
-        }
-        if not pending:
-            return
-        done, still_pending = await asyncio.wait(
-            pending,
-            timeout=max(0.0, float(timeout_seconds)),
+        A caller may supply a hard deadline for tests or forced teardown.  The
+        normal App shutdown intentionally leaves that deadline to the service
+        manager so a graceful restart cannot discard an accepted cohort.
+        """
+
+        # Set the latch before the first await.  record/finish then cannot add
+        # work after the shutdown snapshot on the same event loop.
+        self._v1469_observation_shutdown = True
+        timer_tasks = tuple(
+            getattr(self, "_v1469_bucket_finalizer_tasks", {}).values()
         )
-        for task in done:
-            try:
-                task.result()
-            except asyncio.CancelledError:
-                pass
-            except Exception as exc:  # defensive: worker normally absorbs errors
-                logger.error(
-                    "v1469_observation_shutdown_task_failed",
-                    error=str(exc)[:300],
-                )
-        if not still_pending:
-            return
+        for task in timer_tasks:
+            task.cancel()
+        if timer_tasks:
+            await asyncio.gather(*timer_tasks, return_exceptions=True)
+        getattr(self, "_v1469_bucket_finalizer_tasks", {}).clear()
+        getattr(
+            self, "_v1469_paid_path_inflight_tokens", set()
+        ).clear()
+        getattr(self, "_v1469_paid_token_by_task", {}).clear()
+
+        repository = getattr(self, "_v1469_arm_observation_repo", None)
+        deferred = getattr(self, "_v1469_pending_paid_observations", {})
+        shutdown_queue: list[tuple[Any, ...]] = []
+        for token, claimed in tuple(deferred.items()):
+            run_id, dedup_key, opportunity, candidates = claimed
+            if repository is None:
+                self._v1469_observation_dropped += 1
+                deferred.pop(token, None)
+                continue
+            reason = str(
+                opportunity.get("_v1469_deferred_reason")
+                or "exact_snapshot_data_blocked:shutdown_flush"
+            )
+            clean = self._v1469_clean_staged_opportunity(opportunity)
+            degraded, blocked = self._v1469_degraded_observation_payload(
+                clean,
+                candidates,
+                reason=reason,
+            )
+            shutdown_queue.append(
+                (repository, run_id, dedup_key, degraded, blocked)
+            )
+            deferred.pop(token, None)
+
+        # Preserve already accepted backlog work, but release it through the
+        # same bounded writer pool.  A shutdown must not fan hundreds of SQLite
+        # writers out behind the repository's single transaction lock.
+        backlog = getattr(self, "_v1469_observation_backlog", [])
+        shutdown_queue.extend(backlog)
+        backlog.clear()
+        shutdown_limit = max(1, int(self.V1469_OBSERVATION_MAX_INFLIGHT))
+
+        loop = asyncio.get_running_loop()
+        deadline = (
+            None
+            if timeout_seconds is None
+            else loop.time() + max(0.0, float(timeout_seconds))
+        )
+        while True:
+            while (
+                shutdown_queue
+                and len(self._v1469_observation_tasks) < shutdown_limit
+            ):
+                self._v1469_start_observation_task(*shutdown_queue.pop(0))
+
+            pending = {
+                task
+                for task in self._v1469_observation_tasks
+                if not task.done()
+            }
+            if not pending:
+                if not shutdown_queue:
+                    return
+                continue
+            remaining = (
+                None if deadline is None else deadline - loop.time()
+            )
+            if remaining is not None and remaining <= 0:
+                break
+            done, _ = await asyncio.wait(
+                pending,
+                timeout=remaining,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                break
+            for task in done:
+                try:
+                    task.result()
+                except asyncio.CancelledError:
+                    pass
+                except Exception as exc:
+                    logger.error(
+                        "v1469_observation_shutdown_task_failed",
+                        error=str(exc)[:300],
+                    )
+
+        still_pending = {
+            task
+            for task in self._v1469_observation_tasks
+            if not task.done()
+        }
         for task in still_pending:
             task.cancel()
-        await asyncio.gather(*still_pending, return_exceptions=True)
+        if still_pending:
+            await asyncio.gather(*still_pending, return_exceptions=True)
+        abandoned = len(shutdown_queue)
+        if abandoned:
+            self._v1469_observation_dropped += abandoned
+            shutdown_queue.clear()
         logger.warning(
             "v1469_observation_shutdown_cancelled",
             cancelled=len(still_pending),
+            abandoned_backlog=abandoned,
+            dropped=self._v1469_observation_dropped,
         )
 
     @staticmethod
@@ -15973,6 +16584,7 @@ class MainnetOneRunManager:
         return isinstance(codex, Mapping) and bool(codex.get("enabled"))
 
     async def _run_armed(self, run: dict) -> None:
+        self._v1469_finalize_expired_pending(int(time.time() * 1000))
         if (
             self._adaptive_session
             and self._is_adaptive_run(run)
@@ -16101,24 +16713,30 @@ class MainnetOneRunManager:
         codex_decision: CodexV1Decision | None = None
         codex_features: dict[str, Any] | None = None
         if self._codex_v1_execution_enabled():
-            adjusted_decision, raw_codex_decision, codex_decision, codex_features = await self._apply_codex_v1_gate(
-                run,
-                decision,
-                candles,
-                rng15=rng15,
-                drift_bp=drift_bp,
-            )
-            if adjusted_decision is None:
-                return
-            await self._place_entry(
-                run,
-                adjusted_decision,
-                rng15=rng15,
-                drift_bp=drift_bp,
-                raw_codex_decision=raw_codex_decision,
-                codex_decision=codex_decision,
-                codex_features=codex_features,
-            )
+            try:
+                adjusted_decision, raw_codex_decision, codex_decision, codex_features = await self._apply_codex_v1_gate(
+                    run,
+                    decision,
+                    candles,
+                    rng15=rng15,
+                    drift_bp=drift_bp,
+                )
+                if adjusted_decision is None:
+                    return
+                await self._place_entry(
+                    run,
+                    adjusted_decision,
+                    rng15=rng15,
+                    drift_bp=drift_bp,
+                    raw_codex_decision=raw_codex_decision,
+                    codex_decision=codex_decision,
+                    codex_features=codex_features,
+                )
+            finally:
+                # Release this evaluator's in-flight marker.  The staged
+                # snapshot stays replaceable for same-bucket retries and is
+                # degraded only after the fixed bucket has closed.
+                self._v1469_flush_adaptive_only(run)
             return
 
         # Volatility Range Filter
@@ -18991,41 +19609,187 @@ class MainnetOneRunManager:
         codex_decision: CodexV1Decision | None, *, entry_signal_price: float,
         entry_offset_bp: float, entry_notional: float,
     ) -> str | None:
-        pending_by_run = getattr(self, "_v1469_pending_paid_observations", {})
-        pending = pending_by_run.pop(str(run.get("run_id") or ""), None)
-        if pending is None or self._v1469_arm_observation_repo is None:
+        if getattr(self, "_v1469_observation_shutdown", False):
             return None
-        dedup_key, opportunity, candidates = pending
+        run_id = str(run.get("run_id") or "")
+        token = self._v1469_current_paid_token(run_id)
+        if token is None or self._v1469_arm_observation_repo is None:
+            return None
+        pending_by_token = getattr(
+            self, "_v1469_pending_paid_observations", {}
+        )
+        pending = pending_by_token.pop(token, None)
+        if pending is None:
+            return None
+        (
+            pending_run_id,
+            dedup_key,
+            staged_opportunity,
+            candidates,
+        ) = pending
+        if pending_run_id != run_id:
+            raise RuntimeError("paid observation token owner mismatch")
+        exact_owner = (run_id, dedup_key)
+        self._v1469_acquire_exact_persistence_owner(exact_owner)
+        self._v1469_cancel_bucket_finalizer(token)
+        getattr(
+            self, "_v1469_paid_path_inflight_tokens", set()
+        ).discard(token)
+        self._v1469_forget_paid_token(token)
+        opportunity = self._v1469_clean_staged_opportunity(
+            staged_opportunity
+        )
+        exact_snapshot_ready = True
         try:
-            legacy = self._v1469_build_resolved_legacy_snapshot(run, decision, codex_decision,
-                entry_signal_price=entry_signal_price, entry_offset_bp=entry_offset_bp,
-                entry_notional=entry_notional, opportunity=opportunity, candidates=candidates)
+            legacy = self._v1469_build_resolved_legacy_snapshot(
+                run,
+                decision,
+                codex_decision,
+                entry_signal_price=entry_signal_price,
+                entry_offset_bp=entry_offset_bp,
+                entry_notional=entry_notional,
+                opportunity=opportunity,
+                candidates=candidates,
+            )
             opportunity["legacy_execution_snapshot"] = legacy
-        except Exception as exc:  # noqa: BLE001 - evidence fails closed, paid path unchanged
-            reason = f"exact_snapshot_data_blocked:{type(exc).__name__}:{str(exc)[:160]}"
-            logger.error("v1469_legacy_control_snapshot_data_blocked",
-                run_id=run.get("run_id"), reason=reason)
+        except Exception as exc:  # noqa: BLE001 - paid legacy path stays authoritative
+            exact_snapshot_ready = False
+            reason = (
+                "exact_snapshot_data_blocked:"
+                f"{type(exc).__name__}:{str(exc)[:160]}"
+            )
+            opportunity, candidates = self._v1469_degraded_observation_payload(
+                opportunity,
+                candidates,
+                reason=reason,
+            )
+            logger.error(
+                "v1469_legacy_control_snapshot_data_blocked",
+                run_id=run.get("run_id"),
+                reason=reason,
+            )
+
         try:
-            await asyncio.wait_for(asyncio.shield(self._v1469_persist_lane_observation(
-                repository=self._v1469_arm_observation_repo,
-                run_id=str(run.get("run_id") or ""), dedup_key=dedup_key,
-                opportunity=opportunity, candidates=candidates)), timeout=5.0)
-        except (TimeoutError, Exception) as exc:  # noqa: BLE001 - legacy remains authoritative
-            logger.error("v1469_accepted_durability_barrier_failed",
-                run_id=run.get("run_id"), opportunity_id=opportunity.get("opportunity_id"),
-                error=str(exc)[:300])
-        return str(opportunity.get("opportunity_id") or "")
+            persistence_task = self._v1469_start_observation_task(
+                self._v1469_arm_observation_repo,
+                run_id,
+                dedup_key,
+                opportunity,
+                candidates,
+                raise_on_error=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - observation only
+            self._v1469_release_exact_persistence_owner(exact_owner)
+            logger.error(
+                "v1469_accepted_durability_writer_start_failed",
+                run_id=run.get("run_id"),
+                error=str(exc)[:300],
+            )
+            return None
 
-    def _v1469_flush_adaptive_only(self, run: Mapping[str, Any]) -> None:
-        """Release a deferred paid observation after a later legacy rejection."""
-        pending = self._v1469_pending_paid_observations.pop(
-            str(run.get("run_id") or ""), None)
-        if pending is None or self._v1469_arm_observation_repo is None:
+        def exact_writer_finished(
+            completed: asyncio.Task[dict[str, Any] | None],
+        ) -> None:
+            completed_outcome: Mapping[str, Any] | None = None
+            try:
+                value = completed.result()
+                if isinstance(value, Mapping):
+                    completed_outcome = value
+            except asyncio.CancelledError:
+                completed_outcome = None
+            except Exception:  # noqa: BLE001 - callback releases ownership
+                completed_outcome = None
+            if (
+                exact_snapshot_ready
+                and completed_outcome is not None
+                and bool(completed_outcome.get("observation_durable"))
+                and (
+                    bool(completed_outcome.get("paired_complete"))
+                    or int(completed_outcome.get("capacity_dropped") or 0) > 0
+                )
+                and str(completed_outcome.get("durable_opportunity_id") or "")
+            ):
+                # This callback also covers a writer that completes after the
+                # caller's durability timeout.  Siblings are removed before
+                # exact ownership is released, so no degraded writer can race.
+                self._v1469_discard_pending_bucket_siblings(
+                    run_id,
+                    dedup_key,
+                )
+            self._v1469_release_exact_persistence_owner(exact_owner)
+
+        persistence_task.add_done_callback(exact_writer_finished)
+        try:
+            outcome = await asyncio.wait_for(
+                asyncio.shield(persistence_task),
+                timeout=self.V1469_DURABILITY_BARRIER_SECONDS,
+            )
+        except TimeoutError:
+            # The writer remains tracked and shutdown-drainable, but the caller
+            # must not treat this opportunity as durably available yet.
+            logger.error(
+                "v1469_accepted_durability_barrier_timeout",
+                run_id=run.get("run_id"),
+                opportunity_id=opportunity.get("opportunity_id"),
+            )
+            return None
+        except Exception as exc:  # noqa: BLE001 - legacy remains authoritative
+            logger.error(
+                "v1469_accepted_durability_barrier_failed",
+                run_id=run.get("run_id"),
+                opportunity_id=opportunity.get("opportunity_id"),
+                error=str(exc)[:300],
+            )
+            return None
+        if (
+            not exact_snapshot_ready
+            or not isinstance(outcome, Mapping)
+            or not bool(outcome.get("observation_durable"))
+            or not bool(outcome.get("paired_complete"))
+        ):
+            return None
+        durable_id = str(outcome.get("durable_opportunity_id") or "")
+        if not durable_id:
+            return None
+        # Usually the task callback already performed this cleanup.  Keep the
+        # explicit idempotent call so the return barrier owns the same contract.
+        self._v1469_discard_pending_bucket_siblings(run_id, dedup_key)
+        return durable_id
+
+    def _v1469_flush_adaptive_only(
+        self,
+        run: Mapping[str, Any],
+        *,
+        reason: str | None = None,
+    ) -> None:
+        """Release this evaluator token; the fixed bucket owns finalization."""
+
+        run_id = str(run.get("run_id") or "")
+        token = self._v1469_current_paid_token(run_id)
+        if token is None:
             return
-        dedup_key, opportunity, candidates = pending
-        self._v1469_schedule_observation(self._v1469_arm_observation_repo,
-            str(run.get("run_id") or ""), dedup_key, opportunity, candidates)
-
+        pending = getattr(
+            self, "_v1469_pending_paid_observations", {}
+        )
+        item = pending.get(token)
+        if item is not None and reason:
+            item_run_id, dedup_key, opportunity, candidates = item
+            staged = dict(opportunity)
+            staged["_v1469_deferred_reason"] = str(reason)
+            pending[token] = (
+                item_run_id,
+                dedup_key,
+                staged,
+                candidates,
+            )
+        getattr(
+            self, "_v1469_paid_path_inflight_tokens", set()
+        ).discard(token)
+        self._v1469_forget_paid_token(token)
+        self._v1469_finalize_expired_pending(
+            int(time.time() * 1000),
+            only_token=token,
+        )
     async def _place_entry(
         self,
         run: dict,
@@ -19038,7 +19802,13 @@ class MainnetOneRunManager:
     ) -> None:
         await self._ensure_runtime_config_loaded()
         if self._codex_v1_execution_enabled() and codex_decision is None:
-            self._v1469_flush_adaptive_only(run)
+            self._v1469_flush_adaptive_only(
+                run,
+                reason=(
+                    "exact_snapshot_data_blocked:"
+                    "codex_v1_enabled_without_accepted_lane"
+                ),
+            )
             await self._repo.log_event(
                 run["run_id"],
                 "entry_codex_v1_hard_blocked",
@@ -19111,7 +19881,13 @@ class MainnetOneRunManager:
                 features=codex_features,
             )
             if await self._adaptive_gate_before_submit(run, adaptive_decision_payload):
-                self._v1469_flush_adaptive_only(run)
+                self._v1469_flush_adaptive_only(
+                    run,
+                    reason=(
+                        "exact_snapshot_data_blocked:"
+                        "legacy_adaptive_gate_blocked"
+                    ),
+                )
                 return
             await self._maybe_start_adaptive_stup_fill_shadow(
                 run, decision, codex_decision, adaptive_decision_payload
@@ -19172,7 +19948,13 @@ class MainnetOneRunManager:
                     )
                 )
             if claimed_decision is None:
-                self._v1469_flush_adaptive_only(run)
+                self._v1469_flush_adaptive_only(
+                    run,
+                    reason=(
+                        "exact_snapshot_data_blocked:"
+                        f"legacy_authority_claim_blocked:{claim_reason}"
+                    ),
+                )
                 await self._repo.log_event(
                     run["run_id"],
                     (
@@ -19203,16 +19985,29 @@ class MainnetOneRunManager:
         ):
             # The paired evaluator cannot represent an execution that may
             # dynamically fall back from post-only to GTC.
-            self._v1469_flush_adaptive_only(run)
+            self._v1469_flush_adaptive_only(
+                run,
+                reason=(
+                    "exact_snapshot_data_blocked:unsupported_gtc_fallback"
+                ),
+            )
             logger.error("v1469_legacy_control_snapshot_data_blocked",
                          run_id=run.get("run_id"),
                          reason="exact_snapshot_data_blocked:unsupported_gtc_fallback")
         else:
             snapshot_raw = None
-            pending = self._v1469_pending_paid_observations.get(str(run.get("run_id") or ""))
+            token = self._v1469_current_paid_token(
+                str(run.get("run_id") or "")
+            )
+            pending = self._v1469_pending_paid_observations.get(
+                str(token or "")
+            )
             if pending is not None:
-                snapshot_raw = float(dict(pending[1].get("feature_snapshot") or {}).get(
-                    "signal_reference_price"))
+                snapshot_raw = float(
+                    dict(pending[2].get("feature_snapshot") or {}).get(
+                        "signal_reference_price"
+                    )
+                )
             intended_price = entry_signal_price * (
                 1 - ladder_offset if side == "BUY" else 1 + ladder_offset
             )

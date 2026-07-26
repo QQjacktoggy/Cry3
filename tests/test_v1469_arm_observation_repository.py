@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 import sqlite3
 
 import pytest
 
+from src.gridbot.mainnet.one_run import MainnetOneRunManager
 from src.gridbot.storage.database import Database
 from src.gridbot.storage.v1469_arm_observation_repository import (
     ArmEvidenceConflictError,
@@ -185,6 +188,47 @@ async def test_same_bucket_restart_snapshot_does_not_conflict_durably(
         assert first_result["opportunity_inserted"] is True
         assert second_result["source_replay"] is True
         assert second_result["durable_opportunity_id"] == first.opportunity_id
+        durable = await repo.load_observation_bundle(
+            second_result["durable_opportunity_id"]
+        )
+        assert durable is not None
+        stored_opportunity = durable["opportunity"]
+        assert stored_opportunity["opportunity_id"] == first.opportunity_id
+        assert (
+            stored_opportunity["feature_snapshot"]
+            == first.opportunity["feature_snapshot"]
+        )
+        assert (
+            stored_opportunity["feature_snapshot"]
+            != second.opportunity["feature_snapshot"]
+        )
+        canonical_snapshot = json.dumps(
+            first.opportunity["feature_snapshot"],
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        assert stored_opportunity["feature_hash"] == hashlib.sha256(
+            canonical_snapshot.encode("utf-8")
+        ).hexdigest()
+        expected_candidates = sorted(
+            first.candidates,
+            key=lambda item: (
+                item.get("selection_rank") is None,
+                item.get("selection_rank") or 0,
+                candidate_identity(item),
+            ),
+        )
+        assert [item["candidate_id"] for item in durable["candidates"]] == [
+            candidate_identity(item) for item in expected_candidates
+        ]
+        assert all(
+            isinstance(item["annotations"], dict)
+            and isinstance(item["is_selected"], bool)
+            and isinstance(item["data_complete"], bool)
+            for item in durable["candidates"]
+        )
         assert await db.fetchone(
             "SELECT COUNT(*) AS n FROM v1469_market_opportunities"
         ) == {"n": 1}
@@ -572,6 +616,32 @@ async def test_observation_bundle_candidate_conflict_rolls_back_all_new_rows(
 
 
 @pytest.mark.asyncio
+async def test_single_evidence_append_rejects_legacy_without_sidecar(
+    tmp_path: Path,
+) -> None:
+    db, repo = await _repository(tmp_path)
+    try:
+        opportunity = _opportunity()
+        candidate = _candidate()
+        await repo.insert_opportunity(opportunity)
+        await repo.insert_candidate(candidate)
+        with pytest.raises(
+            ValueError,
+            match="append_evidence_bundle sidecar",
+        ):
+            await repo.append_evidence(
+                {
+                    **_evidence(candidate),
+                    "execution_profile_id": "LEGACY_CONTROL",
+                }
+            )
+        assert await db.fetchone(
+            "SELECT COUNT(*) AS n FROM v1469_arm_evidence"
+        ) == {"n": 0}
+    finally:
+        await db.close()
+
+@pytest.mark.asyncio
 async def test_evidence_append_terminal_is_idempotent_and_conflict_safe(
     tmp_path: Path,
 ) -> None:
@@ -759,3 +829,140 @@ async def test_directional_regime_round_trips_into_arm_identity(
         assert stored["arm_key"].startswith("v1469a_")
     finally:
         await db.close()
+
+
+@pytest.mark.asyncio
+async def test_data_blocked_exact_snapshot_reason_round_trips_in_candidate_annotations(
+    tmp_path: Path,
+) -> None:
+    db, repo = await _repository(tmp_path)
+    manager = object.__new__(MainnetOneRunManager)
+    manager._v1469_observation_tasks = set()
+    manager._v1469_observation_inflight_ids = set()
+    manager._v1469_observed_opportunity_ids = set()
+    manager._v1469_paired_shadow_runtime = None
+    reason = "exact_snapshot_data_blocked:unsupported_gtc_fallback"
+    opportunity = _opportunity()
+    candidate = _candidate()
+    original_snapshot = dict(opportunity["feature_snapshot"])
+    canonical_snapshot = json.dumps(
+        original_snapshot,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    original_hash = hashlib.sha256(
+        canonical_snapshot.encode("utf-8")
+    ).hexdigest()
+
+    try:
+        manager._v1469_start_adaptive_only_observation(
+            repo,
+            "run-1",
+            "dedup-1",
+            opportunity,
+            (candidate,),
+            reason=reason,
+        )
+        task = next(iter(manager._v1469_observation_tasks))
+        await task
+
+        stored_opportunity = await db.fetchone(
+            """SELECT data_quality, feature_snapshot_json, feature_hash
+            FROM v1469_market_opportunities
+            WHERE opportunity_id = ?""",
+            (opportunity["opportunity_id"],),
+        )
+        assert stored_opportunity == {
+            "data_quality": "DATA_INCOMPLETE",
+            "feature_snapshot_json": canonical_snapshot,
+            "feature_hash": original_hash,
+        }
+        stored_candidate = await db.fetchone(
+            """SELECT safety_status, data_complete, annotations_json
+            FROM v1469_lane_candidates
+            WHERE candidate_id = ?""",
+            (candidate_identity(candidate),),
+        )
+        assert stored_candidate is not None
+        assert stored_candidate["safety_status"] == "DATA_BLOCKED"
+        assert stored_candidate["data_complete"] == 0
+        assert json.loads(stored_candidate["annotations_json"])[
+            "exact_snapshot_data_blocked"
+        ] == reason
+    finally:
+        await db.close()
+
+
+def test_migration_020_sidecar_is_rerunnable_and_append_only() -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.executescript(MIGRATION.read_text(encoding="utf-8"))
+    migration_020 = Path(
+        "src/gridbot/storage/migrations/020_v1469_legacy_execution_snapshot.sql"
+    ).read_text(encoding="utf-8")
+    connection.executescript(migration_020)
+    connection.executescript(migration_020)
+
+    connection.execute(
+        """INSERT INTO v1469_market_opportunities (
+            opportunity_id, environment, symbol, observed_at_ms, feature_at_ms,
+            coarse_regime, regime_confidence, feature_schema, feature_hash,
+            feature_snapshot_json, source_run_id, source_event_id,
+            data_quality, created_at_ms
+        ) VALUES (
+            'opp-020', 'MAINNET', 'ETHUSDC', 100, 90, 'RANGE', 0.8,
+            'schema', 'hash', '{}', 'run-020', 'event-020', 'COMPLETE', 100
+        )"""
+    )
+    connection.execute(
+        """INSERT INTO v1469_lane_candidates (
+            candidate_id, opportunity_id, lane_code, effective_side, strategy,
+            match_status, safety_status, is_selected, selection_rank,
+            suppression_reason, suppressed_by_lane_code, matcher_version,
+            matcher_hash, data_complete, annotations_json, created_at_ms
+        ) VALUES (
+            'candidate-020', 'opp-020', 'W6A', 'LONG', 'S1_BB_RSI',
+            'MATCH', 'SAFE', 1, 0, NULL, NULL, 'v1', 'matcher', 1, '{}', 100
+        )"""
+    )
+    profile_hash = "a" * 64
+    connection.execute(
+        """INSERT INTO v1469_arm_evidence (
+            evidence_id, opportunity_id, candidate_id, arm_key,
+            execution_profile_id, execution_profile_schema,
+            execution_profile_hash, source_type, diagnostic_only,
+            observed_at_ms, status, data_complete, ambiguous,
+            created_at_ms, updated_at_ms
+        ) VALUES (
+            'evidence-020', 'opp-020', 'candidate-020', 'arm-020',
+            'LEGACY_CONTROL', 'v1469.execution-profile.1', ?, 'SHADOW', 0,
+            100, 'PENDING', 0, 0, 100, 100
+        )""",
+        (profile_hash,),
+    )
+    connection.execute(
+        """INSERT INTO v1469_arm_evidence_profile_payloads (
+            evidence_id, opportunity_id, candidate_id, source_type,
+            execution_profile_id, execution_profile_schema,
+            execution_profile_hash, canonical_payload_json, created_at_ms
+        ) VALUES (
+            'evidence-020', 'opp-020', 'candidate-020', 'SHADOW',
+            'LEGACY_CONTROL', 'v1469.execution-profile.1', ?, '{}', 100
+        )""",
+        (profile_hash,),
+    )
+    assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+    with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+        connection.execute(
+            """UPDATE v1469_arm_evidence_profile_payloads
+            SET canonical_payload_json = '{\"changed\":true}'
+            WHERE evidence_id = 'evidence-020'"""
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        connection.execute(
+            """DELETE FROM v1469_arm_evidence_profile_payloads
+            WHERE evidence_id = 'evidence-020'"""
+        )
+    connection.close()
