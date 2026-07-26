@@ -2,7 +2,20 @@
 
 日期：2026-07-25  
 對象：Cry3 Live Mainnet Adaptive  
-狀態：**設計與 Live evidence 稽核完成；尚未修改交易路徑、尚未部署**
+狀態：**R0 observation safety 完成；R1 paid authority 尚未開始、尚未部署**
+
+## 0. 2026-07-26 implementation checkpoint
+
+R0 已完成：production observation bucket 固定為 30 秒且設定／schema 不安全時
+startup fail closed；所有 arms 共用有 8-entry、50,000-row、兩小時 expiry 的 bounded
+aggTrade cache；lane observation persistence 維持 non-blocking 且保留每 lane 診斷；普通
+strategy SL 不再自動視為 risk-policy hard loss；Telegram monitor 顯示 exact arm/profile、
+rolling evidence、freshness、lease/state、blockers 與 legacy-control authority 比較。
+
+R1 未開始。`mainnet_codex_v1469_live_enforcement_enabled` 仍為 `False`，legacy paid
+behavior 不變。部署 gates：完成 exact `LEGACY_CONTROL` paired arm、唯一 paid lease/claim
+authority、crash-safe deterministic order lifecycle、restart/concurrency reconciliation、
+probation/live/demotion 與完整 acceptance tests，之後仍須 human review 才能開啟 enforcement。
 
 ## Executive Summary
 

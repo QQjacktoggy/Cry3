@@ -399,7 +399,12 @@ def _parse_individual_row(row: Mapping[str, Any]) -> _ParsedRow:
         evaluable=True,
         data_complete=True,
         identity_valid=True,
-        hard_loss=terminal_reason == "SL",
+        # A strategy stop is an ordinary sampled outcome.  Only the producer's
+        # explicit risk-policy marker may trip the arbiter hard-loss circuit.
+        hard_loss=(
+            payload.get("hard_loss") is True
+            or payload.get("risk_policy_hard_loss") is True
+        ),
     )
     contract = payload.get("paired_contract")
     return _ParsedRow(

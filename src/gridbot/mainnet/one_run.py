@@ -394,6 +394,9 @@ class MainnetOneRunManager:
 
     V1469_OBSERVATION_SEEN_MAX = 4096
     V1469_OBSERVATION_MAX_INFLIGHT = 32
+    V1469_AGGTRADE_CACHE_MAX_ENTRIES = 8
+    V1469_AGGTRADE_CACHE_MAX_ROWS = 50_000
+    V1469_AGGTRADE_CACHE_TTL_MS = 2 * 60 * 60 * 1000
     CODEX_V1_SHADOW_SAMPLE_COOLDOWN_S = 90
     CODEX_V1_SHADOW_ENTRY_REF_MOVE_BP = 5.0
     CODEX_V1_SHADOW_MAX_SAMPLES_PER_RUN = 12
@@ -14389,6 +14392,13 @@ class MainnetOneRunManager:
         symbol = str(samples[0].get("symbol") or ADAPTIVE_SYMBOL).upper()
         start_ms = min(int(sample.get("start_ms") or target_ms) for sample in samples)
         cache_key = f"{run_id}|{symbol}"
+        now_ms = int(time.time() * 1000)
+        # The cache is shared by all arms in an opportunity/run.  Expire and
+        # bound it before lookup so fan-out can never multiply REST state.
+        for key, value in list(self._v1461_shadow_aggtrade_caches.items()):
+            touched_ms = int(value.get("last_access_ms") or 0)
+            if now_ms - touched_ms >= self.V1469_AGGTRADE_CACHE_TTL_MS:
+                self._v1461_shadow_aggtrade_caches.pop(key, None)
         cache = self._v1461_shadow_aggtrade_caches.get(cache_key)
         if cache is None or int(cache.get("coverage_start_ms") or start_ms) > start_ms:
             cache = {
@@ -14400,8 +14410,20 @@ class MainnetOneRunManager:
                 "fetch_failures": 0,
                 "invalid_reason": None,
                 "last_error": None,
+                "created_at_ms": now_ms,
+                "last_access_ms": now_ms,
             }
+            while len(self._v1461_shadow_aggtrade_caches) >= self.V1469_AGGTRADE_CACHE_MAX_ENTRIES:
+                oldest = min(
+                    self._v1461_shadow_aggtrade_caches,
+                    key=lambda key: (
+                        int(self._v1461_shadow_aggtrade_caches[key].get("last_access_ms") or 0),
+                        key,
+                    ),
+                )
+                self._v1461_shadow_aggtrade_caches.pop(oldest, None)
             self._v1461_shadow_aggtrade_caches[cache_key] = cache
+        cache["last_access_ms"] = now_ms
         if cache.get("invalid_reason") or int(cache.get("coverage_end_ms") or 0) >= target_ms:
             return cache
         getter = getattr(self._client, "get_agg_trades", None)
@@ -14498,6 +14520,15 @@ class MainnetOneRunManager:
                 cache["invalid_reason"] = "aggTrade pagination did not advance"
                 break
             in_window = [item for item in parsed if item[0] <= target_ms]
+            remaining = self.V1469_AGGTRADE_CACHE_MAX_ROWS - len(cache["rows"])
+            if len(in_window) > remaining:
+                cache["rows"].extend(item[2] for item in in_window[:remaining])
+                cache["invalid_reason"] = "aggTrade cache row capacity exhausted"
+                cache["coverage_end_ms"] = max(
+                    int(cache.get("coverage_end_ms") or (start_ms - 1)),
+                    int(in_window[max(0, remaining - 1)][0]) - 1 if remaining else start_ms - 1,
+                )
+                break
             cache["rows"].extend(item[2] for item in in_window)
             crossed_target = len(in_window) < len(parsed)
             if in_window:

@@ -568,6 +568,10 @@ class V1469ArmObservationView:
     last_evidence_at_ms: int = 0
     arbiter_eligible: bool = False
     arbiter_blockers: tuple[str, ...] = ()
+    lease_phase: str = "NONE"
+    lease_status: str = "NONE"
+    lease_expires_at_ms: int = 0
+    notional_cap_usdc: float = 0.0
 
     @property
     def ev_bp(self) -> float | None:
@@ -1870,6 +1874,8 @@ async def collect_v1469_observation(
         lane_rows = summary.get("lanes")
         suppressed_rows = summary.get("suppressed_by")
         opportunity_totals = summary.get("opportunities")
+        arm_rows = summary.get("arms", [])
+        lease_rows = summary.get("leases", [])
         if not isinstance(lane_rows, list) or not isinstance(
             suppressed_rows, list
         ) or not isinstance(opportunity_totals, Mapping):
@@ -1898,6 +1904,43 @@ async def collect_v1469_observation(
                     raw.get("last_observed_at_ms")
                 ),
             )
+        if not isinstance(arm_rows, list) or not isinstance(lease_rows, list):
+            raise TypeError("v1469 arm/lease monitor rows are unavailable")
+        leases = {
+            str(row.get("arm_key") or ""): row
+            for row in lease_rows
+            if isinstance(row, Mapping)
+        }
+        for raw in arm_rows:
+            if not isinstance(raw, Mapping):
+                raise TypeError("v1469 arm summary row is invalid")
+            code = str(raw.get("lane_code") or "").strip().upper()
+            view = views.get(code)
+            if view is None:
+                continue
+            arm_key = str(raw.get("arm_key") or "").strip()
+            lease = leases.get(arm_key, {})
+            view.arms.append(V1469ArmObservationView(
+                arm_key=arm_key,
+                lane_code=code,
+                side=str(raw.get("effective_side") or "").strip().upper(),
+                regime=str(raw.get("coarse_regime") or "").strip().upper(),
+                profile_id=str(raw.get("execution_profile_id") or "").strip(),
+                evidence=_positive_int(raw.get("evidence")),
+                pending=_positive_int(raw.get("pending")),
+                terminal=_positive_int(raw.get("terminal")),
+                dropped=_positive_int(raw.get("dropped")),
+                evaluable=_positive_int(raw.get("evaluable")),
+                reward_net_bp=_number(raw.get("evaluable_reward_net_bp")) or 0.0,
+                tp_first=_positive_int(raw.get("tp_first")),
+                sl_first=_positive_int(raw.get("sl_first")),
+                no_fill=_positive_int(raw.get("no_fill")),
+                last_evidence_at_ms=_positive_int(raw.get("last_evidence_at_ms")),
+                lease_phase=str(lease.get("phase") or "NONE").upper(),
+                lease_status=str(lease.get("status") or "NONE").upper(),
+                lease_expires_at_ms=_positive_int(lease.get("expires_at_ms")),
+                notional_cap_usdc=_number(lease.get("notional_cap_usdc")) or 0.0,
+            ))
         for raw in suppressed_rows:
             if not isinstance(raw, Mapping):
                 raise TypeError("v1469 suppression row is invalid")
@@ -2522,6 +2565,22 @@ def _v1469_observation_detail_section(
             f"suppressed-by: <code>{histogram}</code>",
         )
     )
+    if view.arms:
+        lines.append("<b>Exact arms (legacy control remains paid authority)</b>")
+    for arm in view.arms:
+        ev = "—" if arm.ev_bp is None else f"{arm.ev_bp:+.2f}bp"
+        blockers = "none" if arm.evaluable else "rolling_window_not_ready"
+        lines.extend((
+            f"<code>{escape(arm.arm_key[:16])}</code> {escape(arm.side)}/"
+            f"{escape(arm.regime)} profile=<code>{escape(arm.profile_id)}</code>",
+            f"  evidence {arm.evidence} | terminal/evaluable "
+            f"{arm.terminal}/{arm.evaluable} | TP/SL/NF "
+            f"{arm.tp_first}/{arm.sl_first}/{arm.no_fill} | EV {ev} | "
+            f"fresh {_freshness(arm.last_evidence_at_ms, now_ms)}",
+            f"  state/lease {escape(arm.lease_phase)}/{escape(arm.lease_status)} "
+            f"({_lease_remaining(arm.lease_expires_at_ms, now_ms)}) | "
+            f"cap {arm.notional_cap_usdc:.2f} | blockers <code>{blockers}</code>",
+        ))
     return "\n".join(lines)
 
 

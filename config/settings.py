@@ -985,7 +985,7 @@ class Settings(BaseSettings):
     # may materialize read-only lease proposals.  Only live_enforcement may
     # affect paid admission, and it has additional startup invariants below.
     mainnet_codex_v1469_observation_enabled: bool = False
-    mainnet_codex_v1469_observation_bucket_seconds: int = 2 * 60
+    mainnet_codex_v1469_observation_bucket_seconds: int = 30
     mainnet_codex_v1469_paired_shadow_enabled: bool = False
     mainnet_codex_v1469_arbiter_enabled: bool = False
     mainnet_codex_v1469_live_enforcement_enabled: bool = False
@@ -1112,6 +1112,15 @@ class Settings(BaseSettings):
             errors.append("v1469_observation=true when paired_shadow=true")
         if v1469_arbiter and not v1469_paired_shadow:
             errors.append("v1469_paired_shadow=true when arbiter=true")
+        if v1469_observation:
+            try:
+                v1469_bucket = int(
+                    self.mainnet_codex_v1469_observation_bucket_seconds
+                )
+            except (TypeError, ValueError, OverflowError):
+                v1469_bucket = 0
+            if v1469_bucket != 30:
+                errors.append("v1469_observation_bucket_seconds=30")
         if v1469_enforcement:
             # v1.4.69 currently has a shadow evaluator and a read-only
             # authority proposal path only.  Until the paid-order adapter

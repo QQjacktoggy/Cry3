@@ -152,20 +152,17 @@ class App:
                 bucket_seconds = int(
                     self.settings.mainnet_codex_v1469_observation_bucket_seconds
                 )
-                if not 30 <= bucket_seconds <= 15 * 60:
-                    raise ValueError(
-                        "observation bucket must be between 30 and 900 seconds"
-                    )
+                if bucket_seconds != 30:
+                    raise ValueError("observation bucket must be exactly 30 seconds")
                 fingerprint = (
                     await self.v1469_arm_observation_repo.assert_schema_ready()
                 )
-            except Exception as exc:  # passive telemetry must not stop paid bot
+            except Exception as exc:
                 self.v1469_arm_observation_ready = False
-                logger.error(
-                    "v1469_observation_degraded",
-                    error=f"{type(exc).__name__}:{str(exc)[:500]}",
-                    paid_path_affected=False,
-                )
+                raise RuntimeError(
+                    "unsafe v1.4.69 observation configuration/schema: "
+                    f"{type(exc).__name__}:{str(exc)[:500]}"
+                ) from exc
             else:
                 self.v1469_arm_observation_ready = True
                 logger.info(

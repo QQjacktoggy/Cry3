@@ -212,6 +212,37 @@ def test_complete_contract_maps_all_profiles_as_trusted_paired_evidence() -> Non
     )
 
 
+def test_only_explicit_boolean_marker_trips_hard_loss() -> None:
+    row = _row(
+        "RANGE_SCALP",
+        include_contract=False,
+        outcome="sl_first",
+    )
+    payload = json.loads(row["terminal_payload_json"])
+    payload.pop("terminal_hash")
+    payload["terminal_reason"] = "SL"
+    payload["hard_loss"] = "false"
+    payload["terminal_hash"] = canonical_sha256(payload)
+    row["terminal_reason"] = "SL"
+    row["terminal_payload_json"] = _canonical(payload)
+    _rehash_row(row)
+
+    result = map_durable_paired_evidence([row], ledger_scope_complete=True)
+
+    evidence = result.candidates[0].evidence[0]
+    assert evidence.hard_loss is False
+
+    payload.pop("terminal_hash")
+    payload["hard_loss"] = True
+    payload["terminal_hash"] = canonical_sha256(payload)
+    row["terminal_payload_json"] = _canonical(payload)
+    _rehash_row(row)
+
+    result = map_durable_paired_evidence([row], ledger_scope_complete=True)
+
+    assert result.candidates[0].evidence[0].hard_loss is True
+
+
 def test_mapping_and_revisions_are_deterministic_under_row_reordering() -> None:
     rows = [_row(profile_id) for profile_id in expected_profile_ids("RANGE")]
     first = map_durable_paired_evidence(

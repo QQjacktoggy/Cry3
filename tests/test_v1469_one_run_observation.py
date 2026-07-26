@@ -38,7 +38,7 @@ def _manager(repository: _RecordingRepository) -> MainnetOneRunManager:
     manager = object.__new__(MainnetOneRunManager)
     manager._settings = SimpleNamespace(
         mainnet_codex_v1469_observation_enabled=True,
-        mainnet_codex_v1469_observation_bucket_seconds=120,
+        mainnet_codex_v1469_observation_bucket_seconds=30,
     )
     manager._v1469_arm_observation_repo = repository
     manager._v1469_observed_opportunity_ids = set()
@@ -233,3 +233,64 @@ def test_observation_regime_is_symbol_level_and_never_advances_paid_fsm(
     snapshot = opportunity["feature_snapshot"]
     assert snapshot["market_state"] == "TREND_UP"
     assert snapshot["v1469_regime_market_state"] == "TREND_UP"
+
+
+def test_shared_aggtrade_cache_reuses_one_fetch_for_all_lane_arms(monkeypatch):
+    class Client:
+        def __init__(self):
+            self.calls = 0
+
+        async def get_agg_trades(self, *_args, **_kwargs):
+            self.calls += 1
+            return [{"a": 1, "T": 1_100, "p": "100", "q": "1"}]
+
+    manager = object.__new__(MainnetOneRunManager)
+    manager._client = Client()
+    manager._settings = SimpleNamespace(
+        mainnet_codex_v1460_weak_shadow_max_pages=10,
+        mainnet_codex_v1464_shadow_aggtrade_pages_per_cycle=1,
+        mainnet_codex_v1460_weak_shadow_page_limit=1000,
+    )
+    manager._v1461_shadow_aggtrade_caches = {}
+    monkeypatch.setattr(one_run_module.time, "time", lambda: 2.0)
+    samples = tuple(
+        {"symbol": "ETHUSDC", "start_ms": 1_000, "lane": lane}
+        for lane in ("W2A", "W6A", "CNL-WPR-L")
+    )
+
+    async def exercise():
+        first = await manager._v1461_advance_shadow_aggtrade_cache(
+            "shared-run", samples, 1_500
+        )
+        second = await manager._v1461_advance_shadow_aggtrade_cache(
+            "shared-run", samples, 1_500
+        )
+        return first, second
+
+    first, second = asyncio.run(exercise())
+    assert first is second
+    assert manager._client.calls == 1
+    assert first["coverage_end_ms"] == 1_500
+
+
+def test_shared_aggtrade_cache_expiry_and_entry_bound(monkeypatch):
+    manager = object.__new__(MainnetOneRunManager)
+    manager._client = SimpleNamespace(get_agg_trades=None)
+    manager._settings = SimpleNamespace()
+    manager._v1461_shadow_aggtrade_caches = {
+        f"old-{index}|ETHUSDC": {
+            "last_access_ms": index,
+            "coverage_start_ms": 0,
+            "coverage_end_ms": 0,
+            "rows": [],
+        }
+        for index in range(manager.V1469_AGGTRADE_CACHE_MAX_ENTRIES)
+    }
+    monkeypatch.setattr(one_run_module.time, "time", lambda: 10_000.0)
+
+    asyncio.run(manager._v1461_advance_shadow_aggtrade_cache(
+        "new-run", ({"symbol": "ETHUSDC", "start_ms": 1},), 2
+    ))
+
+    assert len(manager._v1461_shadow_aggtrade_caches) == 1
+    assert "new-run|ETHUSDC" in manager._v1461_shadow_aggtrade_caches

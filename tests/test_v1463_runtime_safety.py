@@ -103,6 +103,22 @@ def test_v1469_shadow_and_read_only_arbiter_accept_closed_contract():
     settings.assert_mainnet_v1463_runtime_safety()
 
 
+@pytest.mark.parametrize("bucket", [29, 31, 120, "invalid"])
+def test_v1469_observation_requires_exact_thirty_second_bucket(bucket):
+    settings = _settings(
+        mainnet_one_run_enabled=True,
+        mainnet_codex_v1_enabled=True,
+        mainnet_codex_v1462_strict_live_allowlist_enabled=True,
+        mainnet_codex_v1462_shadow_all_enabled=True,
+        mainnet_codex_v1462_promotion_enforcement_enabled=False,
+        mainnet_codex_v1469_observation_enabled=True,
+        mainnet_codex_v1469_observation_bucket_seconds=bucket,
+    )
+
+    with pytest.raises(RuntimeError, match="v1469_observation_bucket_seconds=30"):
+        settings.assert_mainnet_v1463_runtime_safety()
+
+
 def test_v1469_enforcement_rejected_until_paid_claim_adapter_exists():
     settings = _settings(
         mainnet_one_run_enabled=True,
