@@ -2,7 +2,7 @@
 
 日期：2026-07-25  
 對象：Cry3 Live Mainnet Adaptive  
-狀態：**R0 observation safety 完成；R1 claim lifecycle 部分完成、paid authority 尚未完成／部署**
+狀態：**R0 observation safety 完成；R1-B claim safety checkpoint 完成、paid authority 尚未完成／部署**
 
 ## 0. 2026-07-26 implementation checkpoint
 
@@ -12,10 +12,10 @@ aggTrade cache；lane observation persistence 維持 non-blocking 且保留每 l
 strategy SL 不再自動視為 risk-policy hard loss；Telegram monitor 顯示 exact arm/profile、
 rolling evidence、freshness、lease/state、blockers 與 legacy-control authority 比較。
 
-R1 僅完成 repository-side submission state machine 與 deterministic Binance-safe client
+R1-B safety checkpoint 已加入既有資料庫的 019 table-rebuild migration、repository-side submission state machine 與 deterministic Binance-safe client
 order ID adapter：durable state 可表達 `CLAIMED -> SUBMITTING -> UNKNOWN|SUBMITTED ->
 TERMINAL`，且 adapter 在 submit 前用 client ID 查詢，exception/timeout 持久化 UNKNOWN，
-restart 時只 reconciliation、不從 UNKNOWN 盲目重送。`mainnet_codex_v1469_live_enforcement_enabled`
+restart 時只 reconciliation、不從 persisted SUBMITTING/UNKNOWN 盲目重送；只有成功取得 CLAIMED→SUBMITTING CAS 的該次 caller 可呼叫 submit，並有 two-repository race、timeout 與 restart 測試。`mainnet_codex_v1469_live_enforcement_enabled`
 仍為 `False`，legacy paid behavior 不變。
 
 **R1 尚未完成，不得宣稱完成或開啟 enforcement。** 尚缺 exact `LEGACY_CONTROL` paired

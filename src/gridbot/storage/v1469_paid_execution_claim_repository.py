@@ -133,10 +133,19 @@ def _claim_id(
 def _claim_from_row(row: Mapping[str, Any]) -> DurablePaidExecutionClaim:
     status = str(row.get("status") or "")
     generation = int(row.get("generation") or 0)
-    if status == "CLAIMED" and generation != 1:
+    minimum_generation = {
+        "CLAIMED": 1, "SUBMITTING": 2, "UNKNOWN": 3,
+        "SUBMITTED": 3, "TERMINAL": 2, "ABANDONED": 2,
+    }
+    if generation < minimum_generation.get(status, 1) or (status == "CLAIMED" and generation != 1):
         raise V1469PaidClaimPersistenceError(
-            "CLAIMED row must have generation 1"
+            f"{status or 'unknown'} row has invalid generation"
         )
+    claimed_at = int(row.get("claimed_at_ms") or 0)
+    created_at = int(row.get("created_at_ms") or 0)
+    updated_at = int(row.get("updated_at_ms") or 0)
+    if created_at < claimed_at or updated_at < created_at:
+        raise V1469PaidClaimPersistenceError("paid-claim timestamps are not monotonic")
     if status not in {"CLAIMED", "SUBMITTING", "UNKNOWN", "SUBMITTED", "TERMINAL", "ABANDONED"}:
         raise V1469PaidClaimPersistenceError(
             f"unknown durable paid-claim status: {status}"
@@ -231,6 +240,10 @@ class V1469PaidExecutionClaimRepository:
                 "PRAGMA table_info(v1469_paid_execution_claim_events)"
             )
         }
+        migration = await self._db.fetchone(
+            "SELECT filename FROM _migrations WHERE filename = ?",
+            ("019_v1469_paid_execution_claim_upgrade.sql",),
+        )
         trigger_rows = await self._db.fetchall(
             """SELECT name FROM sqlite_master
             WHERE type = 'trigger' AND name LIKE 'trg_v1469_paid_claim_%'"""
@@ -245,16 +258,18 @@ class V1469PaidExecutionClaimRepository:
             "trg_v1469_paid_claim_event_identity",
             "trg_v1469_paid_claim_events_no_update",
             "trg_v1469_paid_claim_events_no_delete",
+            "trg_v1469_paid_claim_event_requires_cid",
         }
         missing_claim = sorted(required_claim_columns - claim_columns)
         missing_event = sorted(required_event_columns - event_columns)
         missing_triggers = sorted(required_triggers - triggers)
-        if missing_claim or missing_event or missing_triggers:
+        if migration is None or missing_claim or missing_event or missing_triggers:
             raise V1469PaidClaimPersistenceError(
                 "unsafe v1.4.69 paid-claim schema: "
                 f"missing_claim_columns={missing_claim}, "
                 f"missing_event_columns={missing_event}, "
-                f"missing_triggers={missing_triggers}"
+                f"missing_triggers={missing_triggers}, "
+                f"upgrade_019_applied={migration is not None}"
             )
 
     async def get_claim(

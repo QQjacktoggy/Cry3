@@ -12,6 +12,7 @@ from typing import Any, Awaitable, Callable, Mapping
 
 from src.gridbot.storage.v1469_paid_execution_claim_repository import (
     DurablePaidExecutionClaim,
+    V1469PaidClaimConflictError,
     V1469PaidExecutionClaimRepository,
 )
 
@@ -65,29 +66,59 @@ class V1469PaidExecutionAdapter:
                 )).claim
             return SubmissionResult(durable, cid, visible, False)
 
+        owns_submission = False
         if durable.status == "CLAIMED":
-            durable = (await self._repository.transition_submission(
-                claim_id=durable.claim_id, expected_generation=durable.generation,
-                target_status="SUBMITTING", transition_at_ms=now_ms,
-                idempotency_key=f"submitting:{durable.claim_id}", actor=actor,
-                payload={"client_order_id": cid},
-            )).claim
-        elif durable.status == "UNKNOWN":
+            try:
+                durable = (await self._repository.transition_submission(
+                    claim_id=durable.claim_id, expected_generation=durable.generation,
+                    target_status="SUBMITTING", transition_at_ms=now_ms,
+                    idempotency_key=f"submitting:{durable.claim_id}", actor=actor,
+                    payload={"client_order_id": cid},
+                )).claim
+                owns_submission = True
+            except V1469PaidClaimConflictError:
+                # Another process won the durable CAS.  Reload and reconcile,
+                # but this invocation must never inherit its submit authority.
+                durable = await self._repository.get_claim_by_id(claim.claim_id)
+                if durable is None:
+                    raise RuntimeError("paid claim disappeared after CAS conflict")
+                visible = await find_by_client_order_id(cid)
+                if visible is not None and durable.status not in {"TERMINAL", "ABANDONED"}:
+                    try:
+                        durable = (await self._repository.transition_submission(
+                            claim_id=durable.claim_id,
+                            expected_generation=durable.generation,
+                            target_status="SUBMITTED", transition_at_ms=now_ms,
+                            idempotency_key=f"submitted:{durable.claim_id}:{durable.generation}",
+                            actor=actor,
+                            payload={"client_order_id": cid, "reconciled": True},
+                        )).claim
+                    except V1469PaidClaimConflictError:
+                        durable = await self._repository.get_claim_by_id(claim.claim_id) or durable
+                return SubmissionResult(durable, cid, visible, False)
+        elif durable.status in {"SUBMITTING", "UNKNOWN"}:
             # Absence is not proof of non-acceptance; remain fail-closed.
             return SubmissionResult(durable, cid, None, False)
         elif durable.status == "SUBMITTED":
             return SubmissionResult(durable, cid, None, False)
 
+        if not owns_submission:
+            return SubmissionResult(durable, cid, None, False)
         try:
             order = await submit(cid)
         except BaseException:
             # Persist ambiguity even for cancellation; the caller may be dying.
-            await self._repository.transition_submission(
-                claim_id=durable.claim_id, expected_generation=durable.generation,
-                target_status="UNKNOWN", transition_at_ms=now_ms,
-                idempotency_key=f"unknown:{durable.claim_id}:{durable.generation}",
-                actor=actor, payload={"client_order_id": cid},
-            )
+            try:
+                await self._repository.transition_submission(
+                    claim_id=durable.claim_id, expected_generation=durable.generation,
+                    target_status="UNKNOWN", transition_at_ms=now_ms,
+                    idempotency_key=f"unknown:{durable.claim_id}:{durable.generation}",
+                    actor=actor, payload={"client_order_id": cid},
+                )
+            except BaseException:
+                # Persistence is best effort here and must not replace the
+                # original timeout, exception, or cancellation.
+                pass
             raise
         durable = (await self._repository.transition_submission(
             claim_id=durable.claim_id, expected_generation=durable.generation,
