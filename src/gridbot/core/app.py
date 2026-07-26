@@ -16,6 +16,9 @@ from src.gridbot.grid.models import GridMetrics
 from src.gridbot.mainnet.one_run import MainnetOneRunManager
 from src.gridbot.mainnet.v1459_app_runtime_v3 import build_v1459_app_runtime_v3
 from src.gridbot.mainnet.v1459_readonly_identity_client import V1459ReadOnlyIdentityClient
+from src.gridbot.mainnet.v1469_paid_execution_adapter import (
+    V1469PaidExecutionAdapter,
+)
 from src.gridbot.storage.database import Database
 from src.gridbot.storage.v1464_promotion_repository import (
     V1464PromotionRepository,
@@ -25,6 +28,13 @@ from src.gridbot.storage.v1465_w6a_profile_repository import (
 )
 from src.gridbot.storage.v1469_arm_observation_repository import (
     V1469ArmObservationRepository,
+)
+from src.gridbot.storage.v1469_lease_repository import V1469LeaseRepository
+from src.gridbot.storage.v1469_paid_execution_claim_repository import (
+    V1469PaidExecutionClaimRepository,
+)
+from src.gridbot.storage.v1469_risk_event_repository import (
+    V1469RiskEventRepository,
 )
 from src.gridbot.storage.repositories import (
     AuditLogRepository,
@@ -84,7 +94,14 @@ class App:
         self.v1464_promotion_repo = V1464PromotionRepository(self.db)
         self.v1465_w6a_profile_repo = V1465W6AProfileRepository(self.db)
         self.v1469_arm_observation_repo = V1469ArmObservationRepository(self.db)
+        self.v1469_lease_repo = V1469LeaseRepository(self.db)
+        self.v1469_paid_claim_repo = V1469PaidExecutionClaimRepository(self.db)
+        self.v1469_risk_event_repo = V1469RiskEventRepository(self.db)
+        self.v1469_paid_execution_adapter = V1469PaidExecutionAdapter(
+            self.v1469_paid_claim_repo
+        )
         self.v1469_arm_observation_ready = False
+        self.v1469_authority_ready = False
 
         # Fetcher
         self.fetcher = BinanceFetcher(
@@ -170,6 +187,50 @@ class App:
                     fingerprint=fingerprint,
                     bucket_seconds=bucket_seconds,
                 )
+        v1469_authority_enabled = bool(
+            self.settings.mainnet_codex_v1469_arbiter_enabled
+            or self.settings.mainnet_codex_v1469_live_enforcement_enabled
+        )
+        if v1469_authority_enabled:
+            # This entire readiness boundary deliberately precedes both
+            # Binance connect calls.  Each repository validates the concrete
+            # schema it owns (migrations 016 through 019); a migration marker
+            # alone is not treated as proof of readiness.
+            try:
+                if int(
+                    self.settings.mainnet_codex_v1469_observation_bucket_seconds
+                ) != 30:
+                    raise ValueError("observation bucket must be exactly 30 seconds")
+                exact_runtime = {
+                    "mainnet_codex_v1469_safety_window_seconds": 15 * 60,
+                    "mainnet_codex_v1469_authority_window_seconds": 45 * 60,
+                    "mainnet_codex_v1469_guard_window_seconds": 180 * 60,
+                    "mainnet_codex_v1469_regime_max_age_seconds": 60,
+                    "mainnet_codex_v1469_submit_max_age_seconds": 10,
+                    "mainnet_codex_v1469_probation_lease_seconds": 5 * 60,
+                    "mainnet_codex_v1469_live_lease_seconds": 10 * 60,
+                }
+                mismatched = {
+                    name: getattr(self.settings, name, None)
+                    for name, expected in exact_runtime.items()
+                    if int(getattr(self.settings, name, -1)) != expected
+                }
+                if mismatched:
+                    raise ValueError(
+                        f"v1.4.69 exact runtime settings mismatch: {mismatched}"
+                    )
+                await self.v1469_arm_observation_repo.assert_schema_ready()
+                await self.v1469_lease_repo.assert_schema_ready()
+                await self.v1469_risk_event_repo.assert_schema_ready()
+                await self.v1469_paid_claim_repo.assert_schema_ready()
+            except Exception as exc:
+                self.v1469_authority_ready = False
+                raise RuntimeError(
+                    "unsafe v1.4.69 authority configuration/schema: "
+                    f"{type(exc).__name__}:{str(exc)[:500]}"
+                ) from exc
+            self.v1469_authority_ready = True
+            logger.info("v1469_authority_schema_ready", bucket_seconds=30)
         await self.binance.connect()
         if self.settings.mainnet_one_run_enabled and self.settings.mainnet_api_key:
             await self.mainnet_binance.connect()
@@ -609,6 +670,24 @@ class App:
                 arm_observation_repo=(
                     self.v1469_arm_observation_repo
                     if self.v1469_arm_observation_ready
+                    else None
+                ),
+                v1469_lease_repo=(
+                    self.v1469_lease_repo if self.v1469_authority_ready else None
+                ),
+                v1469_paid_claim_repo=(
+                    self.v1469_paid_claim_repo
+                    if self.v1469_authority_ready
+                    else None
+                ),
+                v1469_risk_event_repo=(
+                    self.v1469_risk_event_repo
+                    if self.v1469_authority_ready
+                    else None
+                ),
+                v1469_paid_execution_adapter=(
+                    self.v1469_paid_execution_adapter
+                    if self.v1469_authority_ready
                     else None
                 ),
             )

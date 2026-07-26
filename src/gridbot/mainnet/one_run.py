@@ -133,6 +133,14 @@ from src.gridbot.storage.v1465_w6a_profile_repository import (
 from src.gridbot.storage.v1469_arm_observation_repository import (
     V1469ArmObservationRepository,
 )
+from src.gridbot.storage.v1469_lease_repository import V1469LeaseRepository
+from src.gridbot.storage.v1469_paid_execution_claim_repository import (
+    V1469PaidExecutionClaimRepository,
+)
+from src.gridbot.storage.v1469_risk_event_repository import V1469RiskEventRepository
+from src.gridbot.mainnet.v1469_paid_execution_adapter import (
+    V1469PaidExecutionAdapter,
+)
 from src.gridbot.mainnet.tp_policy_shadow import (
     CODEX_TP_POLICY_VERSION,
     TP_POLICY_PATH_TTL_S,
@@ -423,6 +431,10 @@ class MainnetOneRunManager:
         promotion_repo=None,
         w6a_profile_repo: V1465W6AProfileRepository | None = None,
         arm_observation_repo: V1469ArmObservationRepository | None = None,
+        v1469_lease_repo: V1469LeaseRepository | None = None,
+        v1469_paid_claim_repo: V1469PaidExecutionClaimRepository | None = None,
+        v1469_risk_event_repo: V1469RiskEventRepository | None = None,
+        v1469_paid_execution_adapter: V1469PaidExecutionAdapter | None = None,
     ) -> None:
         self._settings = settings
         self._v1459_guard = V1459ManagerObservationGuard(observation_runtime)
@@ -455,6 +467,14 @@ class MainnetOneRunManager:
         self._v1459_cohort_tracker = cohort_tracker
         self._v1464_promotion_runtime: V1464PromotionRuntime | None = None
         self._v1469_arm_observation_repo = arm_observation_repo
+        # R1-D ownership is explicit even while the enforcement kill-switch is
+        # false.  Keeping these dependencies injected (rather than creating
+        # private connections in the order path) makes one App/database the
+        # sole durable authority owner and is testable without an exchange.
+        self._v1469_lease_repo = v1469_lease_repo
+        self._v1469_paid_claim_repo = v1469_paid_claim_repo
+        self._v1469_risk_event_repo = v1469_risk_event_repo
+        self._v1469_paid_execution_adapter = v1469_paid_execution_adapter
         # These contain bucket-level dedup keys, not durable opportunity IDs.
         self._v1469_observed_opportunity_ids: set[str] = set()
         self._v1469_observation_inflight_ids: set[str] = set()

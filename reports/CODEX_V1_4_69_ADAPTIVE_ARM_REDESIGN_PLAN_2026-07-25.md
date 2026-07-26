@@ -2,7 +2,7 @@
 
 日期：2026-07-25  
 對象：Cry3 Live Mainnet Adaptive  
-狀態：**R0、R1-B 與 R1-C1 identity/authority service 完成；R1-D runtime wiring 尚未完成／部署**
+狀態：**R0、R1-B 與 R1-C1 完成；R1-D ownership/preflight checkpoint 完成但 order-boundary wiring 尚未完成／部署**
 
 ## 0. 2026-07-26 implementation checkpoint
 
@@ -28,6 +28,13 @@ fresh exact identity/revision/regime，不依 UTC date 或 manual promotion。en
 **R1 尚未完成，不得宣稱完成或開啟 enforcement。** 尚缺 `MainnetOneRunManager` 唯一 lease/arbiter admission wiring、完整 exchange adapter integration、
 authoritative TP/SL/cap/risk wiring，以及 two-runner/crash/reconciliation acceptance tests。以上皆為
 deployment gates；完成後仍須 human review。
+
+R1-D 本次安全 checkpoint 已由 `App` 使用同一 DB 建立並注入 observation、lease、daily-risk、
+paid-claim repositories 與 paid-execution adapter；arbiter/enforcement flag 啟用時，會在任何
+Binance connect 前驗證 exact 30s/15m/45m/180m/freshness/lease settings 及 016–019 所有 owner
+schema。Binance client 亦新增 deterministic CID reconciliation query。因真實 `_place_entry`
+仍未完成 caller-resolved snapshot、rolling arbiter、single outer authority 與兩種 entry callable 的
+claim-adapter 包裝，本 checkpoint 保留 enforcement startup rejection；不可視為 R1-D 完成。
 
 ## Executive Summary
 

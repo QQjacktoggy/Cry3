@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 from binance.exceptions import BinanceAPIException
 
@@ -30,6 +32,10 @@ class FakeAsyncBinanceClient:
 
     async def futures_get_position_mode(self):
         return {"dualSidePosition": False}
+
+    async def futures_get_order(self, **params):
+        self.order_params = params
+        return {"status": "NEW", **params}
 
 
 @pytest.mark.asyncio
@@ -129,3 +135,23 @@ async def test_reduce_only_limit_order_uses_tick_price_and_client_id():
     assert result["price"] == "2135.12"
     assert result["reduceOnly"] == "true"
     assert result["newClientOrderId"] == "cry3tp_test"
+
+
+def test_query_order_uses_orig_client_order_id():
+    client = BinanceFuturesClient(
+        Settings(binance_api_key="key", binance_api_secret="secret")
+    )
+    fake = FakeAsyncBinanceClient()
+    client._client = fake
+
+    result = asyncio.run(
+        client.get_order_by_client_order_id("ethusdc", "c69_exact")
+    )
+
+    assert result["status"] == "NEW"
+    assert fake.order_params == {
+        "symbol": "ETHUSDC",
+        "origClientOrderId": "c69_exact",
+    }
+    with pytest.raises(ValueError, match="1..36"):
+        asyncio.run(client.get_order_by_client_order_id("ETHUSDC", ""))

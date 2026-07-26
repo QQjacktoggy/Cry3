@@ -291,6 +291,32 @@ class BinanceFuturesClient:
         if client_order_id:
             params["newClientOrderId"] = client_order_id
         return await self.client.futures_create_order(**params)
+
+    async def get_order_by_client_order_id(
+        self,
+        symbol: str,
+        client_order_id: str,
+    ) -> dict | None:
+        """Query one futures order by Binance ``origClientOrderId``.
+
+        The v1.4.69 reconciler uses this read before it may submit.  Binance's
+        ordinary "order does not exist" response is represented as absence;
+        transport/authentication and all other API errors remain visible so an
+        ambiguous lookup can never be mistaken for proof that no order exists.
+        """
+        value = str(client_order_id or "").strip()
+        if not value or len(value) > 36:
+            raise ValueError("client_order_id must contain 1..36 characters")
+        try:
+            return await self.client.futures_get_order(
+                symbol=str(symbol).upper(),
+                origClientOrderId=value,
+            )
+        except BinanceAPIException as exc:
+            if exc.code == -2013:
+                return None
+            raise
+
     @async_retry(max_attempts=3, base_delay=2.0, exceptions=(BinanceAPIException, Exception))
     async def create_post_only_limit_order(
         self,
