@@ -3,6 +3,9 @@
 Handles initialization, scheduled tasks, and graceful shutdown.
 """
 
+import json
+import math
+
 from config.settings import Settings
 from datetime import datetime, time, timezone
 from zoneinfo import ZoneInfo
@@ -16,9 +19,17 @@ from src.gridbot.grid.models import GridMetrics
 from src.gridbot.mainnet.one_run import MainnetOneRunManager
 from src.gridbot.mainnet.v1459_app_runtime_v3 import build_v1459_app_runtime_v3
 from src.gridbot.mainnet.v1459_readonly_identity_client import V1459ReadOnlyIdentityClient
+from src.gridbot.mainnet.v1469_authority_runtime import V1469AuthorityRuntime
+from src.gridbot.mainnet.v1469_paid_close_runtime import V1469PaidCloseRuntime
+from src.gridbot.mainnet.v1469_paid_entry_runtime import V1469PaidEntryRuntime
 from src.gridbot.mainnet.v1469_paid_execution_adapter import (
     V1469PaidExecutionAdapter,
 )
+from src.gridbot.mainnet.v1469_paid_promotion_runtime import (
+    V1469PaidPromotionRuntime,
+)
+from src.gridbot.mainnet.v1469_paid_reconciler import V1469PaidReconciler
+from src.gridbot.mainnet.v1469_risk_runtime import V1469RiskAdmissionRuntime
 from src.gridbot.storage.database import Database
 from src.gridbot.storage.v1464_promotion_repository import (
     V1464PromotionRepository,
@@ -99,6 +110,33 @@ class App:
         self.v1469_risk_event_repo = V1469RiskEventRepository(self.db)
         self.v1469_paid_execution_adapter = V1469PaidExecutionAdapter(
             self.v1469_paid_claim_repo
+        )
+        self.v1469_paid_reconciler = V1469PaidReconciler(
+            self.v1469_paid_claim_repo
+        )
+        self.v1469_paid_promotion_runtime = V1469PaidPromotionRuntime(
+            self.v1469_paid_claim_repo,
+            evidence_window_ms=(
+                int(self.settings.mainnet_codex_v1469_authority_window_seconds)
+                * 1000
+            ),
+        )
+        self.v1469_authority_runtime = V1469AuthorityRuntime(
+            self.v1469_arm_observation_repo,
+            self.v1469_lease_repo,
+            self.v1469_paid_promotion_runtime,
+        )
+        self.v1469_risk_runtime = V1469RiskAdmissionRuntime(
+            self.v1469_risk_event_repo
+        )
+        self.v1469_paid_entry_runtime = V1469PaidEntryRuntime(
+            authority_runtime=self.v1469_authority_runtime,
+            risk_runtime=self.v1469_risk_runtime,
+            claim_repository=self.v1469_paid_claim_repo,
+        )
+        self.v1469_paid_close_runtime = V1469PaidCloseRuntime(
+            self.v1469_paid_claim_repo,
+            self.v1469_risk_event_repo,
         )
         self.v1469_arm_observation_ready = False
         self.v1469_authority_ready = False
@@ -194,7 +232,7 @@ class App:
         if v1469_authority_enabled:
             # This entire readiness boundary deliberately precedes both
             # Binance connect calls.  Each repository validates the concrete
-            # schema it owns (migrations 016 through 020); a migration marker
+            # schema it owns (migrations 016 through 022); a migration marker
             # alone is not treated as proof of readiness.
             try:
                 if int(
@@ -255,6 +293,191 @@ class App:
             await lane_monitor_db.close()
         await self.db.close()
         logger.info("app_shutdown")
+
+    async def _reconcile_v1469_paid_claims_on_restart(self):
+        """Resolve ambiguous adaptive submissions before entry admission.
+
+        This boundary is deliberately dormant while v1.4.69 paid enforcement
+        is disabled. When enabled, the mainnet client has already connected
+        and the scheduler has not started yet. The reconciler is read-only
+        toward Binance and can only transition durable claims after finding
+        their deterministic client order id.
+        """
+        if not bool(
+            self.settings.mainnet_codex_v1469_live_enforcement_enabled
+        ):
+            return None
+        if not self.v1469_authority_ready:
+            raise RuntimeError(
+                "v1.4.69 paid restart reconciliation requires authority readiness"
+            )
+
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        try:
+            result = await self.v1469_paid_reconciler.reconcile_on_restart(
+                environment="MAINNET",
+                symbol=None,
+                now_ms=now_ms,
+                limit=100,
+                find_by_client_order_id=(
+                    self.mainnet_binance.get_order_by_client_order_id
+                ),
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "v1.4.69 paid restart reconciliation failed: "
+                f"{type(exc).__name__}:{str(exc)[:500]}"
+            ) from exc
+
+        if result is None or not bool(getattr(result, "ok", False)):
+            errors = tuple(getattr(result, "errors", ()) or ())
+            detail = "; ".join(
+                (
+                    f"{getattr(item, 'code', 'UNKNOWN')}:"
+                    f"{getattr(item, 'detail', '')}"
+                )[:500]
+                for item in errors[:5]
+            )
+            raise RuntimeError(
+                "v1.4.69 paid restart reconciliation was not clean"
+                + (f": {detail}" if detail else "")
+            )
+
+        logger.info(
+            "v1469_paid_restart_reconciliation_complete",
+            enumerated_claims=int(result.enumerated_claims),
+            lookup_calls=int(result.lookup_calls),
+            visible_orders=int(result.visible_orders),
+            absent_orders=int(result.absent_orders),
+            transitioned_claims=int(result.transitioned_claims),
+        )
+        return result
+
+    @staticmethod
+    def _v1469_json_mapping(value, *, field: str) -> dict:
+        if isinstance(value, dict):
+            return value
+        try:
+            parsed = json.loads(str(value or "{}"))
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"{field} is not valid JSON") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError(f"{field} must be a JSON object")
+        return parsed
+
+    async def _backfill_v1469_paid_terminal_claims_on_restart(self) -> int:
+        """Repair completed paid runs before any new entry can be admitted."""
+        if not bool(
+            self.settings.mainnet_codex_v1469_live_enforcement_enabled
+        ):
+            return 0
+        if not self.v1469_authority_ready:
+            raise RuntimeError(
+                "v1.4.69 paid terminal backfill requires authority readiness"
+            )
+
+        repaired = 0
+        inspected_paid = 0
+        try:
+            runs = await self.mainnet_run_repo.get_recent_runs(limit=100)
+            for run in runs:
+                if str(run.get("status") or "").upper() != "COMPLETED":
+                    continue
+                signal = self._v1469_json_mapping(
+                    run.get("signal_json"),
+                    field="signal_json",
+                )
+                plan = signal.get("v1469_paid_execution")
+                claim_id = str(
+                    signal.get("v1469_paid_claim_id") or ""
+                ).strip()
+                if plan is None and not claim_id:
+                    continue
+                inspected_paid += 1
+                if (
+                    not isinstance(plan, dict)
+                    or plan.get("schema")
+                    != "v1469.paid-execution-plan.1"
+                    or not claim_id
+                ):
+                    raise ValueError(
+                        "completed paid run has invalid execution identity"
+                    )
+                run_id = str(run.get("run_id") or "").strip()
+                if not run_id:
+                    raise ValueError("completed paid run is missing run_id")
+                events = await self.mainnet_run_repo.get_events_by_types(
+                    run_id,
+                    ("completed",),
+                    limit=5,
+                )
+                if len(events) != 1:
+                    raise ValueError(
+                        "completed paid run must have exactly one completed event"
+                    )
+                event = events[0]
+                details = self._v1469_json_mapping(
+                    event.get("details_json"),
+                    field="completed.details_json",
+                )
+                if details.get("eligible_for_wr_ev") is not True:
+                    raise ValueError(
+                        "completed paid run is not reconciliation-eligible"
+                    )
+                if str(
+                    details.get("reconciliation_status") or ""
+                ).upper() != "COMPLETE":
+                    raise ValueError(
+                        "completed paid run lacks complete reconciliation"
+                    )
+                reason = str(
+                    details.get("exit_reason_final")
+                    or details.get("reason")
+                    or ""
+                ).strip()
+                try:
+                    net_pnl = float(details["net_pnl"])
+                    terminal_at_ms = int(details["terminal_at_ms"])
+                except (KeyError, TypeError, ValueError, OverflowError) as exc:
+                    raise ValueError(
+                        "completed paid run has invalid terminal facts"
+                    ) from exc
+                if (
+                    not reason
+                    or not math.isfinite(net_pnl)
+                    or terminal_at_ms <= 0
+                ):
+                    raise ValueError(
+                        "completed paid run has invalid terminal facts"
+                    )
+                loss_cap = float(
+                    self.settings.mainnet_codex_v1469_per_trade_loss_cap_usdc
+                )
+                hard_loss_marker = loss_cap > 0.0 and net_pnl <= -loss_cap
+                result = await self.v1469_paid_close_runtime.record_close(
+                    claim_id=claim_id,
+                    fee_net_pnl_usdc=net_pnl,
+                    terminal_reason=reason,
+                    occurred_at_ms=terminal_at_ms,
+                    source_run_id=run_id,
+                    hard_loss_marker=hard_loss_marker,
+                    actor="v1469-startup-terminal-backfill",
+                )
+                if not result.replayed:
+                    repaired += 1
+        except Exception as exc:
+            raise RuntimeError(
+                "v1.4.69 paid terminal backfill failed: "
+                f"{type(exc).__name__}:{str(exc)[:500]}"
+            ) from exc
+
+        logger.info(
+            "v1469_paid_terminal_backfill_complete",
+            scanned_runs=len(runs),
+            inspected_paid_runs=inspected_paid,
+            repaired_claims=repaired,
+        )
+        return repaired
 
     async def run_fetch_cycle(self) -> None:
         """Execute a single fetch cycle for all symbols."""
@@ -614,6 +837,8 @@ class App:
 
         async def _run():
             await self.initialize()
+            await self._reconcile_v1469_paid_claims_on_restart()
+            await self._backfill_v1469_paid_terminal_claims_on_restart()
 
             # Build Telegram app only when configured. Testnet signal-only runs
             # should still stay alive when Telegram credentials are not present.
@@ -687,6 +912,16 @@ class App:
                 ),
                 v1469_paid_execution_adapter=(
                     self.v1469_paid_execution_adapter
+                    if self.v1469_authority_ready
+                    else None
+                ),
+                v1469_paid_entry_runtime=(
+                    self.v1469_paid_entry_runtime
+                    if self.v1469_authority_ready
+                    else None
+                ),
+                v1469_paid_close_runtime=(
+                    self.v1469_paid_close_runtime
                     if self.v1469_authority_ready
                     else None
                 ),

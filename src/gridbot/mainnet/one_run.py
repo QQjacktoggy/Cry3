@@ -184,6 +184,22 @@ from src.gridbot.mainnet.v1469_paired_evaluator import ShadowCostModel
 from src.gridbot.mainnet.v1469_paired_shadow_runtime import (
     V1469PairedShadowRuntime,
 )
+from src.gridbot.mainnet.v1469_arm_arbiter import (
+    ArbiterPolicy,
+    RegimeSnapshot,
+)
+from src.gridbot.mainnet.v1469_authority_runtime import AuthorityRuntimeInput
+from src.gridbot.mainnet.v1469_execution_plan import (
+    apply_paid_execution_plan,
+    execution_plan_from_signal,
+)
+from src.gridbot.mainnet.v1469_paid_entry_runtime import (
+    PaidEntryPreparation,
+    PaidEntryPreparationRequest,
+    V1469PaidEntryRuntime,
+)
+from src.gridbot.mainnet.v1469_paid_close_runtime import V1469PaidCloseRuntime
+from src.gridbot.mainnet.v1469_risk_runtime import risk_policy_from_settings
 from src.gridbot.strategy.codex_adaptive_controller import (
     AdaptiveControllerConfig,
     AdaptiveControllerInput,
@@ -451,6 +467,8 @@ class MainnetOneRunManager:
         v1469_paid_claim_repo: V1469PaidExecutionClaimRepository | None = None,
         v1469_risk_event_repo: V1469RiskEventRepository | None = None,
         v1469_paid_execution_adapter: V1469PaidExecutionAdapter | None = None,
+        v1469_paid_entry_runtime: V1469PaidEntryRuntime | None = None,
+        v1469_paid_close_runtime: V1469PaidCloseRuntime | None = None,
     ) -> None:
         self._settings = settings
         self._v1459_guard = V1459ManagerObservationGuard(observation_runtime)
@@ -491,6 +509,8 @@ class MainnetOneRunManager:
         self._v1469_paid_claim_repo = v1469_paid_claim_repo
         self._v1469_risk_event_repo = v1469_risk_event_repo
         self._v1469_paid_execution_adapter = v1469_paid_execution_adapter
+        self._v1469_paid_entry_runtime = v1469_paid_entry_runtime
+        self._v1469_paid_close_runtime = v1469_paid_close_runtime
         # These contain bucket-level dedup keys, not durable opportunity IDs.
         self._v1469_observed_opportunity_ids: set[str] = set()
         self._v1469_observation_inflight_ids: set[str] = set()
@@ -1581,7 +1601,16 @@ class MainnetOneRunManager:
     ) -> bool:
         """Execution hardening mutates exchange flow only in reviewed mode."""
 
-        return self._v1460_enforcement_active(run)
+        if self._v1460_enforcement_active(run):
+            return True
+        if run is None:
+            return False
+        return (
+            self._v1469_paid_exact_plan(
+                self._codex_v1_signal_payload(run)
+            )
+            is not None
+        )
 
     def _v1461_candidate_active(self, run: Mapping[str, Any] | None) -> bool:
         return bool(
@@ -16578,6 +16607,158 @@ class MainnetOneRunManager:
         return policy
 
     @staticmethod
+    def _v1469_paid_exact_plan(
+        signal: Mapping[str, Any],
+    ) -> Mapping[str, Any] | None:
+        plan = execution_plan_from_signal(signal)
+        if plan is None:
+            return None
+        if str(plan.get("schema") or "") != "v1469.paid-execution-plan.1":
+            raise RuntimeError("v1469 paid execution plan schema mismatch")
+        return plan
+
+    async def _v1469_record_paid_close(
+        self,
+        run: Mapping[str, Any],
+        *,
+        net_pnl_usdc: float,
+        terminal_reason: str,
+        terminal_at_ms: int,
+    ) -> bool:
+        signal = self._codex_v1_signal_payload(run)
+        plan = self._v1469_paid_exact_plan(signal)
+        if plan is None:
+            return True
+        claim_id = str(signal.get("v1469_paid_claim_id") or "").strip()
+        runtime = self._v1469_paid_close_runtime
+        if not claim_id or runtime is None:
+            logger.error(
+                "v1469_paid_close_runtime_unavailable",
+                run_id=run.get("run_id"),
+                claim_id=claim_id or None,
+            )
+            return False
+        loss_cap = float(
+            getattr(
+                self._settings,
+                "mainnet_codex_v1469_per_trade_loss_cap_usdc",
+                0.0,
+            )
+            or 0.0
+        )
+        hard_loss_marker = loss_cap > 0.0 and float(net_pnl_usdc) <= -loss_cap
+        try:
+            await runtime.record_close(
+                claim_id=claim_id,
+                fee_net_pnl_usdc=float(net_pnl_usdc),
+                terminal_reason=str(terminal_reason),
+                occurred_at_ms=int(terminal_at_ms),
+                source_run_id=str(run.get("run_id") or ""),
+                hard_loss_marker=hard_loss_marker,
+                actor=self._v1465_owner_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - flat run stays closed; reservation stays active.
+            logger.error(
+                "v1469_paid_close_repair_required",
+                run_id=run.get("run_id"),
+                claim_id=claim_id,
+                error=str(exc)[:300],
+            )
+            try:
+                await self._repo.log_event(
+                    str(run.get("run_id") or ""),
+                    "v1469_paid_close_repair_required",
+                    {"claim_id": claim_id, "error": str(exc)[:300]},
+                )
+            except Exception:
+                pass
+            return False
+        try:
+            await self._repo.log_event(
+                str(run.get("run_id") or ""),
+                "v1469_paid_close_recorded",
+                {
+                    "claim_id": claim_id,
+                    "terminal_at_ms": int(terminal_at_ms),
+                    "net_pnl_usdc": float(net_pnl_usdc),
+                    "terminal_reason": str(terminal_reason),
+                    "hard_loss_marker": hard_loss_marker,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - close is already durable.
+            logger.warning(
+                "v1469_paid_close_audit_log_failed",
+                run_id=run.get("run_id"),
+                claim_id=claim_id,
+                error=str(exc)[:200],
+            )
+        return True
+
+    async def _v1469_record_paid_no_fill(
+        self,
+        run: Mapping[str, Any],
+        *,
+        terminal_reason: str,
+        terminal_at_ms: int,
+    ) -> bool:
+        signal = self._codex_v1_signal_payload(run)
+        plan = self._v1469_paid_exact_plan(signal)
+        if plan is None:
+            return True
+        claim_id = str(signal.get("v1469_paid_claim_id") or "").strip()
+        runtime = self._v1469_paid_close_runtime
+        if not claim_id or runtime is None:
+            logger.error(
+                "v1469_paid_no_fill_runtime_unavailable",
+                run_id=run.get("run_id"),
+                claim_id=claim_id or None,
+            )
+            return False
+        try:
+            result = await runtime.record_no_fill(
+                claim_id=claim_id,
+                terminal_reason=str(terminal_reason),
+                occurred_at_ms=int(terminal_at_ms),
+                source_run_id=str(run.get("run_id") or ""),
+                actor=self._v1465_owner_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - reservation remains active.
+            logger.error(
+                "v1469_paid_no_fill_repair_required",
+                run_id=run.get("run_id"),
+                claim_id=claim_id,
+                error=str(exc)[:300],
+            )
+            try:
+                await self._repo.log_event(
+                    str(run.get("run_id") or ""),
+                    "v1469_paid_no_fill_repair_required",
+                    {"claim_id": claim_id, "error": str(exc)[:300]},
+                )
+            except Exception:
+                pass
+            return False
+        try:
+            await self._repo.log_event(
+                str(run.get("run_id") or ""),
+                "v1469_paid_no_fill_recorded",
+                {
+                    "claim_id": claim_id,
+                    "terminal_at_ms": result.claim.terminal_at_ms,
+                    "terminal_reason": str(terminal_reason),
+                    "outcome": "NO_FILL",
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - terminal claim is durable.
+            logger.warning(
+                "v1469_paid_no_fill_audit_log_failed",
+                run_id=run.get("run_id"),
+                claim_id=claim_id,
+                error=str(exc)[:200],
+            )
+        return True
+
+    @staticmethod
     def _run_uses_codex_v1(run: Mapping[str, Any]) -> bool:
         signal = MainnetOneRunManager._codex_v1_signal_payload(run)
         codex = signal.get("codex_v1") or {}
@@ -16675,7 +16856,12 @@ class MainnetOneRunManager:
             self._codex_v1_execution_enabled()
             and bool(getattr(self._settings, "mainnet_codex_state_throttle_enabled", True))
         )
-        _dir_block_until = 0.0 if _codex_state_throttle_owns_codex else self._dir_throttle_until.get(decision.side, 0.0)
+        _dir_block_until = (
+            0.0
+            if self._v1469_paid_enforcement_enabled()
+            or _codex_state_throttle_owns_codex
+            else self._dir_throttle_until.get(decision.side, 0.0)
+        )
         if _dir_block_until > now_ms:
             _remaining_s = int((_dir_block_until - now_ms) / 1000)
             _dir_count_cfg = int(getattr(self._settings, "mainnet_dir_throttle_loss_count", 2) or 2)
@@ -16722,7 +16908,13 @@ class MainnetOneRunManager:
                     drift_bp=drift_bp,
                 )
                 if adjusted_decision is None:
-                    return
+                    if not self._v1469_paid_enforcement_enabled():
+                        return
+                    # v1.4.69 authority may select a matched arm that the
+                    # legacy first-match gate rejected. The Wildcat decision is
+                    # only a provisional shell; durable authority/risk/claim
+                    # must still pass before any order API call.
+                    adjusted_decision = decision
                 await self._place_entry(
                     run,
                     adjusted_decision,
@@ -17611,12 +17803,30 @@ class MainnetOneRunManager:
                 },
             )
 
-        await self._repo.update_run(
-            run["run_id"],
-            status="RUNNING",
-            avg_entry_price=position.entry_price,
-            qty=abs(position.position_amt),
-        )
+        signal = self._codex_v1_signal_payload(run)
+        paid_plan = self._v1469_paid_exact_plan(signal)
+        running_update: dict[str, Any] = {
+            "status": "RUNNING",
+            "avg_entry_price": position.entry_price,
+            "qty": abs(position.position_amt),
+        }
+        if paid_plan is not None:
+            signal = dict(signal)
+            initial_qty = abs(float(position.position_amt))
+            if not math.isfinite(initial_qty) or initial_qty <= 0:
+                raise RuntimeError("v1469 exact fill quantity is invalid")
+            signal["v1469_paid_initial_qty"] = initial_qty
+            exact_sl = self._sl_price_from_pct(
+                float(position.entry_price),
+                str(position.position_direction),
+                self._effective_sl_pct(signal),
+            )
+            if exact_sl <= 0:
+                raise RuntimeError("v1469 exact fill SL is invalid")
+            signal["stop_loss"] = exact_sl
+            running_update["signal_json"] = signal
+            run["signal_json"] = json.dumps(signal)
+        await self._repo.update_run(run["run_id"], **running_update)
         counters = self._adaptive_counters() if self._is_adaptive_run(run) else None
         if counters is not None:
             counters["normal_fill"] = int(counters.get("normal_fill") or 0) + 1
@@ -17636,15 +17846,15 @@ class MainnetOneRunManager:
             },
         )
         await self._sync_fill_v1_events(run, "entry_filled")
-        signal = self._codex_v1_signal_payload(run)
         tp_orders = await self._sync_take_profit_orders(run, position, signal)
-        await self._start_codex_v132_live_tp_policy_sample(
-            run,
-            position,
-            signal,
-            tp_orders,
-            fill_detected_ms=fill_detected_ms,
-        )
+        if paid_plan is None:
+            await self._start_codex_v132_live_tp_policy_sample(
+                run,
+                position,
+                signal,
+                tp_orders,
+                fill_detected_ms=fill_detected_ms,
+            )
         if self._settings.mainnet_sl_use_maker and not protection_prearmed:
             sl_price = float(signal.get("stop_loss") or 0.0)
             if sl_price > 0:
@@ -17661,14 +17871,16 @@ class MainnetOneRunManager:
                 )
         run["avg_entry_price"] = position.entry_price
         run["qty"] = abs(position.position_amt)
-        await self._preplace_next_dca(run, position)
+        if paid_plan is None:
+            await self._preplace_next_dca(run, position)
         trail_sig = self._codex_v1_signal_payload(run)
         trail_tp_pct = float(trail_sig.get("wildcat", {}).get("tp_pct") or 0.0)
         trail_side = "LONG" if position.position_amt > 0 else "SHORT"
         trail_close_side = "SELL" if position.position_amt > 0 else "BUY"
-        self._start_trail_watch(
-            run, trail_side, trail_close_side, trail_tp_pct
-        )
+        if paid_plan is None:
+            self._start_trail_watch(
+                run, trail_side, trail_close_side, trail_tp_pct
+            )
         codex_note = self._codex_v1_telegram_note(trail_sig)
         await self._notify(
             "✅ <b>Mainnet one-run 已成交</b>\n"
@@ -17779,6 +17991,123 @@ class MainnetOneRunManager:
         symbol = run["symbol"]
         open_orders = await self._client.get_open_orders(symbol)
         order_id = int(run["entry_order_id"]) if run.get("entry_order_id") else None
+        signal_payload = self._codex_v1_signal_payload(run)
+        paid_plan = self._v1469_paid_exact_plan(signal_payload)
+        if paid_plan is not None and order_id is None:
+            claim_id = str(
+                signal_payload.get("v1469_paid_claim_id") or ""
+            ).strip()
+            client_order_id = str(
+                signal_payload.get("v1469_paid_client_order_id") or ""
+            ).strip()
+            if not claim_id or not client_order_id:
+                await self._repo.log_event(
+                    run["run_id"],
+                    "v1469_paid_entry_binding_invalid",
+                    {
+                        "claim_id": claim_id or None,
+                        "client_order_id": client_order_id or None,
+                    },
+                )
+                return
+            try:
+                visible = await self._client.get_order_by_client_order_id(
+                    symbol,
+                    client_order_id,
+                )
+            except Exception as exc:
+                logger.error(
+                    "v1469_paid_entry_lookup_ambiguous",
+                    run_id=run.get("run_id"),
+                    claim_id=claim_id,
+                    error=str(exc)[:200],
+                )
+                return
+            if visible is not None:
+                visible_cid = str(visible.get("clientOrderId") or "")
+                visible_symbol = str(visible.get("symbol") or symbol).upper()
+                recovered_order_id = int(visible.get("orderId") or 0)
+                if (
+                    visible_cid != client_order_id
+                    or visible_symbol != str(symbol).upper()
+                    or recovered_order_id <= 0
+                ):
+                    await self._repo.log_event(
+                        run["run_id"],
+                        "v1469_paid_entry_binding_mismatch",
+                        {
+                            "claim_id": claim_id,
+                            "client_order_id": client_order_id,
+                        },
+                    )
+                    return
+                order_id = recovered_order_id
+                run["entry_order_id"] = order_id
+                await self._repo.update_run(
+                    run["run_id"],
+                    entry_order_id=order_id,
+                )
+            else:
+                claim = (
+                    await self._v1469_paid_claim_repo.get_claim_by_id(claim_id)
+                    if self._v1469_paid_claim_repo is not None
+                    else None
+                )
+                if claim is not None and claim.status == "ABANDONED":
+                    reason = str(
+                        claim.terminal_reason
+                        or "v1469_paid_pre_submit_abandoned"
+                    )
+                    await self._repo.complete_run(
+                        run["run_id"],
+                        "ENTRY_REJECTED",
+                        reason,
+                    )
+                    await self._advance_loop_after_entry_failure(run, reason)
+                    return
+                if claim is not None and claim.status == "TERMINAL":
+                    outcome = (
+                        str((claim.result_payload or {}).get("outcome") or "")
+                        .strip()
+                        .upper()
+                    )
+                    if outcome == "NO_FILL":
+                        reason = str(
+                            claim.terminal_reason or "v1469_paid_no_fill"
+                        )
+                        await self._repo.complete_run(
+                            run["run_id"],
+                            "ENTRY_EXPIRED",
+                            reason,
+                        )
+                        await self._advance_loop_after_entry_failure(
+                            run,
+                            reason,
+                        )
+                        return
+                    await self._repo.log_event(
+                        run["run_id"],
+                        "v1469_paid_terminal_entry_binding_invalid",
+                        {"claim_id": claim_id, "outcome": outcome or None},
+                    )
+                    return
+                if claim is None or claim.status in {
+                    "CLAIMED",
+                    "SUBMITTING",
+                    "UNKNOWN",
+                    "SUBMITTED",
+                }:
+                    await self._repo.log_event(
+                        run["run_id"],
+                        "v1469_paid_entry_absent_fail_closed",
+                        {
+                            "claim_id": claim_id,
+                            "claim_status": (
+                                claim.status if claim is not None else "MISSING"
+                            ),
+                        },
+                    )
+                    return
         still_open = any(int(row.get("orderId", 0)) == order_id for row in open_orders)
         position = await self._client.get_position(symbol)
         if position:
@@ -17790,7 +18119,7 @@ class MainnetOneRunManager:
             )
             return
         if not still_open:
-            if self._v1460_entry_safety_active(run):
+            if self._v1460_entry_safety_active(run) or paid_plan is not None:
                 reconciliation = await self._v1460_cancel_confirm_entry(
                     run,
                     order_id,
@@ -17809,6 +18138,16 @@ class MainnetOneRunManager:
                     )
                     return
                 if reconciliation["status"] != "NO_FILL":
+                    return
+                if not await self._v1469_record_paid_no_fill(
+                    run,
+                    terminal_reason="entry_not_open_no_position",
+                    terminal_at_ms=int(time.time() * 1000),
+                ):
+                    await self._v1460_halt_paid_path(
+                        run,
+                        "v1469_paid_no_fill_persistence_failed",
+                    )
                     return
             await self._repo.complete_run(run["run_id"], "ENTRY_EXPIRED", "entry_not_open_no_position")
             await self._notify(f"⌛ Entry 掛單已不在 open orders 且沒有持倉，run 已停止：<code>{escape(run['run_id'])}</code>")
@@ -17835,6 +18174,16 @@ class MainnetOneRunManager:
                 return
             if reconciliation["status"] != "NO_FILL":
                 return
+            if not await self._v1469_record_paid_no_fill(
+                run,
+                terminal_reason=str(regime_block["reason"]),
+                terminal_at_ms=int(time.time() * 1000),
+            ):
+                await self._v1460_halt_paid_path(
+                    run,
+                    "v1469_paid_no_fill_persistence_failed",
+                )
+                return
             await self._repo.log_event(
                 run["run_id"],
                 "v1461_pending_entry_regime_cancelled",
@@ -17855,7 +18204,7 @@ class MainnetOneRunManager:
         ladder_deadline_ms = signal_j.get("entry_ladder_deadline_ms")
         if ladder_deadline_ms is not None:
             if int(time.time() * 1000) >= ladder_deadline_ms:
-                if self._v1460_entry_safety_active(run):
+                if self._v1460_entry_safety_active(run) or paid_plan is not None:
                     reconciliation = await self._v1460_cancel_confirm_entry(
                         run,
                         order_id,
@@ -17874,6 +18223,16 @@ class MainnetOneRunManager:
                         )
                         return
                     if reconciliation["status"] != "NO_FILL":
+                        return
+                    if not await self._v1469_record_paid_no_fill(
+                        run,
+                        terminal_reason="entry_ttl_expired",
+                        terminal_at_ms=int(time.time() * 1000),
+                    ):
+                        await self._v1460_halt_paid_path(
+                            run,
+                            "v1469_paid_no_fill_persistence_failed",
+                        )
                         return
                 elif order_id:
                     await self._client.cancel_order(symbol, order_id)
@@ -17896,7 +18255,7 @@ class MainnetOneRunManager:
         now_ms = int(time.time() * 1000)
         ttl_policy = self._codex_v1_live_entry_ttl_policy(run)
         timing = self._entry_timing_snapshot(run, now_ms=now_ms)
-        if self._v1460_entry_safety_active(run):
+        if self._v1460_entry_safety_active(run) or paid_plan is not None:
             age_ms = max(0, now_ms - int(timing["submitted_at_ms"]))
             expired = now_ms >= int(timing["entry_deadline_ms"])
         else:
@@ -17904,7 +18263,7 @@ class MainnetOneRunManager:
             expired = age_ms >= max(1, int(ttl_policy["ttl_seconds"])) * 1000
         ttl_seconds = max(1, int(ttl_policy["ttl_seconds"]))
         if expired:
-            if self._v1460_entry_safety_active(run):
+            if self._v1460_entry_safety_active(run) or paid_plan is not None:
                 reconciliation = await self._v1460_cancel_confirm_entry(
                     run,
                     order_id,
@@ -17923,6 +18282,16 @@ class MainnetOneRunManager:
                     )
                     return
                 if reconciliation["status"] != "NO_FILL":
+                    return
+                if not await self._v1469_record_paid_no_fill(
+                    run,
+                    terminal_reason="entry_ttl_expired",
+                    terminal_at_ms=int(time.time() * 1000),
+                ):
+                    await self._v1460_halt_paid_path(
+                        run,
+                        "v1469_paid_no_fill_persistence_failed",
+                    )
                     return
             elif order_id:
                 await self._client.cancel_order(symbol, order_id)
@@ -18494,6 +18863,30 @@ class MainnetOneRunManager:
         await self._refresh_partial_fill_state(run, position, prev_qty=prev_qty)
         await self._sync_take_profit_orders(run, position, signal)
         signal = json.loads(run.get("signal_json") or "{}")
+        paid_plan = self._v1469_paid_exact_plan(signal)
+        if paid_plan is not None:
+            sl_price = float(signal.get("stop_loss") or 0.0)
+            if self._hit_stop(side, mark, sl_price):
+                await self._close_position(
+                    symbol, close_side, qty, "SL", run
+                )
+                return
+            try:
+                max_hold_s = int(paid_plan.get("max_hold_s"))
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise RuntimeError("v1469 paid max_hold_s is invalid") from exc
+            if max_hold_s <= 0:
+                raise RuntimeError("v1469 paid max_hold_s is invalid")
+            if int(time.time() * 1000) - hold_start_ms >= max_hold_s * 1000:
+                reason = (
+                    "MAX_HOLD_WIN"
+                    if position.unrealized_pnl >= 0
+                    else "MAX_HOLD_LOSS"
+                )
+                await self._close_position(
+                    symbol, close_side, qty, reason, run
+                )
+            return
         if await self._maybe_full_tp_touch_lock(run, signal, position, side, mark, entry, qty, close_side):
             return
         await self._maybe_apply_breakeven_sl(
@@ -19002,6 +19395,15 @@ class MainnetOneRunManager:
         )
         return False
     def _max_holding_bars_for_run(self, signal: Mapping[str, Any]) -> int:
+        paid_plan = self._v1469_paid_exact_plan(signal)
+        if paid_plan is not None:
+            try:
+                max_hold_s = int(paid_plan.get("max_hold_s"))
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise RuntimeError("v1469 paid max_hold_s is invalid") from exc
+            if max_hold_s <= 0:
+                raise RuntimeError("v1469 paid max_hold_s is invalid")
+            return max(1, int(math.ceil(max_hold_s / 60.0)))
         default_bars = max(1, int(getattr(self._settings, "mainnet_max_holding_bars", 24) or 24))
         codex = signal.get("codex_v1") if isinstance(signal, Mapping) else None
         if not isinstance(codex, Mapping) or not codex.get("enabled"):
@@ -19756,6 +20158,206 @@ class MainnetOneRunManager:
         self._v1469_discard_pending_bucket_siblings(run_id, dedup_key)
         return durable_id
 
+    def _v1469_paid_enforcement_enabled(self) -> bool:
+        return bool(
+            getattr(
+                self._settings,
+                "mainnet_codex_v1469_live_enforcement_enabled",
+                False,
+            )
+        )
+
+    def _v1469_paid_arbiter_policy(self) -> ArbiterPolicy:
+        s = self._settings
+        return ArbiterPolicy(
+            safety_window_ms=max(
+                1, int(s.mainnet_codex_v1469_safety_window_seconds)
+            ) * 1000,
+            authority_window_ms=max(
+                1, int(s.mainnet_codex_v1469_authority_window_seconds)
+            ) * 1000,
+            guard_window_ms=max(
+                1, int(s.mainnet_codex_v1469_guard_window_seconds)
+            ) * 1000,
+            regime_max_age_ms=max(
+                1, int(s.mainnet_codex_v1469_regime_max_age_seconds)
+            ) * 1000,
+            submit_max_age_ms=max(
+                1, int(s.mainnet_codex_v1469_submit_max_age_seconds)
+            ) * 1000,
+            regime_confirmations=max(
+                1, int(s.mainnet_codex_v1469_regime_confirmations)
+            ),
+            regime_min_dwell_ms=max(
+                0, int(s.mainnet_codex_v1469_regime_min_dwell_seconds)
+            ) * 1000,
+            authority_min_paired_evaluable=max(
+                1, int(s.mainnet_codex_v1469_probation_min_evaluable)
+            ),
+            authority_min_tp_first=max(
+                1, int(s.mainnet_codex_v1469_probation_min_tp_first)
+            ),
+            guard_min_evaluable=max(
+                1, int(s.mainnet_codex_v1469_guard_min_evaluable)
+            ),
+            challenger_min_delta_bp=float(
+                s.mainnet_codex_v1469_challenger_margin_bp
+            ),
+            challenger_min_paired_wins=max(
+                1, int(s.mainnet_codex_v1469_challenger_min_paired_wins)
+            ),
+            probation_lease_ms=max(
+                1, int(s.mainnet_codex_v1469_probation_lease_seconds)
+            ) * 1000,
+            live_lease_ms=max(
+                1, int(s.mainnet_codex_v1469_live_lease_seconds)
+            ) * 1000,
+        )
+
+    def _v1469_paid_regime_snapshot(
+        self,
+        symbol: str,
+    ) -> RegimeSnapshot:
+        runtime = getattr(
+            self, "_v1469_observation_regime_runtimes", {}
+        ).get(str(symbol or "").strip().upper())
+        state = runtime.state if runtime is not None else None
+        if state is None:
+            raise RuntimeError("v1469 submit regime state is unavailable")
+        regime = str(getattr(state.regime, "value", state.regime)).upper()
+        direction = str(
+            getattr(state.direction, "value", state.direction)
+        ).upper()
+        if regime == "TREND":
+            if direction not in {"UP", "DOWN"}:
+                raise RuntimeError("v1469 trend direction is unavailable")
+            regime = f"TREND_{direction}"
+        valid_sides = {
+            "TREND_UP": frozenset({"LONG"}),
+            "TREND_DOWN": frozenset({"SHORT"}),
+            "RANGE": frozenset({"LONG", "SHORT"}),
+            "SHOCK": frozenset(),
+            "UNCERTAIN": frozenset(),
+        }.get(regime, frozenset())
+        confirmation_at_ms = tuple(
+            sorted(
+                {
+                    int(state.since_ms),
+                    int(state.last_decision_time_ms),
+                }
+            )
+        )
+        return RegimeSnapshot(
+            regime=regime,
+            observed_at_ms=int(state.last_decision_time_ms),
+            confirmation_at_ms=confirmation_at_ms,
+            direction_valid_sides=valid_sides,
+        )
+
+    async def _v1469_abandon_unsubmitted_preparation(
+        self,
+        preparation: PaidEntryPreparation | None,
+        *,
+        reason: str,
+    ) -> bool:
+        if preparation is None:
+            return True
+        repository = self._v1469_paid_claim_repo
+        if repository is None:
+            logger.error(
+                "v1469_paid_claim_cleanup_unavailable",
+                claim_id=preparation.claim.claim_id,
+                reason=reason,
+            )
+            return False
+        claim = preparation.claim
+        abandoned_at_ms = max(
+            int(time.time() * 1000),
+            int(claim.claimed_at_ms),
+            int(claim.created_at_ms),
+        )
+        try:
+            await repository.abandon_claim(
+                claim_id=claim.claim_id,
+                expected_generation=int(claim.generation),
+                abandoned_at_ms=abandoned_at_ms,
+                terminal_reason=str(reason),
+                idempotency_key=(
+                    f"abandoned:{claim.claim_id}:{claim.generation}:"
+                    f"{reason}"
+                ),
+                actor=self._v1465_owner_id,
+                result_payload={"submitted": False},
+            )
+        except Exception as exc:  # reservation remains active on cleanup failure
+            logger.error(
+                "v1469_paid_claim_cleanup_failed",
+                claim_id=claim.claim_id,
+                reason=reason,
+                error=str(exc)[:300],
+            )
+            return False
+        return True
+    async def _v1469_paid_preparation_request(
+        self,
+        *,
+        run: Mapping[str, Any],
+        durable_opportunity_id: str,
+        desired_notional_usdc: float,
+        as_of_ms: int,
+    ) -> PaidEntryPreparationRequest:
+        runtime = self._v1469_paid_entry_runtime
+        lease_repo = self._v1469_lease_repo
+        if runtime is None:
+            raise RuntimeError("v1469 paid entry runtime is unavailable")
+        if lease_repo is None:
+            raise RuntimeError("v1469 lease repository is unavailable")
+        symbol = str(run.get("symbol") or "").strip().upper()
+        if not symbol:
+            raise RuntimeError("v1469 paid symbol is unavailable")
+        current_lease = await lease_repo.get_active_lease(
+            environment="MAINNET",
+            symbol=symbol,
+            now_ms=int(as_of_ms),
+        )
+        regime = self._v1469_paid_regime_snapshot(symbol)
+        risk_policy = risk_policy_from_settings(self._settings)
+        return PaidEntryPreparationRequest(
+            authority_input=AuthorityRuntimeInput(
+                environment="MAINNET",
+                symbol=symbol,
+                opportunity_id=str(durable_opportunity_id),
+                as_of_ms=int(as_of_ms),
+                regime_snapshot=regime,
+                submit_snapshot=regime,
+                current_lease=current_lease,
+                incumbent_arm_key=(
+                    current_lease.arm_key
+                    if current_lease is not None
+                    else None
+                ),
+                policy=self._v1469_paid_arbiter_policy(),
+            ),
+            risk_policy=risk_policy,
+            desired_notional_usdc=float(desired_notional_usdc),
+            exchange_min_notional_usdc=MAINNET_MIN_ENTRY_NOTIONAL_USDC,
+            roundtrip_fee_bp=float(
+                self._settings.mainnet_codex_v1469_roundtrip_fee_bp
+            ),
+            slippage_bp=float(
+                self._settings.mainnet_codex_v1469_slippage_bp
+            ),
+            probation_notional_usdc=float(
+                self._settings.mainnet_codex_v1469_probation_notional_usdc
+            ),
+            live_notional_usdc=float(
+                self._settings.mainnet_codex_v1469_live_notional_usdc
+            ),
+            owner_id=self._v1465_owner_id,
+            boot_id=self._v1465_boot_id,
+            actor=self._v1465_owner_id,
+        )
+
     def _v1469_flush_adaptive_only(
         self,
         run: Mapping[str, Any],
@@ -19801,7 +20403,12 @@ class MainnetOneRunManager:
         codex_features: Mapping[str, Any] | None = None,
     ) -> None:
         await self._ensure_runtime_config_loaded()
-        if self._codex_v1_execution_enabled() and codex_decision is None:
+        v1469_paid_enforcement = self._v1469_paid_enforcement_enabled()
+        if (
+            not v1469_paid_enforcement
+            and self._codex_v1_execution_enabled()
+            and codex_decision is None
+        ):
             self._v1469_flush_adaptive_only(
                 run,
                 reason=(
@@ -19880,7 +20487,12 @@ class MainnetOneRunManager:
                 raw_decision=raw_codex_decision,
                 features=codex_features,
             )
-            if await self._adaptive_gate_before_submit(run, adaptive_decision_payload):
+            if (
+                not v1469_paid_enforcement
+                and await self._adaptive_gate_before_submit(
+                    run, adaptive_decision_payload
+                )
+            ):
                 self._v1469_flush_adaptive_only(
                     run,
                     reason=(
@@ -19889,9 +20501,10 @@ class MainnetOneRunManager:
                     ),
                 )
                 return
-            await self._maybe_start_adaptive_stup_fill_shadow(
-                run, decision, codex_decision, adaptive_decision_payload
-            )
+            if not v1469_paid_enforcement:
+                await self._maybe_start_adaptive_stup_fill_shadow(
+                    run, decision, codex_decision, adaptive_decision_payload
+                )
 
         side = "BUY" if decision.side == "LONG" else "SELL"
         entry_notional = decision.signal.planned_notional_usdc
@@ -19908,19 +20521,25 @@ class MainnetOneRunManager:
             decision.side,
             entry_offset_bp,
         )
-        await self._ensure_fee_guard(run["symbol"])
-        await self._client.set_leverage(run["symbol"], self._settings.mainnet_leverage)
-        # V6.5: remember the actual sizing scale so DCA cumulative-cap checks
-        # can scale the cap with the entry (fixes the 1.2x bookkeeping bug).
-        base_notional = self._settings.mainnet_effective_entry_notional_usdc
-        if base_notional > 0 and entry_notional > 0:
-            self._notional_scale[run["run_id"]] = entry_notional / base_notional
-        qty = await self._client.format_quantity(
-            run["symbol"],
-            entry_notional / entry_signal_price,
-        )
+        qty: Any = None
         client_order_id = f"{run['run_id']}_entry"
-        if codex_decision is not None:
+        if not v1469_paid_enforcement:
+            await self._ensure_fee_guard(run["symbol"])
+            await self._client.set_leverage(
+                run["symbol"], self._settings.mainnet_leverage
+            )
+            # V6.5: remember the actual sizing scale so DCA cumulative-cap checks
+            # can scale the cap with the entry (fixes the 1.2x bookkeeping bug).
+            base_notional = self._settings.mainnet_effective_entry_notional_usdc
+            if base_notional > 0 and entry_notional > 0:
+                self._notional_scale[run["run_id"]] = (
+                    entry_notional / base_notional
+                )
+            qty = await self._client.format_quantity(
+                run["symbol"],
+                entry_notional / entry_signal_price,
+            )
+        if codex_decision is not None and not v1469_paid_enforcement:
             codex_metrics = (
                 codex_decision.metrics
                 if isinstance(codex_decision.metrics, Mapping)
@@ -19979,9 +20598,18 @@ class MainnetOneRunManager:
                     )
                 return
             codex_decision = claimed_decision
-        ladder_offset = 0.0 if codex_decision is not None else self._settings.mainnet_entry_limit_offset
-        if codex_decision is None and not ladder_offset and bool(
-            self._settings.mainnet_entry_fallback_to_gtc
+        ladder_offset = (
+            0.0
+            if v1469_paid_enforcement or codex_decision is not None
+            else self._settings.mainnet_entry_limit_offset
+        )
+        if (
+            not v1469_paid_enforcement
+            and codex_decision is None
+            and not ladder_offset
+            and bool(
+                self._settings.mainnet_entry_fallback_to_gtc
+            )
         ):
             # The paired evaluator cannot represent an execution that may
             # dynamically fall back from post-only to GTC.
@@ -20016,6 +20644,238 @@ class MainnetOneRunManager:
             run["_v1469_durable_opportunity_id"] = await self._v1469_finish_paid_observation(
                 run, decision, codex_decision, entry_signal_price=intended_price,
                 entry_offset_bp=total_offset_bp, entry_notional=entry_notional)
+        paid_preparation: PaidEntryPreparation | None = None
+        paid_order = None
+        if v1469_paid_enforcement:
+            durable_opportunity_id = str(
+                run.get("_v1469_durable_opportunity_id") or ""
+            )
+            if not durable_opportunity_id:
+                await self._repo.log_event(
+                    run["run_id"],
+                    "entry_v1469_paid_blocked",
+                    {
+                        "reason": "durable_opportunity_id_missing",
+                        "order_api_calls": 0,
+                    },
+                )
+                return
+            if self._v1469_paid_execution_adapter is None:
+                await self._repo.log_event(
+                    run["run_id"],
+                    "entry_v1469_paid_blocked",
+                    {
+                        "reason": "paid_execution_adapter_unavailable",
+                        "order_api_calls": 0,
+                    },
+                )
+                return
+            prepare_at_ms = int(time.time() * 1000)
+            paid_submit_attempted = False
+            try:
+                paid_request = await self._v1469_paid_preparation_request(
+                    run=run,
+                    durable_opportunity_id=durable_opportunity_id,
+                    desired_notional_usdc=entry_notional,
+                    as_of_ms=prepare_at_ms,
+                )
+                paid_preparation = (
+                    await self._v1469_paid_entry_runtime.prepare(paid_request)
+                )
+                paid_plan = paid_preparation.plan
+                decision = apply_paid_execution_plan(
+                    replace(
+                        decision,
+                        side=paid_plan.side,
+                        strategy=paid_plan.strategy,
+                        signal=replace(
+                            decision.signal,
+                            action=(
+                                "BUY"
+                                if paid_plan.side == "LONG"
+                                else "SELL"
+                            ),
+                        ),
+                    ),
+                    paid_plan,
+                    reference_price=float(decision.signal.price),
+                    leverage=int(self._settings.mainnet_leverage),
+                )
+                side = "BUY" if paid_plan.side == "LONG" else "SELL"
+                entry_notional = float(paid_plan.notional_cap_usdc)
+                entry_signal_price = float(decision.signal.entries[0])
+                await self._ensure_fee_guard(run["symbol"])
+                await self._client.set_leverage(
+                    run["symbol"], self._settings.mainnet_leverage
+                )
+                qty = await self._client.format_quantity(
+                    run["symbol"],
+                    entry_notional / entry_signal_price,
+                )
+                tick = float(
+                    await self._client.price_tick_size(run["symbol"])
+                )
+                if tick <= 0:
+                    raise RuntimeError("paid entry tick size is invalid")
+                if side == "BUY":
+                    limit_price = (
+                        math.floor(entry_signal_price / tick) * tick
+                    )
+                else:
+                    limit_price = (
+                        math.ceil(entry_signal_price / tick) * tick
+                    )
+                limit_price = round(limit_price, 8)
+
+                async def find_paid_order(cid: str):
+                    return await self._client.get_order_by_client_order_id(
+                        run["symbol"], cid
+                    )
+
+                async def submit_paid_order(cid: str):
+                    nonlocal paid_submit_attempted
+                    paid_submit_attempted = True
+                    return await self._client.create_limit_order_raw(
+                        symbol=run["symbol"],
+                        side=side,
+                        quantity=qty,
+                        price=limit_price,
+                        time_in_force="GTX",
+                        reduce_only=False,
+                        client_order_id=cid,
+                    )
+
+                async def bind_paid_run_before_submit(
+                    cid: str,
+                    submitting_claim,
+                ) -> None:
+                    bound_at_ms = int(time.time() * 1000)
+                    bound_signal = self._codex_v1_signal_payload(run)
+                    bound_signal.update(
+                        {
+                            "v1469_paid_execution": paid_plan.to_payload(),
+                            "v1469_paid_claim_id": submitting_claim.claim_id,
+                            "v1469_paid_client_order_id": cid,
+                            "v1469_paid_order_state": "SUBMITTING",
+                            "action": decision.signal.action,
+                            "stop_loss": decision.signal.stop_loss,
+                            "take_profits": list(
+                                decision.signal.take_profits
+                            ),
+                            "take_profit": (
+                                decision.signal.take_profits[0]
+                                if decision.signal.take_profits
+                                else None
+                            ),
+                            "entry_submitted_at_ms": bound_at_ms,
+                            "entry_deadline_ms": (
+                                bound_at_ms + paid_plan.entry_ttl_s * 1000
+                            ),
+                            "entry_ttl_seconds": paid_plan.entry_ttl_s,
+                            "entry_ttl_source": "v1469_paid_execution_plan",
+                        }
+                    )
+                    await self._repo.update_run(
+                        run["run_id"],
+                        status="ENTRY_PENDING",
+                        side=paid_plan.side,
+                        signal_json=bound_signal,
+                        entry_order_id=0,
+                        entry_client_order_id=cid,
+                        entry_price=limit_price,
+                        cumulative_notional_usdc=entry_notional,
+                    )
+                    run["status"] = "ENTRY_PENDING"
+                    run["side"] = paid_plan.side
+                    run["signal_json"] = json.dumps(bound_signal)
+                    run["entry_client_order_id"] = cid
+                    run["entry_price"] = limit_price
+
+                submission = (
+                    await self._v1469_paid_execution_adapter.submit_or_reconcile(
+                        claim=paid_preparation.claim,
+                        now_ms=int(time.time() * 1000),
+                        find_by_client_order_id=find_paid_order,
+                        submit=submit_paid_order,
+                        actor=self._v1465_owner_id,
+                        before_submit=bind_paid_run_before_submit,
+                    )
+                )
+            except BinanceAPIException as exc:
+                if not paid_submit_attempted:
+                    await self._v1469_abandon_unsubmitted_preparation(
+                        paid_preparation,
+                        reason="PRE_SUBMIT_EXCHANGE_LOOKUP_FAILED",
+                    )
+                    await self._repo.log_event(
+                        run["run_id"],
+                        "entry_v1469_paid_blocked",
+                        {
+                            "reason": str(exc)[:300],
+                            "exchange_code": getattr(exc, "code", None),
+                            "order_api_calls": 0,
+                        },
+                    )
+                    return
+                await self._repo.complete_run(
+                    run["run_id"],
+                    "ENTRY_REJECTED",
+                    "v1469_paid_exchange_rejected",
+                    str(exc)[:500],
+                )
+                await self._repo.log_event(
+                    run["run_id"],
+                    "entry_v1469_paid_rejected",
+                    {
+                        "reason": "explicit_exchange_reject",
+                        "exchange_code": getattr(exc, "code", None),
+                        "order_api_calls": int(paid_submit_attempted),
+                    },
+                )
+                await self._advance_loop_after_entry_failure(
+                    run, "v1469_paid_exchange_rejected"
+                )
+                return
+            except Exception as exc:  # fail closed before/after ambiguous submit
+                if not paid_submit_attempted:
+                    await self._v1469_abandon_unsubmitted_preparation(
+                        paid_preparation,
+                        reason="PRE_SUBMIT_PREPARATION_FAILED",
+                    )
+                await self._repo.log_event(
+                    run["run_id"],
+                    "entry_v1469_paid_blocked",
+                    {
+                        "reason": str(exc)[:300],
+                        "order_api_calls": int(paid_submit_attempted),
+                    },
+                )
+                return
+            if submission.exchange_order is None:
+                await self._repo.log_event(
+                    run["run_id"],
+                    "entry_v1469_paid_blocked",
+                    {
+                        "reason": (
+                            "paid_submission_not_visible:"
+                            f"{submission.claim.status}"
+                        ),
+                        "claim_id": submission.claim.claim_id,
+                        "client_order_id": submission.client_order_id,
+                        "order_api_calls": 0,
+                    },
+                )
+                return
+            paid_order = submission.exchange_order
+            client_order_id = submission.client_order_id
+            entry_signal_price = limit_price
+            base_notional = (
+                self._settings.mainnet_effective_entry_notional_usdc
+            )
+            if base_notional > 0:
+                self._notional_scale[run["run_id"]] = (
+                    entry_notional / base_notional
+                )
         ladder_deadline_ms: int | None = None
         entry_note = ""
         s = self._settings
@@ -20024,7 +20884,16 @@ class MainnetOneRunManager:
             and s.mainnet_rng15_sweet_low_bp <= rng15 < s.mainnet_rng15_sweet_high_bp
         ):
             entry_note += f"\n🔥 <b>甜蜜區進場，資金已自動放大 {s.mainnet_rng15_sweet_scale:g} 倍！</b>"
-        if ladder_offset > 0.0:
+        if v1469_paid_enforcement:
+            if paid_preparation is None or paid_order is None:
+                raise RuntimeError("v1469 paid branch lost durable preparation")
+            order = paid_order
+            final_price = float(order.get("price", 0) or entry_signal_price)
+            entry_note = (
+                "\n🧭 v1.4.69 exact paid GTX"
+                f"｜TTL {paid_preparation.plan.entry_ttl_s}s"
+            )
+        elif ladder_offset > 0.0:
             # Ladder entry: place GTC LIMIT at a better price and wait up to TTL bars
             tick = float(await self._client.price_tick_size(run["symbol"]))
             raw_limit = entry_signal_price * (1 - ladder_offset if side == "BUY" else 1 + ladder_offset)
@@ -20150,6 +21019,14 @@ class MainnetOneRunManager:
             lane_code=codex_decision.lane_code if codex_decision is not None else None,
             uses_codex_v1=codex_decision is not None,
         )
+        if paid_preparation is not None:
+            recovery_runtime = {
+                **recovery_runtime,
+                "runtime_dca_enabled": False,
+                "codex_recovery_allowed": False,
+                "effective_recovery_enabled": False,
+                "recovery_block_reason": "v1469_exact_plan_dynamic_controls_disabled",
+            }
         if (
             codex_decision is not None
             and "v1464_adaptive_lease" in codex_decision.risk_tags
@@ -20211,6 +21088,27 @@ class MainnetOneRunManager:
             "notional_scale": round(self._notional_scale.get(run["run_id"], 1.0), 4),
             **recovery_runtime,
         }
+        if paid_preparation is not None:
+            paid_risk = paid_preparation.risk
+            payload["v1469_paid_execution"] = (
+                paid_preparation.plan.to_payload()
+            )
+            payload["v1469_paid_claim_id"] = paid_preparation.claim.claim_id
+            payload["v1469_paid_client_order_id"] = client_order_id
+            payload["v1469_paid_risk"] = {
+                "reason": paid_risk.reason,
+                "approved_notional_usdc": paid_risk.approved_notional_usdc,
+                "reserved_loss_usdc": paid_risk.reserved_loss_usdc,
+                "risk_policy_hash": paid_risk.snapshot.risk_policy_hash,
+                "active_day": paid_risk.snapshot.active_day,
+                "remaining_daily_risk_usdc": (
+                    paid_risk.snapshot.remaining_daily_risk_usdc
+                ),
+            }
+            payload["v1469_paid_entry_ttl_s"] = (
+                paid_preparation.plan.entry_ttl_s
+            )
+            payload["v1469_paid_dynamic_controls_enabled"] = False
         if codex_decision is not None:
             raw_snapshot = self._codex_v1_decision_snapshot(raw_codex_decision or codex_decision, codex_features)
             effective_snapshot = self._codex_v1_decision_snapshot(
@@ -20305,9 +21203,18 @@ class MainnetOneRunManager:
             entry_submitted_at_ms = submitted_now_ms
         if entry_submitted_at_ms <= 0 or entry_submitted_at_ms > submitted_now_ms + 60_000:
             entry_submitted_at_ms = submitted_now_ms
-        persisted_ttl_policy = self._codex_v1_live_entry_ttl_policy(
-            {"signal_json": payload}
-        )
+        if paid_preparation is not None:
+            persisted_ttl_policy = {
+                "ttl_seconds": max(
+                    1, int(paid_preparation.plan.entry_ttl_s)
+                ),
+                "ttl_source": "v1469_paid_execution_plan",
+                "lane_code": paid_preparation.plan.lane_code,
+            }
+        else:
+            persisted_ttl_policy = self._codex_v1_live_entry_ttl_policy(
+                {"signal_json": payload}
+            )
         entry_deadline_ms = (
             int(ladder_deadline_ms)
             if ladder_deadline_ms is not None
@@ -21032,12 +21939,14 @@ class MainnetOneRunManager:
         if current_qty <= 0:
             return []
         close_side = "SELL" if position.position_direction == "LONG" else "BUY"
-        desired = await self._desired_take_profit_orders(run, position, signal, close_side)
         existing_orders = await self._client.get_open_orders(position.symbol)
         existing_tp = [
             order for order in existing_orders
             if str(order.get("clientOrderId") or "").startswith(f"{run_id}_tp")
         ]
+        desired = await self._desired_take_profit_orders(
+            run, position, signal, close_side, existing_tp
+        )
         await self._audit_tp1_touch_no_fill(run, position, desired, existing_tp, signal)
         current_qty = abs(position.position_amt)
         if self._take_profit_orders_match(
@@ -21163,17 +22072,243 @@ class MainnetOneRunManager:
         )
         return actual_orders
 
+    async def _v1469_desired_exact_take_profit_orders(
+        self,
+        run: Mapping[str, Any],
+        position: PositionInfo,
+        plan: Mapping[str, Any],
+        existing_orders: Sequence[Mapping[str, Any]] | None = None,
+    ) -> list[tuple[str, str, float]]:
+        run_id = str(run.get("run_id") or "")
+        current_qty = abs(float(position.position_amt))
+        raw_levels = plan.get("take_profits")
+        if (
+            not run_id
+            or current_qty <= 0
+            or not isinstance(raw_levels, Sequence)
+            or isinstance(raw_levels, (str, bytes, bytearray))
+            or not 1 <= len(raw_levels) <= 3
+        ):
+            raise RuntimeError("v1469 paid TP plan is invalid")
+        levels: list[tuple[float, float]] = []
+        for raw in raw_levels:
+            if not isinstance(raw, Mapping):
+                raise RuntimeError("v1469 paid TP level is invalid")
+            try:
+                target_bp = float(raw.get("target_bp"))
+                fraction = float(raw.get("fraction"))
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise RuntimeError("v1469 paid TP level is invalid") from exc
+            if (
+                not math.isfinite(target_bp)
+                or target_bp <= 0
+                or not math.isfinite(fraction)
+                or fraction <= 0
+                or fraction > 1
+            ):
+                raise RuntimeError("v1469 paid TP level is invalid")
+            levels.append((target_bp, fraction))
+        if abs(sum(fraction for _, fraction in levels) - 1.0) > 1e-6:
+            raise RuntimeError("v1469 paid TP fractions must sum to one")
+        plan_side = str(plan.get("side") or "").upper()
+        position_side = str(position.position_direction or "").upper()
+        if plan_side != position_side or plan_side not in {"LONG", "SHORT"}:
+            raise RuntimeError("v1469 paid TP side mismatch")
+        suffixes = (
+            (FINAL_TP_SUFFIX,)
+            if len(levels) == 1
+            else (PARTIAL_TP_SUFFIX, FINAL_TP_SUFFIX)
+            if len(levels) == 2
+            else (PARTIAL_TP_SUFFIX, MID_TP_SUFFIX, FINAL_TP_SUFFIX)
+        )
+
+        signal = self._codex_v1_signal_payload(run)
+        try:
+            initial_qty = float(signal.get("v1469_paid_initial_qty"))
+        except (TypeError, ValueError, OverflowError):
+            initial_qty = 0.0
+        event_types = (
+            "entry_filled",
+            "partial_exit",
+            "mid_exit",
+            "final_exit",
+            "v1469_tp_layer_progress",
+        )
+        get_events = getattr(self._repo, "get_events_by_types", None)
+        if callable(get_events):
+            event_rows = await get_events(run_id, event_types, limit=500)
+        else:
+            fallback = getattr(self._repo, "get_events", None)
+            rows = await fallback(run_id, limit=500) if callable(fallback) else []
+            event_rows = [
+                row
+                for row in rows
+                if str(row.get("event_type") or "") in event_types
+            ]
+
+        parsed_events: list[tuple[str, dict[str, Any]]] = []
+        for row in reversed(event_rows):
+            event_type = str(row.get("event_type") or "")
+            details = row.get("details")
+            if not isinstance(details, Mapping):
+                raw_details = row.get("details_json")
+                try:
+                    details = json.loads(str(raw_details or "{}"))
+                except (TypeError, json.JSONDecodeError):
+                    details = {}
+            if isinstance(details, Mapping):
+                parsed_events.append((event_type, dict(details)))
+                if initial_qty <= 0 and event_type == "entry_filled":
+                    try:
+                        initial_qty = float(details.get("qty"))
+                    except (TypeError, ValueError, OverflowError):
+                        initial_qty = 0.0
+        if not math.isfinite(initial_qty) or initial_qty <= 0:
+            raise RuntimeError("v1469 paid initial fill quantity is unavailable")
+
+        # Freeze each layer against the original filled position.  Subsequent
+        # fills subtract from that layer only; they never re-apportion the
+        # current position across the remaining fractions.
+        target_quantities: list[float] = []
+        unallocated_qty = initial_qty
+        for index, (_, fraction) in enumerate(levels):
+            raw_target = (
+                unallocated_qty
+                if index == len(levels) - 1
+                else initial_qty * fraction
+            )
+            formatted = await self._client.format_quantity(
+                position.symbol, raw_target
+            )
+            target_qty = float(formatted)
+            if not math.isfinite(target_qty) or target_qty < 0:
+                raise RuntimeError("v1469 paid TP target quantity is invalid")
+            target_quantities.append(target_qty)
+            unallocated_qty = max(0.0, unallocated_qty - target_qty)
+
+        executed_by_layer = [0.0 for _ in levels]
+        executed_by_order: dict[str, float] = {}
+        completed_event_by_layer = {
+            "partial_exit": 0,
+            "mid_exit": 1,
+            "final_exit": len(levels) - 1,
+        }
+        for event_type, details in parsed_events:
+            if event_type in completed_event_by_layer:
+                index = completed_event_by_layer[event_type]
+                if 0 <= index < len(levels):
+                    executed_by_layer[index] = target_quantities[index]
+                continue
+            if event_type != "v1469_tp_layer_progress":
+                continue
+            try:
+                index = int(details.get("level_index"))
+                total_executed = float(details.get("executed_qty"))
+                order_executed = float(details.get("order_executed_qty"))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if not 0 <= index < len(levels):
+                continue
+            if math.isfinite(total_executed):
+                executed_by_layer[index] = max(
+                    executed_by_layer[index],
+                    min(target_quantities[index], max(0.0, total_executed)),
+                )
+            order_key = str(
+                details.get("order_id")
+                or details.get("client_order_id")
+                or ""
+            )
+            if order_key and math.isfinite(order_executed):
+                executed_by_order[order_key] = max(
+                    executed_by_order.get(order_key, 0.0),
+                    max(0.0, order_executed),
+                )
+
+        # Persist exchange cumulative execution per concrete order.  The order
+        # identity prevents repeated polls from double-counting and allows a
+        # replacement order to continue from the durable layer total.
+        for order in list(existing_orders or ()):
+            client_order_id = str(order.get("clientOrderId") or "")
+            index = next(
+                (
+                    idx
+                    for idx, suffix in enumerate(suffixes)
+                    if client_order_id == f"{run_id}{suffix}"
+                ),
+                None,
+            )
+            if index is None:
+                continue
+            try:
+                order_executed = float(order.get("executedQty") or 0.0)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if not math.isfinite(order_executed) or order_executed <= 0:
+                continue
+            order_key = str(order.get("orderId") or client_order_id)
+            already_recorded = executed_by_order.get(order_key, 0.0)
+            newly_executed = max(0.0, order_executed - already_recorded)
+            if newly_executed <= 1e-9:
+                continue
+            total_executed = min(
+                target_quantities[index],
+                executed_by_layer[index] + newly_executed,
+            )
+            await self._repo.log_event(
+                run_id,
+                "v1469_tp_layer_progress",
+                {
+                    "level_index": index,
+                    "level_id": f"TP{index + 1}",
+                    "client_order_id": client_order_id,
+                    "order_id": order_key,
+                    "order_executed_qty": order_executed,
+                    "executed_qty": total_executed,
+                    "target_qty": target_quantities[index],
+                },
+            )
+            executed_by_order[order_key] = order_executed
+            executed_by_layer[index] = total_executed
+
+        entry = float(position.entry_price)
+        if not math.isfinite(entry) or entry <= 0:
+            raise RuntimeError("v1469 paid TP entry basis is invalid")
+        direction = 1.0 if plan_side == "LONG" else -1.0
+        orders: list[tuple[str, str, float]] = []
+        available_qty = current_qty
+        for index, (target_bp, _) in enumerate(levels):
+            raw_qty = min(
+                available_qty,
+                max(0.0, target_quantities[index] - executed_by_layer[index]),
+            )
+            qty = await self._client.format_quantity(position.symbol, raw_qty)
+            qty_value = float(qty)
+            if qty_value <= 0:
+                continue
+            available_qty = max(0.0, available_qty - qty_value)
+            price = entry * (1.0 + direction * target_bp / 10_000.0)
+            orders.append((f"{run_id}{suffixes[index]}", qty, price))
+        if not orders:
+            raise RuntimeError("v1469 paid TP quantities are not executable")
+        return orders
     async def _desired_take_profit_orders(
         self,
         run: dict,
         position: PositionInfo,
         signal: dict,
         close_side: str,
+        existing_tp: Sequence[Mapping[str, Any]] | None = None,
     ) -> list[tuple[str, str, float]]:
         run_id = run["run_id"]
         current_qty = abs(position.position_amt)
         if current_qty <= 0:
             return []
+        paid_plan = self._v1469_paid_exact_plan(signal)
+        if paid_plan is not None:
+            return await self._v1469_desired_exact_take_profit_orders(
+                run, position, paid_plan, existing_tp
+            )
         full_tp_price = float(signal.get("take_profit") or 0.0)
         # TP3 is always derived from the LIVE cost basis (ladder fill or
         # post-DCA average) × tp_pct.  signal.take_profit is an absolute price
@@ -21266,6 +22401,15 @@ class MainnetOneRunManager:
         return run_id in self._partial_exits
 
     def _effective_sl_pct(self, signal: dict) -> float:
+        paid_plan = self._v1469_paid_exact_plan(signal)
+        if paid_plan is not None:
+            try:
+                sl_bp = float(paid_plan.get("sl_bp"))
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise RuntimeError("v1469 paid SL is invalid") from exc
+            if not math.isfinite(sl_bp) or sl_bp <= 0:
+                raise RuntimeError("v1469 paid SL is invalid")
+            return sl_bp / 10_000.0
         wildcat = signal.get("wildcat", {}) if isinstance(signal, Mapping) else {}
         codex = signal.get("codex_v1", {}) if isinstance(signal, Mapping) else {}
         if isinstance(codex, Mapping) and codex.get("enabled"):
@@ -21378,8 +22522,10 @@ class MainnetOneRunManager:
         existing_by_price: dict[float, float] = {}
         for o in existing_orders:
             p = float(o.get("price", 0) or 0)
-            q = float(o.get("origQty", 0) or 0)
-            existing_by_price[p] = existing_by_price.get(p, 0.0) + q
+            original_qty = float(o.get("origQty", 0) or 0)
+            executed_qty = float(o.get("executedQty", 0) or 0)
+            leaves_qty = max(0.0, original_qty - executed_qty)
+            existing_by_price[p] = existing_by_price.get(p, 0.0) + leaves_qty
 
         for _, desired_qty_str, desired_price in desired_orders:
             desired_qty = float(desired_qty_str)
@@ -24878,6 +26024,15 @@ class MainnetOneRunManager:
                 )
             reconciliation_blocked = not reconciliation_result.continue_live
 
+        paid_signal = self._codex_v1_signal_payload(run)
+        paid_exact_plan = self._v1469_paid_exact_plan(paid_signal)
+        if paid_exact_plan is not None and reconciliation_result is None:
+            reconciliation_result = self._v1459_reconciliation_hook.fail_closed(
+                status="MISSING_PAID_RECONCILIATION",
+                reason="v1469 paid run has no complete exchange reconciliation",
+            )
+            reconciliation_blocked = True
+
         summary["funding_usdc"] = funding_usdc
         if reconciliation_blocked:
             await self._drop_codex_v132_tp_policy_samples(
@@ -24901,6 +26056,7 @@ class MainnetOneRunManager:
             - float(summary["commission_usdc"])
             - funding_usdc
         )
+        terminal_at_ms = int(time.time() * 1000)
         await self._repo.update_run(
             run["run_id"],
             qty=summary["qty"],
@@ -24916,6 +26072,7 @@ class MainnetOneRunManager:
             "gross_pnl": summary["realized_pnl_usdc"],
             "total_commission": summary["commission_usdc"],
             "net_pnl": _net_pnl,
+            "terminal_at_ms": terminal_at_ms,
             "has_tp1": await self._repo.get_first_event_time(run["run_id"], "partial_exit") is not None,
             "has_trail": exit_reason == "TRAIL",
             "has_soft_exit": str(exit_reason).startswith("w6a_no_bounce"),
@@ -24976,11 +26133,29 @@ class MainnetOneRunManager:
                 )
             return
         if completed_details.get("eligible_for_wr_ev") is True:
+            if not await self._v1469_record_paid_close(
+                run,
+                net_pnl_usdc=_net_pnl,
+                terminal_reason=str(exit_reason),
+                terminal_at_ms=terminal_at_ms,
+            ):
+                if self._adaptive_session is not None:
+                    await self._stop_adaptive_session(
+                        run,
+                        "v1469_paid_close_repair_required",
+                        unexpected=True,
+                    )
+                await self._notify(
+                    "⛔ <b>v1.4.69 paid 結算寫入失敗，已停止自動 re-arm</b>\n"
+                    f"Run：<code>{escape(run['run_id'])}</code>\n"
+                    "部位已平倉；風險額度仍保留，等待 restart reconciliation 修復。"
+                )
+                return
             await self._v1464_record_paid_terminal(
                 run,
                 net_pnl_usdc=_net_pnl,
                 reason=str(exit_reason),
-                terminal_at_ms=int(time.time() * 1000),
+                terminal_at_ms=terminal_at_ms,
             )
         # Loop progress: increment completed and compute position label.
         in_loop = self._loop_total > 0

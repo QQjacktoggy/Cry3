@@ -77,6 +77,56 @@ async def _repository(
     return db, V1469LeaseRepository(db)
 
 
+async def _seed_promotion_snapshot(
+    db: Database,
+    *,
+    evidence_revision: str = "revision-2",
+    as_of_ms: int = NOW + 99,
+    clock_revision: int = 0,
+    terminal_fills: int = 3,
+    wins: int = 2,
+    fee_net_paid_pnl: float = 0.03,
+    hard_loss_marker: bool = False,
+) -> None:
+    if clock_revision:
+        await db.conn.execute(
+            """INSERT INTO v1469_paid_terminal_evidence_clocks (
+                environment, symbol, arm_key, execution_profile_hash,
+                regime, revision, terminal_count, latest_terminal_at_ms,
+                latest_claim_id, updated_at_ms
+            ) VALUES (
+                'MAINNET', 'ETHUSDC', 'arm-a', 'profile-hash-a',
+                'RANGE', ?, ?, ?, 'claim-watermark', ?
+            )""",
+            (clock_revision, clock_revision, as_of_ms - 1, as_of_ms),
+        )
+    await db.conn.execute(
+        """INSERT INTO v1469_paid_promotion_evidence_snapshots (
+            environment, symbol, arm_key, execution_profile_hash, regime,
+            evidence_revision, window_start_ms, as_of_ms, evidence_limit,
+            clock_revision, evidence_watermark, terminal_fills, wins,
+            fee_net_paid_pnl, hard_loss_marker, latest_terminal_at_ms,
+            truncated, created_at_ms
+        ) VALUES (
+            'MAINNET', 'ETHUSDC', 'arm-a', 'profile-hash-a', 'RANGE',
+            ?, 0, ?, 100, ?, ?, ?, ?, ?, ?, ?, 0, ?
+        )""",
+        (
+            evidence_revision,
+            as_of_ms,
+            clock_revision,
+            "f" * 64,
+            terminal_fills,
+            wins,
+            fee_net_paid_pnl,
+            int(hard_loss_marker),
+            as_of_ms - 1 if terminal_fills else None,
+            as_of_ms,
+        ),
+    )
+    await db.conn.commit()
+
+
 @pytest.mark.asyncio
 async def test_schema_ready_and_grant_exact_retry(tmp_path: Path) -> None:
     db, repo = await _repository(tmp_path)
@@ -625,5 +675,262 @@ async def test_keep_or_none_cannot_mutate_durable_authority(
                 actor="test",
             )
         assert await repo.get_lease("arm-a") is None
+    finally:
+        await db.close()
+
+@pytest.mark.asyncio
+async def test_promote_probation_to_live_exact_cas_and_replay(
+    tmp_path: Path,
+) -> None:
+    db, repo = await _repository(tmp_path)
+    try:
+        granted = await repo.apply_proposal(
+            _identity(),
+            _proposal(),
+            _context(),
+            expected_generation=0,
+            expected_evidence_revision=None,
+            event_time_ms=NOW,
+            idempotency_key="grant-for-promotion",
+            actor="test",
+        )
+        await _seed_promotion_snapshot(db)
+        kwargs = dict(
+            environment="MAINNET",
+            symbol="ETHUSDC",
+            arm_key="arm-a",
+            lease_id=granted.lease.lease_id,
+            expected_generation=1,
+            expected_evidence_revision="revision-1",
+            new_evidence_revision="revision-2",
+            expected_execution_profile_hash="profile-hash-a",
+            expected_regime="RANGE",
+            expected_risk_policy_hash="risk-policy-a",
+            live_notional_cap_usdc=40.0,
+            evidence_as_of_ms=NOW + 99,
+            event_time_ms=NOW + 100,
+            expires_at_ms=NOW + 10_000,
+            hard_loss_marker=False,
+            idempotency_key="promote-a",
+            actor="test",
+        )
+        promoted = await repo.promote_probation_to_live(**kwargs)
+        assert promoted.applied is True
+        assert promoted.replayed is False
+        assert promoted.lease.phase is LeasePhase.LIVE
+        assert promoted.lease.generation == 2
+        assert promoted.lease.notional_cap_usdc == pytest.approx(40.0)
+        assert promoted.lease.evidence_revision == "revision-2"
+
+        replay = await repo.promote_probation_to_live(**kwargs)
+        assert replay.applied is False
+        assert replay.replayed is True
+        assert replay.lease == promoted.lease
+
+        with pytest.raises(
+            V1469LeaseConflictError, match="live_promotion_cas_lost"
+        ):
+            await repo.promote_probation_to_live(
+                **{**kwargs, "idempotency_key": "competing-promotion"}
+            )
+        assert await db.fetchone(
+            """SELECT COUNT(*) AS n FROM v1469_arm_events
+            WHERE event_type = 'LIVE_PROMOTED'"""
+        ) == {"n": 1}
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("override", "error"),
+    [
+        ({"environment": "TESTNET"}, "live_promotion_cas_lost"),
+        ({"symbol": "BTCUSDC"}, "live_promotion_cas_lost"),
+        ({"arm_key": "wrong-arm"}, "lease_missing"),
+        ({"lease_id": "wrong-lease"}, "live_promotion_cas_lost"),
+        ({"expected_generation": 2}, "live_promotion_cas_lost"),
+        ({"expected_evidence_revision": "wrong"},
+         "live_promotion_cas_lost"),
+        ({"live_notional_cap_usdc": 50.01},
+         "LIVE promotion notional cap must be positive and <= 50 USDC"),
+        ({"expected_execution_profile_hash": "wrong"},
+         "live_promotion_cas_lost"),
+        ({"expected_regime": "TREND_UP"}, "live_promotion_cas_lost"),
+        ({"expected_risk_policy_hash": "wrong"},
+         "live_promotion_cas_lost"),
+        ({"event_time_ms": NOW + 5_000,
+          "expires_at_ms": NOW + 10_000,
+          "evidence_as_of_ms": NOW + 4_999},
+         "live_promotion_cas_lost"),
+        ({"hard_loss_marker": True},
+         "hard_loss_marker_blocks_live_promotion"),
+    ],
+)
+async def test_promotion_scope_expiry_and_hard_loss_fail_closed(
+    tmp_path: Path,
+    override: dict[str, object],
+    error: str,
+) -> None:
+    db, repo = await _repository(tmp_path)
+    try:
+        granted = await repo.apply_proposal(
+            _identity(),
+            _proposal(),
+            _context(),
+            expected_generation=0,
+            expected_evidence_revision=None,
+            event_time_ms=NOW,
+            idempotency_key="grant-for-blocked-promotion",
+            actor="test",
+        )
+        await _seed_promotion_snapshot(db)
+        kwargs = dict(
+            environment="MAINNET",
+            symbol="ETHUSDC",
+            arm_key="arm-a",
+            lease_id=granted.lease.lease_id,
+            expected_generation=1,
+            expected_evidence_revision="revision-1",
+            new_evidence_revision="revision-2",
+            expected_execution_profile_hash="profile-hash-a",
+            expected_regime="RANGE",
+            expected_risk_policy_hash="risk-policy-a",
+            live_notional_cap_usdc=40.0,
+            evidence_as_of_ms=NOW + 99,
+            event_time_ms=NOW + 100,
+            expires_at_ms=NOW + 10_000,
+            hard_loss_marker=False,
+            idempotency_key="blocked-promotion",
+            actor="test",
+        )
+        kwargs.update(override)
+        with pytest.raises((V1469LeaseConflictError, ValueError), match=error):
+            await repo.promote_probation_to_live(**kwargs)
+        current = await repo.get_lease("arm-a")
+        assert current is not None
+        assert current.phase is LeasePhase.PROBATION
+        assert current.generation == 1
+        assert await db.fetchone(
+            """SELECT COUNT(*) AS n FROM v1469_arm_events
+            WHERE event_type = 'LIVE_PROMOTED'"""
+        ) == {"n": 0}
+    finally:
+        await db.close()
+@pytest.mark.asyncio
+async def test_live_promotion_rejects_changed_paid_evidence_clock(
+    tmp_path: Path,
+) -> None:
+    db, repo = await _repository(tmp_path)
+    try:
+        granted = await repo.apply_proposal(
+            _identity(),
+            _proposal(),
+            _context(),
+            expected_generation=0,
+            expected_evidence_revision=None,
+            event_time_ms=NOW,
+            idempotency_key="grant-for-watermark-race",
+            actor="test",
+        )
+        await _seed_promotion_snapshot(db)
+        # Simulate a new same-scope TERMINAL commit after evidence was read.
+        await db.conn.execute(
+            """INSERT INTO v1469_paid_terminal_evidence_clocks (
+                environment, symbol, arm_key, execution_profile_hash,
+                regime, revision, terminal_count, latest_terminal_at_ms,
+                latest_claim_id, updated_at_ms
+            ) VALUES (
+                'MAINNET', 'ETHUSDC', 'arm-a', 'profile-hash-a',
+                'RANGE', 1, 1, ?, 'new-hard-loss', ?
+            )""",
+            (NOW + 99, NOW + 99),
+        )
+        await db.conn.commit()
+
+        with pytest.raises(
+            V1469LeaseConflictError,
+            match="promotion_evidence_watermark_changed",
+        ):
+            await repo.promote_probation_to_live(
+                environment="MAINNET",
+                symbol="ETHUSDC",
+                arm_key="arm-a",
+                lease_id=granted.lease.lease_id,
+                expected_generation=1,
+                expected_evidence_revision="revision-1",
+                new_evidence_revision="revision-2",
+                expected_execution_profile_hash="profile-hash-a",
+                expected_regime="RANGE",
+                expected_risk_policy_hash="risk-policy-a",
+                live_notional_cap_usdc=40.0,
+                evidence_as_of_ms=NOW + 99,
+                event_time_ms=NOW + 100,
+                expires_at_ms=NOW + 10_000,
+                hard_loss_marker=False,
+                idempotency_key="stale-watermark-promotion",
+                actor="test",
+            )
+        current = await repo.get_lease("arm-a")
+        assert current is not None
+        assert current.phase is LeasePhase.PROBATION
+        assert current.generation == 1
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_live_promotion_rejects_stale_or_missing_snapshot(
+    tmp_path: Path,
+) -> None:
+    db, repo = await _repository(tmp_path)
+    try:
+        granted = await repo.apply_proposal(
+            _identity(),
+            _proposal(),
+            _context(),
+            expected_generation=0,
+            expected_evidence_revision=None,
+            event_time_ms=NOW,
+            idempotency_key="grant-for-snapshot-contract",
+            actor="test",
+        )
+        base = dict(
+            environment="MAINNET",
+            symbol="ETHUSDC",
+            arm_key="arm-a",
+            lease_id=granted.lease.lease_id,
+            expected_generation=1,
+            expected_evidence_revision="revision-1",
+            new_evidence_revision="revision-2",
+            expected_execution_profile_hash="profile-hash-a",
+            expected_regime="RANGE",
+            expected_risk_policy_hash="risk-policy-a",
+            live_notional_cap_usdc=40.0,
+            expires_at_ms=NOW + 30_000,
+            hard_loss_marker=False,
+            actor="test",
+        )
+        with pytest.raises(
+            V1469LeaseConflictError,
+            match="promotion_evidence_snapshot_missing",
+        ):
+            await repo.promote_probation_to_live(
+                **base,
+                evidence_as_of_ms=NOW + 99,
+                event_time_ms=NOW + 100,
+                idempotency_key="missing-snapshot",
+            )
+        await _seed_promotion_snapshot(db, as_of_ms=NOW + 99)
+        with pytest.raises(
+            V1469LeaseConflictError,
+            match="promotion_evidence_snapshot_stale",
+        ):
+            await repo.promote_probation_to_live(
+                **base,
+                evidence_as_of_ms=NOW + 99,
+                event_time_ms=NOW + 10_100,
+                idempotency_key="stale-snapshot",
+            )
     finally:
         await db.close()

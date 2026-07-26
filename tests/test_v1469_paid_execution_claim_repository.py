@@ -8,6 +8,7 @@ import pytest
 
 from src.gridbot.storage.database import Database
 from src.gridbot.storage.v1469_paid_execution_claim_repository import (
+    DurablePaidExecutionClaim,
     V1469PaidClaimConflictError,
     V1469PaidExecutionClaimRepository,
 )
@@ -76,6 +77,35 @@ async def _seed_opportunities_and_active_lease(
         ),
     )
     await db.conn.commit()
+
+
+async def _transition_claim_to_submitted(
+    repo: V1469PaidExecutionClaimRepository,
+    claim: DurablePaidExecutionClaim,
+    *,
+    submitting_at_ms: int,
+    submitted_at_ms: int,
+    key: str,
+) -> DurablePaidExecutionClaim:
+    submitting = await repo.transition_submission(
+        claim_id=claim.claim_id,
+        expected_generation=claim.generation,
+        target_status="SUBMITTING",
+        transition_at_ms=submitting_at_ms,
+        idempotency_key=f"submitting:{key}",
+        actor="test",
+        payload={"client_order_id": f"cid-{key}"},
+    )
+    submitted = await repo.transition_submission(
+        claim_id=claim.claim_id,
+        expected_generation=submitting.claim.generation,
+        target_status="SUBMITTED",
+        transition_at_ms=submitted_at_ms,
+        idempotency_key=f"submitted:{key}",
+        actor="test",
+        payload={"client_order_id": f"cid-{key}"},
+    )
+    return submitted.claim
 
 
 @pytest.mark.asyncio
@@ -193,9 +223,16 @@ async def test_paid_claim_terminal_and_abandon_are_cas_and_audited(
             actor="test",
         )
 
+        first_submitted = await _transition_claim_to_submitted(
+            repo,
+            first.claim,
+            submitting_at_ms=1_200,
+            submitted_at_ms=1_300,
+            key="opp-1",
+        )
         terminal = await repo.terminalize_claim(
             claim_id=first.claim.claim_id,
-            expected_generation=1,
+            expected_generation=first_submitted.generation,
             terminal_at_ms=2_000,
             terminal_reason="PAID_POSITION_CLOSED",
             idempotency_key="terminal:opp-1",
@@ -204,14 +241,14 @@ async def test_paid_claim_terminal_and_abandon_are_cas_and_audited(
         )
         assert terminal.applied is True
         assert terminal.claim.status == "TERMINAL"
-        assert terminal.claim.generation == 2
+        assert terminal.claim.generation == 4
         assert terminal.claim.result_payload == {
             "fee_net_pnl_usdc": 0.12
         }
 
         terminal_retry = await repo.terminalize_claim(
             claim_id=first.claim.claim_id,
-            expected_generation=1,
+            expected_generation=first_submitted.generation,
             terminal_at_ms=2_000,
             terminal_reason="PAID_POSITION_CLOSED",
             idempotency_key="terminal:opp-1:retry",
@@ -277,9 +314,19 @@ async def test_paid_claim_terminal_and_abandon_are_cas_and_audited(
                 "generation_after": 1,
             },
             {
-                "event_type": "TERMINAL",
+                "event_type": "SUBMITTING",
                 "generation_before": 1,
                 "generation_after": 2,
+            },
+            {
+                "event_type": "SUBMITTED",
+                "generation_before": 2,
+                "generation_after": 3,
+            },
+            {
+                "event_type": "TERMINAL",
+                "generation_before": 3,
+                "generation_after": 4,
             },
             {
                 "event_type": "ABANDONED",
@@ -323,6 +370,134 @@ async def test_paid_claim_terminal_and_abandon_are_cas_and_audited(
 
 
 @pytest.mark.asyncio
+async def test_terminal_and_abandon_require_unambiguous_lifecycle_states(
+    tmp_path: Path,
+) -> None:
+    db = Database(str(tmp_path / "paid-claim-lifecycle-guards.db"))
+    await db.initialize()
+    repo = V1469PaidExecutionClaimRepository(db)
+    await _seed_opportunities_and_active_lease(
+        db,
+        "claimed-terminal",
+        "unknown-abandon",
+        "submitted-abandon",
+    )
+    try:
+        claimed = (
+            await repo.claim(
+                environment=ENVIRONMENT,
+                symbol=SYMBOL,
+                opportunity_id="claimed-terminal",
+                arm_key=ARM_KEY,
+                lease_id=LEASE_ID,
+                claimed_at_ms=1_100,
+                idempotency_key="claim:claimed-terminal",
+                actor="test",
+            )
+        ).claim
+        with pytest.raises(
+            V1469PaidClaimConflictError,
+            match="must be SUBMITTED before TERMINAL",
+        ):
+            await repo.terminalize_claim(
+                claim_id=claimed.claim_id,
+                expected_generation=1,
+                terminal_at_ms=1_500,
+                terminal_reason="INVALID_CLOSE",
+                idempotency_key="terminal:claimed-terminal",
+                actor="test",
+                result_payload={"fee_net_pnl_usdc": 0.0},
+            )
+
+        unknown = (
+            await repo.claim(
+                environment=ENVIRONMENT,
+                symbol=SYMBOL,
+                opportunity_id="unknown-abandon",
+                arm_key=ARM_KEY,
+                lease_id=LEASE_ID,
+                claimed_at_ms=1_101,
+                idempotency_key="claim:unknown-abandon",
+                actor="test",
+            )
+        ).claim
+        unknown = (
+            await repo.transition_submission(
+                claim_id=unknown.claim_id,
+                expected_generation=1,
+                target_status="SUBMITTING",
+                transition_at_ms=1_200,
+                idempotency_key="submitting:unknown-abandon",
+                actor="test",
+                payload={"client_order_id": "cid-unknown"},
+            )
+        ).claim
+        unknown = (
+            await repo.transition_submission(
+                claim_id=unknown.claim_id,
+                expected_generation=2,
+                target_status="UNKNOWN",
+                transition_at_ms=1_300,
+                idempotency_key="unknown:unknown-abandon",
+                actor="test",
+                payload={"client_order_id": "cid-unknown"},
+            )
+        ).claim
+        with pytest.raises(
+            V1469PaidClaimConflictError,
+            match="only unambiguous unsubmitted claim",
+        ):
+            await repo.abandon_claim(
+                claim_id=unknown.claim_id,
+                expected_generation=unknown.generation,
+                abandoned_at_ms=1_500,
+                terminal_reason="UNSAFE_RELEASE",
+                idempotency_key="abandon:unknown",
+                actor="test",
+            )
+
+        submitted_seed = (
+            await repo.claim(
+                environment=ENVIRONMENT,
+                symbol=SYMBOL,
+                opportunity_id="submitted-abandon",
+                arm_key=ARM_KEY,
+                lease_id=LEASE_ID,
+                claimed_at_ms=1_102,
+                idempotency_key="claim:submitted-abandon",
+                actor="test",
+            )
+        ).claim
+        submitted = await _transition_claim_to_submitted(
+            repo,
+            submitted_seed,
+            submitting_at_ms=1_201,
+            submitted_at_ms=1_301,
+            key="submitted-abandon",
+        )
+        with pytest.raises(
+            V1469PaidClaimConflictError,
+            match="only unambiguous unsubmitted claim",
+        ):
+            await repo.abandon_claim(
+                claim_id=submitted.claim_id,
+                expected_generation=submitted.generation,
+                abandoned_at_ms=1_500,
+                terminal_reason="UNSAFE_RELEASE",
+                idempotency_key="abandon:submitted",
+                actor="test",
+            )
+
+        claimed_after = await repo.get_claim_by_id(claimed.claim_id)
+        unknown_after = await repo.get_claim_by_id(unknown.claim_id)
+        submitted_after = await repo.get_claim_by_id(submitted.claim_id)
+        assert claimed_after is not None and claimed_after.status == "CLAIMED"
+        assert unknown_after is not None and unknown_after.status == "UNKNOWN"
+        assert submitted_after is not None and submitted_after.status == "SUBMITTED"
+    finally:
+        await db.close()
+
+@pytest.mark.asyncio
 async def test_paid_claim_audit_failure_rolls_back_claim_and_terminal_cas(
     tmp_path: Path,
 ) -> None:
@@ -341,6 +516,13 @@ async def test_paid_claim_audit_failure_rolls_back_claim_and_terminal_cas(
             idempotency_key="shared-audit-key",
             actor="test",
         )
+        first_submitted = await _transition_claim_to_submitted(
+            repo,
+            first.claim,
+            submitting_at_ms=1_200,
+            submitted_at_ms=1_300,
+            key="audit-opp-1",
+        )
 
         with pytest.raises(
             V1469PaidClaimConflictError,
@@ -348,7 +530,7 @@ async def test_paid_claim_audit_failure_rolls_back_claim_and_terminal_cas(
         ):
             await repo.terminalize_claim(
                 claim_id=first.claim.claim_id,
-                expected_generation=1,
+                expected_generation=first_submitted.generation,
                 terminal_at_ms=2_000,
                 terminal_reason="CLOSED",
                 idempotency_key="shared-audit-key",
@@ -358,8 +540,8 @@ async def test_paid_claim_audit_failure_rolls_back_claim_and_terminal_cas(
             first.claim.claim_id
         )
         assert after_failed_terminal is not None
-        assert after_failed_terminal.status == "CLAIMED"
-        assert after_failed_terminal.generation == 1
+        assert after_failed_terminal.status == "SUBMITTED"
+        assert after_failed_terminal.generation == 3
 
         with pytest.raises(
             V1469PaidClaimConflictError,
@@ -390,7 +572,7 @@ async def test_paid_claim_audit_failure_rolls_back_claim_and_terminal_cas(
                 (SELECT COUNT(*) FROM v1469_paid_execution_claim_events)
                     AS event_count"""
         )
-        assert counts == {"claim_count": 1, "event_count": 1}
+        assert counts == {"claim_count": 1, "event_count": 3}
     finally:
         await db.close()
 

@@ -351,7 +351,10 @@ class V1469LeaseRepository:
             WHERE name IN (
                 'idx_v1469_one_active_arm_per_symbol',
                 'trg_v1469_arm_events_no_update',
-                'trg_v1469_arm_events_no_delete'
+                'trg_v1469_arm_events_no_delete',
+                'v1469_paid_terminal_evidence_clocks',
+                'v1469_paid_promotion_evidence_snapshots',
+                'trg_v1469_paid_terminal_evidence_clock'
             )"""
         )
         schema_names = {str(row["name"]) for row in schema_rows}
@@ -359,6 +362,9 @@ class V1469LeaseRepository:
             "idx_v1469_one_active_arm_per_symbol",
             "trg_v1469_arm_events_no_update",
             "trg_v1469_arm_events_no_delete",
+            "v1469_paid_terminal_evidence_clocks",
+            "v1469_paid_promotion_evidence_snapshots",
+            "trg_v1469_paid_terminal_evidence_clock",
         }
         index_sql = next(
             (
@@ -688,6 +694,276 @@ class V1469LeaseRepository:
                     await self._db.conn.rollback()
                 raise
 
+    async def promote_probation_to_live(
+        self,
+        *,
+        environment: str,
+        symbol: str,
+        arm_key: str,
+        lease_id: str,
+        expected_generation: int,
+        expected_evidence_revision: str,
+        new_evidence_revision: str,
+        expected_execution_profile_hash: str,
+        expected_regime: str,
+        expected_risk_policy_hash: str,
+        live_notional_cap_usdc: float,
+        evidence_as_of_ms: int,
+        event_time_ms: int,
+        expires_at_ms: int,
+        hard_loss_marker: bool,
+        idempotency_key: str,
+        actor: str,
+    ) -> LeaseMutationResult:
+        """Atomically promote one exact, unexpired PROBATION lease to LIVE."""
+
+        scope_environment = _required_text(
+            environment, "environment", upper=True
+        )
+        scope_symbol = _required_text(symbol, "symbol", upper=True)
+        exact_arm_key = _required_text(arm_key, "arm_key")
+        exact_lease_id = _required_text(lease_id, "lease_id")
+        generation_before = _expected_generation(expected_generation)
+        if generation_before < 1:
+            raise ValueError("promotion requires a positive expected_generation")
+        exact_revision = _required_text(
+            expected_evidence_revision, "expected_evidence_revision"
+        )
+        new_revision = _required_text(
+            new_evidence_revision, "new_evidence_revision"
+        )
+        exact_profile_hash = _required_text(
+            expected_execution_profile_hash,
+            "expected_execution_profile_hash",
+        )
+        exact_regime = _required_text(
+            expected_regime, "expected_regime", upper=True
+        )
+        exact_risk_hash = _required_text(
+            expected_risk_policy_hash, "expected_risk_policy_hash"
+        )
+        event_time = _non_negative_int(event_time_ms, "event_time_ms")
+        evidence_time = _non_negative_int(
+            evidence_as_of_ms, "evidence_as_of_ms"
+        )
+        expiry = _non_negative_int(expires_at_ms, "expires_at_ms")
+        if evidence_time > event_time:
+            raise ValueError("evidence_as_of_ms cannot be in the future")
+        if event_time - evidence_time > 10_000:
+            raise V1469LeaseConflictError(
+                "promotion_evidence_snapshot_stale"
+            )
+        if expiry <= event_time:
+            raise ValueError("promotion expiry must be after event_time_ms")
+        if bool(hard_loss_marker):
+            raise V1469LeaseConflictError(
+                "hard_loss_marker_blocks_live_promotion"
+            )
+        cap = float(live_notional_cap_usdc)
+        if not isfinite(cap) or cap <= 0 or cap > 50:
+            raise ValueError(
+                "LIVE promotion notional cap must be positive and <= 50 USDC"
+            )
+        key = _required_text(idempotency_key, "idempotency_key")
+        event_actor = _required_text(actor, "actor")
+        generation_after = generation_before + 1
+        payload_json = _canonical_json(
+            {
+                "schema": "v1469.lease-mutation.1",
+                "operation": "PROMOTE_PROBATION_TO_LIVE",
+                "environment": scope_environment,
+                "symbol": scope_symbol,
+                "arm_key": exact_arm_key,
+                "lease_id": exact_lease_id,
+                "expected_generation": generation_before,
+                "expected_evidence_revision": exact_revision,
+                "new_evidence_revision": new_revision,
+                "expected_execution_profile_hash": exact_profile_hash,
+                "expected_regime": exact_regime,
+                "expected_risk_policy_hash": exact_risk_hash,
+                "live_notional_cap_usdc": cap,
+                "evidence_as_of_ms": evidence_time,
+                "expires_at_ms": expiry,
+                "hard_loss_marker": False,
+            }
+        )
+        event_row = {
+            "idempotency_key": key,
+            "arm_key": exact_arm_key,
+            "lease_id": exact_lease_id,
+            "opportunity_id": None,
+            "candidate_id": None,
+            "generation_before": generation_before,
+            "generation_after": generation_after,
+            "event_time_ms": event_time,
+            "event_type": "LIVE_PROMOTED",
+            "actor": event_actor,
+            "payload_json": payload_json,
+        }
+        async with self._write_lock:
+            began = False
+            try:
+                await self._db.conn.execute("BEGIN IMMEDIATE")
+                began = True
+                if await self._exact_event_replay(event_row):
+                    current = await self._lease_row(exact_arm_key)
+                    if (
+                        current is None
+                        or str(current["lease_id"]) != exact_lease_id
+                        or int(current["generation"]) != generation_after
+                        or str(current["phase"]) != LeasePhase.LIVE.value
+                        or str(current["evidence_revision"])
+                        != new_revision
+                    ):
+                        raise V1469LeasePersistenceError(
+                            "idempotent LIVE_PROMOTED event has no exact lease"
+                        )
+                    await self._db.conn.rollback()
+                    began = False
+                    return LeaseMutationResult(
+                        lease=_lease_from_row(current),
+                        applied=False,
+                        replayed=True,
+                        event_generation=generation_after,
+                    )
+                current = await self._lease_row(exact_arm_key)
+                if current is None:
+                    raise V1469LeaseConflictError("lease_missing")
+                exact_source_matches = (
+                    str(current["environment"]) == scope_environment
+                    and str(current["symbol"]) == scope_symbol
+                    and str(current["lease_id"]) == exact_lease_id
+                    and int(current["generation"]) == generation_before
+                    and str(current["evidence_revision"]) == exact_revision
+                    and str(current["execution_profile_hash"])
+                    == exact_profile_hash
+                    and str(current["coarse_regime"]) == exact_regime
+                    and str(current["risk_policy_hash"]) == exact_risk_hash
+                    and str(current["status"]) == "ACTIVE"
+                    and str(current["phase"]) == LeasePhase.PROBATION.value
+                    and int(current["expires_at_ms"]) > event_time
+                )
+                if not exact_source_matches:
+                    raise V1469LeaseConflictError("live_promotion_cas_lost")
+                snapshot = await self._db.fetchone(
+                    """SELECT *
+                    FROM v1469_paid_promotion_evidence_snapshots
+                    WHERE environment = ? AND symbol = ?
+                      AND arm_key = ? AND execution_profile_hash = ?
+                      AND regime = ? AND evidence_revision = ?""",
+                    (
+                        scope_environment,
+                        scope_symbol,
+                        exact_arm_key,
+                        exact_profile_hash,
+                        exact_regime,
+                        new_revision,
+                    ),
+                )
+                if snapshot is None:
+                    raise V1469LeaseConflictError(
+                        "promotion_evidence_snapshot_missing"
+                    )
+                if int(snapshot["as_of_ms"]) != evidence_time:
+                    raise V1469LeaseConflictError(
+                        "promotion_evidence_snapshot_changed"
+                    )
+                clock = await self._db.fetchone(
+                    """SELECT revision
+                    FROM v1469_paid_terminal_evidence_clocks
+                    WHERE environment = ? AND symbol = ?
+                      AND arm_key = ? AND execution_profile_hash = ?
+                      AND regime = ?""",
+                    (
+                        scope_environment,
+                        scope_symbol,
+                        exact_arm_key,
+                        exact_profile_hash,
+                        exact_regime,
+                    ),
+                )
+                clock_revision = (
+                    0 if clock is None else int(clock["revision"])
+                )
+                if clock_revision != int(snapshot["clock_revision"]):
+                    raise V1469LeaseConflictError(
+                        "promotion_evidence_watermark_changed"
+                    )
+                if (
+                    int(snapshot["terminal_fills"]) < 3
+                    or int(snapshot["wins"]) < 2
+                    or float(snapshot["fee_net_paid_pnl"]) <= 0.0
+                    or bool(snapshot["hard_loss_marker"])
+                ):
+                    raise V1469LeaseConflictError(
+                        "promotion_evidence_not_live_ready"
+                    )
+                if evidence_time < int(current["evidence_as_of_ms"]):
+                    raise V1469LeaseConflictError(
+                        "promotion_evidence_precedes_lease_evidence"
+                    )
+                cursor = await self._db.conn.execute(
+                    """UPDATE v1469_arm_leases
+                    SET generation = ?, phase = 'LIVE',
+                        notional_cap_usdc = ?, evidence_revision = ?,
+                        evidence_as_of_ms = ?,
+                        renewed_at_ms = ?, expires_at_ms = ?,
+                        updated_at_ms = ?
+                    WHERE environment = ? AND symbol = ?
+                      AND arm_key = ? AND lease_id = ?
+                      AND generation = ? AND evidence_revision = ?
+                      AND execution_profile_hash = ?
+                      AND coarse_regime = ? AND risk_policy_hash = ?
+                      AND status = 'ACTIVE' AND phase = 'PROBATION'
+                      AND expires_at_ms > ?""",
+                    (
+                        generation_after,
+                        cap,
+                        new_revision,
+                        evidence_time,
+                        event_time,
+                        expiry,
+                        event_time,
+                        scope_environment,
+                        scope_symbol,
+                        exact_arm_key,
+                        exact_lease_id,
+                        generation_before,
+                        exact_revision,
+                        exact_profile_hash,
+                        exact_regime,
+                        exact_risk_hash,
+                        event_time,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise V1469LeaseConflictError("live_promotion_cas_lost")
+                await self._insert_event(event_row)
+                promoted = await self._lease_row(exact_arm_key)
+                if promoted is None:
+                    raise V1469LeasePersistenceError(
+                        "promoted lease disappeared before commit"
+                    )
+                await self._db.conn.commit()
+                began = False
+                return LeaseMutationResult(
+                    lease=_lease_from_row(promoted),
+                    applied=True,
+                    replayed=False,
+                    event_generation=generation_after,
+                )
+            except asyncio.CancelledError:
+                if began:
+                    await asyncio.shield(self._db.conn.rollback())
+                raise
+            except sqlite3.IntegrityError as exc:
+                if began:
+                    await self._db.conn.rollback()
+                raise V1469LeaseConflictError(str(exc)) from exc
+            except Exception:
+                if began:
+                    await self._db.conn.rollback()
+                raise
     async def revoke(
         self,
         revocation: LeaseRevocation,

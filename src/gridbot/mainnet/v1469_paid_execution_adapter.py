@@ -33,6 +33,36 @@ class SubmissionResult:
     submitted_now: bool
 
 
+_AMBIGUOUS_BINANCE_CODES = frozenset({-1000, -1001, -1006, -1007})
+
+
+def _http_status_from_exception(exc: BaseException) -> int | None:
+    """Best-effort extraction for HTTP clients without coupling to one SDK."""
+    for source in (exc, getattr(exc, "response", None)):
+        for name in ("status_code", "status", "http_status"):
+            value = getattr(source, name, None)
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _is_ambiguous_submit_error(exc: BaseException) -> bool:
+    """Whether the exchange may have accepted a submit despite this error."""
+    try:
+        exchange_code = int(getattr(exc, "code", None))
+    except (TypeError, ValueError):
+        exchange_code = None
+    if exchange_code in _AMBIGUOUS_BINANCE_CODES:
+        return True
+    # urllib-style HTTP errors expose the response status as ``code``.
+    if exchange_code is not None and 500 <= exchange_code <= 599:
+        return True
+    http_status = _http_status_from_exception(exc)
+    return http_status is not None and 500 <= http_status <= 599
+
+
 class V1469PaidExecutionAdapter:
     def __init__(self, repository: V1469PaidExecutionClaimRepository) -> None:
         self._repository = repository
@@ -45,6 +75,9 @@ class V1469PaidExecutionAdapter:
         find_by_client_order_id: Callable[[str], Awaitable[Mapping[str, Any] | None]],
         submit: Callable[[str], Awaitable[Mapping[str, Any]]],
         actor: str,
+        before_submit: Callable[
+            [str, DurablePaidExecutionClaim], Awaitable[None]
+        ] | None = None,
     ) -> SubmissionResult:
         cid = deterministic_client_order_id(claim.claim_id)
         durable = await self._repository.get_claim_by_id(claim.claim_id)
@@ -104,9 +137,80 @@ class V1469PaidExecutionAdapter:
 
         if not owns_submission:
             return SubmissionResult(durable, cid, None, False)
+        if before_submit is not None:
+            try:
+                await before_submit(cid, durable)
+            except BaseException:
+                try:
+                    await self._repository.abandon_claim(
+                        claim_id=durable.claim_id,
+                        expected_generation=durable.generation,
+                        abandoned_at_ms=now_ms,
+                        terminal_reason="PRE_SUBMIT_BINDING_FAILED",
+                        idempotency_key=(
+                            f"abandoned:{durable.claim_id}:"
+                            f"{durable.generation}:binding"
+                        ),
+                        actor=actor,
+                        result_payload={
+                            "client_order_id": cid,
+                            "submitted": False,
+                        },
+                    )
+                except BaseException:
+                    pass
+                raise
         try:
             order = await submit(cid)
-        except BaseException:
+        except BaseException as exc:
+            # Binance's internal/timeout codes and HTTP 5xx do not prove that
+            # the exchange rejected the order. Look up the deterministic CID
+            # before deciding whether this invocation may return successfully.
+            exchange_code = getattr(exc, "code", None)
+            if _is_ambiguous_submit_error(exc):
+                try:
+                    visible = await find_by_client_order_id(cid)
+                except BaseException:
+                    visible = None
+                if visible is not None:
+                    durable = (await self._repository.transition_submission(
+                        claim_id=durable.claim_id,
+                        expected_generation=durable.generation,
+                        target_status="SUBMITTED",
+                        transition_at_ms=now_ms,
+                        idempotency_key=(
+                            f"submitted:{durable.claim_id}:{durable.generation}"
+                        ),
+                        actor=actor,
+                        payload={
+                            "client_order_id": cid,
+                            "reconciled_after_ambiguous_submit_error": True,
+                        },
+                    )).claim
+                    return SubmissionResult(durable, cid, visible, False)
+            # An explicit non-ambiguous exchange error code proves this
+            # request was rejected. Timeouts and transport failures remain
+            # UNKNOWN.
+            if exchange_code is not None and not _is_ambiguous_submit_error(exc):
+                try:
+                    await self._repository.abandon_claim(
+                        claim_id=durable.claim_id,
+                        expected_generation=durable.generation,
+                        abandoned_at_ms=now_ms,
+                        terminal_reason="EXCHANGE_REJECTED",
+                        idempotency_key=(
+                            f"abandoned:{durable.claim_id}:"
+                            f"{durable.generation}"
+                        ),
+                        actor=actor,
+                        result_payload={
+                            "client_order_id": cid,
+                            "exchange_code": exchange_code,
+                        },
+                    )
+                except BaseException:
+                    pass
+                raise
             # Persist ambiguity even for cancellation; the caller may be dying.
             try:
                 await self._repository.transition_submission(

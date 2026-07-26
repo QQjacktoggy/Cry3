@@ -123,7 +123,12 @@ def test_enforcement_on_requires_exact_fresh_identity_and_risk():
         probation_evidence=evidence, daily_risk_snapshot=risk, enforcement_enabled=True,
         now_ms=10000, regime="RANGE")
     assert resolve_paid_authority(**kwargs).kind is PaidAuthorityKind.ADAPTIVE
-    assert resolve_paid_authority(**{**kwargs, "durable_lease": replace(evidence, arm_key="wrong")}).kind is PaidAuthorityKind.LEGACY_CONTROL
+    invalid = resolve_paid_authority(
+        **{**kwargs, "durable_lease": replace(evidence, arm_key="wrong")}
+    )
+    assert invalid.kind is PaidAuthorityKind.BLOCK
+    assert invalid.reason == "adaptive_authority_invalid_block"
+    assert invalid.execution_payload is None
     blocked = resolve_paid_authority(**{**kwargs, "legacy_decision": LegacyPaidDecision(allowed=False, decision_payload=None, reason="risk"), "daily_risk_snapshot": None})
     assert blocked.kind is PaidAuthorityKind.BLOCK
 

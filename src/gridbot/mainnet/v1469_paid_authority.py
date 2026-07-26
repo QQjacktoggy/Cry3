@@ -111,7 +111,16 @@ def resolve_paid_authority(*, legacy_snapshot: LegacyExecutionSnapshot,
                      and evidence.regime.upper() == regime.upper()
                      and int(now_ms) - evidence.as_of_ms <= 10_000)
     if not valid:
-        return replace(fallback, reason="adaptive_authority_invalid_fallback" if legacy_decision.allowed else "adaptive_authority_invalid_block")
+        # Once v1.4.69 enforcement is explicitly enabled, the only entry
+        # authority is an exact, fresh adaptive lease.  Falling back to the
+        # legacy decision here would bypass the paid-claim contract and could
+        # create an order without the lease/risk snapshot that enforcement is
+        # meant to require.
+        return PaidAuthorityDecision(
+            kind=PaidAuthorityKind.BLOCK,
+            reason="adaptive_authority_invalid_block",
+            legacy_decision=legacy_decision,
+        )
     return PaidAuthorityDecision(kind=PaidAuthorityKind.ADAPTIVE,
         reason="exact_active_lease", legacy_decision=legacy_decision,
         arm=winner, lease_id=str(durable_lease.lease_id),
@@ -141,7 +150,7 @@ def apply_automatic_live_phase(decision: ArbiterDecision,
     if duration <= 0:
         raise ValueError("live_lease_ms must be positive")
     return replace(decision, lease_proposal=replace(
-        proposal, phase=LeasePhase.LIVE,
+        proposal, action=LeaseAction.RENEW, phase=LeasePhase.LIVE,
         expires_at_ms=int(now_ms) + duration,
     ))
 
