@@ -10,6 +10,10 @@ class FakeMainnetClient:
         self.position = None
         self.open_orders = []
         self.commission_rate = {"makerCommissionRate": "0", "takerCommissionRate": "0.0004"}
+        self.asset_balances = {
+            "USDC": {"asset": "USDC", "availableBalance": "1000"},
+            "USDT": {"asset": "USDT", "availableBalance": "1000"},
+        }
 
     async def get_commission_rate(self, symbol):
         return self.commission_rate
@@ -19,6 +23,8 @@ class FakeMainnetClient:
 
     async def get_open_orders(self, symbol):
         return list(self.open_orders)
+    async def get_asset_balance(self, asset):
+        return self.asset_balances.get(asset)
 
 
 class MemoryMainnetRunRepo:
@@ -129,4 +135,30 @@ async def test_arm_creates_single_armed_run_when_safe():
     assert "已啟動" in result
     assert repo.run["status"] == "ARMED"
     assert repo.run["symbol"] == "ETHUSDC"
-    assert repo.events[-1][1] == "armed"
+    assert [event[1] for event in repo.events[-2:]] == [
+        "armed",
+        "loop_rearm_authority",
+    ]
+
+@pytest.mark.asyncio
+async def test_arm_blocks_when_available_margin_cannot_cover_recovery_basket():
+    client = FakeMainnetClient()
+    client.asset_balances["USDC"]["availableBalance"] = "0.4234"
+    repo = MemoryMainnetRunRepo()
+    manager = MainnetOneRunManager(
+        settings=_settings(
+            mainnet_initial_notional_usdc=50.0,
+            mainnet_max_cumulative_notional_usdc=150.0,
+            mainnet_equity_cap_usdc=50.0,
+            mainnet_leverage=75,
+        ),
+        client=client,
+        repo=repo,
+    )
+
+    result = await manager.arm()
+
+    assert "可用保證金不足" in result
+    assert "0.4234" in result
+    assert "2.1000" in result
+    assert repo.run is None

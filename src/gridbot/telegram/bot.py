@@ -3,6 +3,7 @@
 Registers all command handlers and builds the Application.
 """
 
+from telegram import BotCommand, BotCommandScopeAllPrivateChats
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters
 
 from config.settings import Settings
@@ -22,6 +23,7 @@ from src.gridbot.storage.repositories import (
 from src.gridbot.telegram.handlers import (
     cmd_ai,
     cmd_help,
+    cmd_lanes,
     cmd_mainnet,
     cmd_pause,
     cmd_pnl,
@@ -36,29 +38,36 @@ from src.gridbot.telegram.handlers import (
     handle_text_message,
     handle_unknown_command,
 )
+from src.gridbot.telegram.adaptive_status import cmd_status
+from src.gridbot.telegram.clean_commands import cmd_help as clean_cmd_help, cmd_start as clean_cmd_start
 from src.gridbot.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
 
-async def post_init(application: Application) -> None:
-    from telegram import BotCommand
-    commands = [
-        BotCommand("signal", "即時策略訊號與子邏輯診斷"),
-        BotCommand("mainnet", "手動實盤 one-run 驗證與開單"),
-        BotCommand("testnet", "查看 Testnet 當前部位狀態"),
-        BotCommand("pnl", "查看今日/昨日交易損益"),
-        BotCommand("ai", "使用 Gemini 分析最新交易市況"),
-        BotCommand("pause", "暫停 Testnet 自動化調度器"),
-        BotCommand("resume", "恢復 Testnet 自動化調度器"),
-        BotCommand("help", "顯示所有功能命令清單"),
-    ]
+TELEGRAM_MENU_COMMANDS = [
+    BotCommand("status", "查看 Adaptive 目前 run 與狀態"),
+    BotCommand("lanes", "查看全部 legacy lane 狀態"),
+    BotCommand("mainnet", "管理 mainnet Adaptive run"),
+    BotCommand("pnl", "查看 mainnet 今日 PnL"),
+    BotCommand("help", "顯示可用命令"),
+]
+
+
+async def sync_command_menu(application: Application) -> None:
+    """Replace stale default/private-chat menus with the current minimal menu."""
     try:
-        await application.bot.set_my_commands(commands)
-        logger.info("telegram_bot_commands_set_success")
+        await application.bot.set_my_commands(TELEGRAM_MENU_COMMANDS)
+        await application.bot.set_my_commands(
+            TELEGRAM_MENU_COMMANDS,
+            scope=BotCommandScopeAllPrivateChats(),
+        )
+        logger.info("telegram_bot_commands_set_success", count=len(TELEGRAM_MENU_COMMANDS))
     except Exception as e:
         logger.error("telegram_bot_commands_set_failed", error=str(e))
 
+async def post_init(application: Application) -> None:
+    await sync_command_menu(application)
 
 def build_telegram_app(
     settings: Settings,
@@ -93,8 +102,10 @@ def build_telegram_app(
     app.bot_data["mainnet_run_repo"] = MainnetRunRepository(db)
 
     # Register command handlers
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("start", clean_cmd_start))
+    app.add_handler(CommandHandler("help", clean_cmd_help))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("lanes", cmd_lanes))
     app.add_handler(CommandHandler("testnet", cmd_testnet))
     app.add_handler(CommandHandler("mainnet", cmd_mainnet))
     app.add_handler(CommandHandler("pnl", cmd_pnl))
@@ -110,6 +121,6 @@ def build_telegram_app(
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
     app.add_handler(MessageHandler(filters.COMMAND, handle_unknown_command))
 
-    logger.info("telegram_app_configured", handlers=13)
+    logger.info("telegram_app_configured", handlers=14)
 
     return app

@@ -7,6 +7,8 @@ All handlers receive ApplicationContext from python-telegram-bot v21.
 from __future__ import annotations
 
 import asyncio
+import collections
+import hashlib
 import json
 import urllib.request
 from dataclasses import replace
@@ -24,11 +26,76 @@ from src.gridbot.storage.repositories import AuditLogRepository
 from src.gridbot.telegram.formatters import (
     format_testnet_dashboard,
 )
+from src.gridbot.telegram.lane_monitor import (
+    build_lane_detail,
+    build_lane_monitor,
+    lane_monitor_html_chunks,
+    lane_monitor_keyboard,
+)
 from src.gridbot.testnet.pnl import calculate_testnet_pnl_breakdown
 from src.gridbot.utils.logging import get_logger
 
 logger = get_logger(__name__)
 TAIPEI = ZoneInfo("Asia/Taipei")
+
+
+TELEGRAM_HTML_SAFE_LIMIT = 3900
+
+
+def _lane_monitor_database(context: ContextTypes.DEFAULT_TYPE):
+    """Prefer the read-dedicated connection so status views cannot queue trades."""
+
+    bot_data = context.application.bot_data
+    return bot_data.get("lane_monitor_db") or bot_data.get("db")
+
+
+def _telegram_html_chunks(text: str, *, limit: int = TELEGRAM_HTML_SAFE_LIMIT) -> list[str]:
+    """Split HTML Telegram messages without exceeding Telegram's 4096-char limit."""
+
+    if limit <= 0:
+        raise ValueError("limit must be positive")
+    if not text:
+        return [""]
+    chunks: list[str] = []
+    current = ""
+    for line in text.splitlines(keepends=True):
+        if len(line) > limit:
+            if current.strip():
+                chunks.append(current.rstrip())
+                current = ""
+            # Long single lines are rare in /signal. Escape fallback chunks so a
+            # forced split cannot leave an unclosed HTML tag in Telegram.
+            escaped_line = escape(line)
+            while len(escaped_line) > limit:
+                split_at = limit
+                # html.escape() emits entities such as ``&amp;``.  Splitting
+                # between ``&`` and ``;`` makes Telegram reject the entire
+                # parse-mode=HTML message, so move the boundary to the start of
+                # the incomplete entity.  Production's 3900-char limit is far
+                # longer than every entity emitted by html.escape().
+                entity_start = escaped_line.rfind("&", 0, split_at)
+                entity_end = escaped_line.rfind(";", 0, split_at)
+                if entity_start > entity_end:
+                    split_at = entity_start
+                if split_at <= 0:  # Defensive fallback for impractically tiny limits.
+                    split_at = limit
+                chunks.append(escaped_line[:split_at])
+                escaped_line = escaped_line[split_at:]
+            current = escaped_line
+            continue
+        if current and len(current) + len(line) > limit:
+            chunks.append(current.rstrip())
+            current = line
+        else:
+            current += line
+    if current.strip() or not chunks:
+        chunks.append(current.rstrip())
+    return chunks
+
+
+async def _reply_html_chunks(message, text: str, *, limit: int = TELEGRAM_HTML_SAFE_LIMIT) -> None:
+    for chunk in _telegram_html_chunks(text, limit=limit):
+        await message.reply_text(chunk, parse_mode="HTML")
 
 
 async def _authorized(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -514,8 +581,11 @@ async def cmd_testnet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not await _authorized(update, context):
         return
     app_data = context.application.bot_data
-    binance_client: BinanceFuturesClient = app_data["binance_client"]
     settings: Settings = app_data["settings"]
+    if not settings.testnet_legacy_enabled:
+        await update.message.reply_text("ℹ️ 舊 Testnet 功能已停用；請使用 /status、/mainnet 或 /pnl。")
+        return
+    binance_client: BinanceFuturesClient = app_data["binance_client"]
 
     if settings.testnet_telegram_signal_only:
         await update.message.reply_text("ℹ️ 目前為手動訊號模式，這個 bot 不會自動下 testnet 單；主要請看 Telegram 開單通知與 /signal。")
@@ -708,200 +778,763 @@ async def handle_rescue_callback(update: Update, context: ContextTypes.DEFAULT_T
         logger.info("rescue_menu_edit_skipped", error=str(exc))
 
 
+async def _build_codex_signal_snapshot(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    execution_wired: bool,
+) -> str | None:
+    manager = context.application.bot_data.get("mainnet_one_run_manager")
+    if manager is None:
+        return None
+
+    try:
+        from scripts.backtest_wildcat_s1s5 import build_features
+        from src.gridbot.strategy.codex_v1_live import (
+            build_codex_v1_live_features,
+            describe_codex_v1_nearest_lanes,
+            format_codex_v1_telegram_report,
+        )
+        from src.gridbot.strategy.wildcat_live import (
+            explain_wildcat_no_signal,
+            generate_wildcat_v2_adverse_guard_live_decision,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("cmd_signal_import_failed", error=str(exc))
+        return None
+
+    settings: Settings = context.application.bot_data["settings"]
+    candles = await manager._load_candles(settings.mainnet_symbol)
+    if len(candles) < 160:
+        return (
+            "⚡ <b>即時 lane snapshot</b>\n"
+            f"目前 K 線不足：<code>{len(candles)}</code> 根，至少需要 <code>160</code> 根。"
+        )
+
+    rng15 = 0.0
+    if len(candles) >= 16:
+        window = candles[-16:-1]
+        hi = max(candle.high for candle in window)
+        lo = min(candle.low for candle in window)
+        px = candles[-1].close
+        rng15 = (hi - lo) / px * 1e4 if px > 0 else 0.0
+    drift_bp = manager._signed_drift_bp(candles, settings.mainnet_range_drift_window_bars)
+    rescue_enabled = await manager._is_rescue_enabled()
+    decision = generate_wildcat_v2_adverse_guard_live_decision(
+        candles,
+        target_daily_usdc=settings.mainnet_equity_cap_usdc * 0.03,
+        notional_usdc=settings.mainnet_effective_entry_notional_usdc,
+        leverage=settings.mainnet_leverage,
+        rescue_enabled=rescue_enabled,
+    )
+
+    if decision is None:
+        reasons = explain_wildcat_no_signal(
+            candles,
+            target_daily_usdc=settings.mainnet_equity_cap_usdc * 0.03,
+            leverage=settings.mainnet_leverage,
+        )
+        detail = "\n".join(reasons[:3]) if reasons else "目前 wildcat 沒有形成候選訊號。"
+        return (
+            "⚡ <b>即時 lane snapshot</b>\n"
+            f"  • 最新 K：<code>{datetime.fromtimestamp((candles[-1].open_time_ms + 60_000) / 1000, tz=timezone.utc).astimezone(TAIPEI).strftime('%Y/%m/%d %H:%M:%S')}</code>\n"
+            "  • wildcat：<code>no_candidate</code>\n"
+            f"{detail}"
+        )
+
+    raw = [
+        {
+            "time_ms": candle.open_time_ms,
+            "open": candle.open,
+            "high": candle.high,
+            "low": candle.low,
+            "close": candle.close,
+            "volume": candle.volume,
+            "quote_volume": candle.quote_volume,
+        }
+        for candle in candles
+    ]
+    feature_series = None
+    try:
+        feature_series = build_features(raw)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("cmd_signal_feature_series_failed", error=str(exc))
+
+    features = build_codex_v1_live_features(
+        symbol=settings.mainnet_symbol,
+        strategy=decision.strategy,
+        side=decision.side,
+        score=decision.signal.score,
+        rng15=rng15,
+        d30=drift_bp,
+        signal=decision.signal,
+        candles=raw,
+        feature_series=feature_series,
+    )
+    nearest = describe_codex_v1_nearest_lanes(features, limit=3)
+    nearest_block = "\n".join(f"  • {escape(line)}" for line in nearest)
+    latest_bar_time = datetime.fromtimestamp(
+        (candles[-1].open_time_ms + 60_000) / 1000,
+        tz=timezone.utc,
+    ).astimezone(TAIPEI).strftime("%Y/%m/%d %H:%M:%S")
+    head = [
+        "⚡ <b>即時 lane snapshot</b>",
+        f"  • 最新 K：<code>{escape(latest_bar_time)}</code>",
+        (
+            "  • wildcat candidate: "
+            f"<code>{escape(decision.strategy)}</code> / "
+            f"<code>{escape(decision.side)}</code> / "
+            f"score=<code>{float(decision.signal.score):.1f}</code>"
+        ),
+        f"  • rescue：<code>{'ON' if rescue_enabled else 'OFF'}</code>",
+        "",
+    ]
+    return "\n".join(head) + format_codex_v1_telegram_report(features, execution_wired=execution_wired) + "\n\n🎯 <b>最近 lane / 尚差門檻</b>\n" + nearest_block
+
+
+async def _build_codex_signal_stats(context: ContextTypes.DEFAULT_TYPE) -> str:
+    db = context.application.bot_data.get("db")
+    if db is None:
+        return "📊 <b>Codex gate 統計</b>\n  • DB 未初始化。"
+
+    now_tpe = datetime.now(tz=TAIPEI)
+    start_tpe = now_tpe.replace(hour=0, minute=0, second=0, microsecond=0)
+    since_ms = int(start_tpe.astimezone(timezone.utc).timestamp() * 1000)
+    now_ms = int(now_tpe.astimezone(timezone.utc).timestamp() * 1000)
+    current_version_fragment = "v1.4"
+    # Keep the operator-facing identity tied to the imported strategy runtime;
+    # a hard-coded copy previously drifted all the way back to v1.4.2.
+    runtime_version = CODEX_V1_VERSION
+    schema_version = "2026_06_20_v133"
+    settings = context.application.bot_data.get("settings")
+    config_keys = (
+        "mainnet_strategy_label",
+        "mainnet_codex_v1_enabled",
+        "mainnet_codex_v1_w2a_shadow_only_enabled",
+        "mainnet_codex_v1_w6a_guarded_200cap_enabled",
+        "mainnet_codex_tp_policy_live_override_enabled",
+        "mainnet_codex_v133_no_lane_miner_enabled",
+        "mainnet_codex_v133_shadow_family_quota_enabled",
+        "mainnet_codex_v133_diagnostic_fill_enabled",
+        "mainnet_codex_v133_tp_terminalization_enabled",
+        "mainnet_codex_v133_fee_gate_audit_only",
+        "mainnet_codex_v133_fee_gate_enforce",
+        "mainnet_codex_v133_net_floor_audit_only",
+        "mainnet_codex_v133_maker_first_profit_exit",
+    )
+    config_snapshot = {key: getattr(settings, key, None) for key in config_keys} if settings is not None else {}
+    config_hash = hashlib.sha1(
+        json.dumps(config_snapshot, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()[:8] if config_snapshot else "n/a"
+
+    event_types = (
+        "entry_codex_v1_accepted",
+        "entry_codex_v1_skipped",
+        "entry_codex_v1_hard_blocked",
+        "entry_codex_v1_no_lane_candidate",
+        "entry_codex_v1_shadow_sample_started",
+        "entry_codex_v1_shadow_sample_dropped",
+        "entry_codex_v1_shadow_outcome",
+        "entry_codex_v1_tp_policy_shadow_started",
+        "entry_codex_v1_tp_policy_shadow_outcome",
+        "entry_codex_v1_tp_policy_shadow_dropped",
+        "w6a_exit_policy_shadow",
+        "entry_placed",
+        "entry_filled",
+        "completed",
+    )
+    event_placeholders = ", ".join("?" for _ in event_types)
+    events_all = await db.fetchall(
+        f"""SELECT run_id, event_type, details_json, event_time_ms
+        FROM mainnet_run_events
+        WHERE event_time_ms >= ?
+          AND event_time_ms <= ?
+          AND event_type IN ({event_placeholders})
+        ORDER BY event_time_ms ASC
+        LIMIT 10000""",
+        (since_ms, now_ms, *event_types),
+    )
+    runs_all = await db.fetchall(
+        """SELECT run_id, status, exit_reason, signal_json, armed_at_ms, completed_at_ms,
+                  realized_pnl_usdc, commission_usdc, side, cumulative_notional_usdc
+        FROM mainnet_runs
+        WHERE armed_at_ms >= ?
+        ORDER BY armed_at_ms ASC
+        LIMIT 300""",
+        (since_ms,),
+    )
+
+    def _json_loads(raw: object) -> dict:
+        try:
+            data = json.loads(str(raw or "{}"))
+            return data if isinstance(data, dict) else {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+
+    parsed_events: list[dict] = []
+    version_counts: dict[str, int] = {}
+    for event in events_all:
+        raw_json = str(event.get("details_json") or "")
+        details = _json_loads(raw_json)
+        event_type = str(event.get("event_type") or "")
+        details["event_type"] = event_type
+        version = str(
+            details.get("version")
+            or (details.get("decision") or {}).get("version")
+            or (details.get("effective_execution") or {}).get("version")
+            or (details.get("raw_classifier") or {}).get("version")
+            or (current_version_fragment if current_version_fragment in raw_json else "unknown")
+        )
+        version_counts[version] = version_counts.get(version, 0) + 1
+        parsed_events.append({**dict(event), "details": details, "raw_json": raw_json, "version": version})
+
+    version_scoped_indices = {
+        idx
+        for idx, event in enumerate(parsed_events)
+        if current_version_fragment in str(event.get("version") or event.get("raw_json") or "")
+    }
+    scoped_run_ids = {
+        str(parsed_events[idx].get("run_id") or "")
+        for idx in version_scoped_indices
+        if parsed_events[idx].get("run_id")
+    }
+    scoped_runs = [
+        row
+        for row in runs_all
+        if str(row.get("run_id") or "") in scoped_run_ids
+        or current_version_fragment in str(row.get("signal_json") or "")
+    ]
+    scoped_run_ids.update(str(row.get("run_id") or "") for row in scoped_runs if row.get("run_id"))
+    if version_scoped_indices or scoped_run_ids:
+        scoped_events = [
+            event
+            for idx, event in enumerate(parsed_events)
+            if idx in version_scoped_indices or str(event.get("run_id") or "") in scoped_run_ids
+        ]
+        scope_label = current_version_fragment
+    else:
+        scoped_events = parsed_events
+        scope_label = "all_codex_today"
+        scoped_run_ids = {str(event.get("run_id") or "") for event in scoped_events if event.get("run_id")}
+        scoped_runs = [row for row in runs_all if str(row.get("run_id") or "") in scoped_run_ids]
+
+    accepted_events = sum(1 for event in scoped_events if event.get("event_type") == "entry_codex_v1_accepted")
+    entry_placed_events = sum(1 for event in scoped_events if event.get("event_type") == "entry_placed")
+    entry_filled_events = sum(1 for event in scoped_events if event.get("event_type") == "entry_filled")
+    skip_events = [event for event in scoped_events if event.get("event_type") in {"entry_codex_v1_skipped", "entry_codex_v1_hard_blocked"}]
+    no_lane_candidates = [event for event in scoped_events if event.get("event_type") == "entry_codex_v1_no_lane_candidate"]
+    shadow_starts = [event for event in scoped_events if event.get("event_type") == "entry_codex_v1_shadow_sample_started"]
+    shadow_drops = [event for event in scoped_events if event.get("event_type") == "entry_codex_v1_shadow_sample_dropped"]
+    shadow_outcomes = [event for event in scoped_events if event.get("event_type") == "entry_codex_v1_shadow_outcome"]
+    tp_policy_starts = [event for event in scoped_events if event.get("event_type") == "entry_codex_v1_tp_policy_shadow_started"]
+    tp_policy_outcomes = [event for event in scoped_events if event.get("event_type") == "entry_codex_v1_tp_policy_shadow_outcome"]
+    tp_policy_drops = [event for event in scoped_events if event.get("event_type") == "entry_codex_v1_tp_policy_shadow_dropped"]
+
+    def _bump(counts: dict[str, int], key: object) -> None:
+        name = str(key or "-")
+        if name and name != "-":
+            counts[name] = counts.get(name, 0) + 1
+
+    def _nested(data: dict, key: str) -> dict:
+        value = data.get(key)
+        return value if isinstance(value, dict) else {}
+
+    def _event_fields(details: dict) -> tuple[str, str, str, str, str, str]:
+        raw = _nested(details, "raw_classifier")
+        effective = _nested(details, "effective_execution")
+        decision = _nested(details, "decision")
+        metrics = _nested(decision, "metrics")
+        lane = (
+            details.get("lane_code")
+            or effective.get("lane_code")
+            or raw.get("lane_code")
+            or decision.get("lane_code")
+            or "NONE"
+        )
+        shadow_lane = (
+            details.get("shadow_lane")
+            or decision.get("shadow_lane")
+            or metrics.get("shadow_lane")
+            or ""
+        )
+        candidate_lane = details.get("candidate_bucket") or details.get("candidate_lane") or decision.get("candidate_lane") or ""
+        reason = (
+            effective.get("effective_reason")
+            or details.get("shadow_outcome")
+            or details.get("terminal_reason")
+            or details.get("reason")
+            or decision.get("reason")
+            or "-"
+        )
+        policy = (
+            details.get("policy_tag")
+            or decision.get("policy_tag")
+            or metrics.get("policy_tag")
+            or metrics.get("policy_note")
+            or shadow_lane
+            or candidate_lane
+            or "-"
+        )
+        status = effective.get("status") or details.get("effective_status") or "-"
+        return str(lane), str(status), str(reason), str(policy), str(shadow_lane), str(candidate_lane)
+
+    reason_rows: dict[str, int] = {}
+    reason_runs: dict[str, set[str]] = {}
+    lane_rows: dict[str, int] = {}
+    side_reason_rows: dict[str, int] = {}
+    for event in skip_events:
+        details = event["details"]
+        lane, _status, reason, _policy, shadow_lane, _candidate_lane = _event_fields(details)
+        run_id = str(event.get("run_id") or "-")
+        _bump(reason_rows, reason)
+        reason_runs.setdefault(reason, set()).add(run_id)
+        _bump(lane_rows, shadow_lane or lane)
+        decision = _nested(details, "decision")
+        effective = _nested(details, "effective_execution")
+        features = _nested(effective, "features")
+        side = decision.get("side") or effective.get("side") or features.get("side") or "-"
+        strategy = decision.get("strategy") or effective.get("strategy") or features.get("strategy") or "-"
+        _bump(side_reason_rows, f"{side}/{strategy}/{reason}")
+
+    no_lane_bucket_counts: dict[str, int] = {}
+    shadow_start_counts: dict[str, int] = {}
+    shadow_drop_counts: dict[str, int] = {}
+    shadow_outcome_counts: dict[str, int] = {}
+    shadow_family_counts: dict[str, int] = {}
+    shadow_metrics: dict[str, dict[str, Any]] = {}
+    shadow_pending_ids: set[str] = set()
+    shadow_done_ids: set[str] = set()
+    shadow_opportunity_ids: set[str] = set()
+    missing_opportunity_rows = 0
+
+    def _shadow_group(details: dict, lane: str, shadow_lane: str, candidate_lane: str) -> str:
+        return str(shadow_lane or details.get("candidate_bucket") or candidate_lane or lane or details.get("reason") or "-")
+
+    def _shadow_family(details: dict, group: str) -> str:
+        family = str(details.get("shadow_lane_family") or "")
+        if family:
+            return family
+        if group.startswith("SH_W2A"):
+            return "W2A"
+        if group.startswith("SH_W6A"):
+            return "W6A"
+        if group.startswith("SH_ANCHOR_S") or group == "ANCHOR-S":
+            return "ANCHOR_S"
+        if group.startswith("SH_DISABLED"):
+            return "DISABLED"
+        if group.startswith("SH_SHORT"):
+            return "SHORT_VETO"
+        if group.startswith("SH_") or group.startswith("NL-"):
+            return "NL"
+        return "OTHER"
+
+    for event in no_lane_candidates:
+        details = event["details"]
+        _bump(no_lane_bucket_counts, details.get("candidate_bucket") or details.get("nearest_lane_code") or "NL_UNCLASSIFIED")
+
+    for event in shadow_starts:
+        details = event["details"]
+        lane, _status, reason, _policy, shadow_lane, candidate_lane = _event_fields(details)
+        sample_id = str(details.get("sample_id") or "")
+        opportunity_id = str(details.get("opportunity_id") or "")
+        if sample_id:
+            shadow_pending_ids.add(sample_id)
+        if opportunity_id:
+            shadow_opportunity_ids.add(opportunity_id)
+        else:
+            missing_opportunity_rows += 1
+        group = _shadow_group(details, lane, shadow_lane, candidate_lane)
+        _bump(shadow_start_counts, group or reason)
+        _bump(shadow_family_counts, _shadow_family(details, group))
+    for event in shadow_drops:
+        details = event["details"]
+        lane, _status, reason, _policy, shadow_lane, candidate_lane = _event_fields(details)
+        opportunity_id = str(details.get("opportunity_id") or "")
+        if opportunity_id:
+            shadow_opportunity_ids.add(opportunity_id)
+        else:
+            missing_opportunity_rows += 1
+        group = _shadow_group(details, lane, shadow_lane, candidate_lane)
+        drop_reason = str(details.get("drop_reason") or "dropped")
+        _bump(shadow_drop_counts, f"{group}:{drop_reason}")
+        _bump(shadow_family_counts, _shadow_family(details, group))
+    for event in shadow_outcomes:
+        details = event["details"]
+        lane, _status, _reason, _policy, shadow_lane, candidate_lane = _event_fields(details)
+        sample_id = str(details.get("sample_id") or "")
+        opportunity_id = str(details.get("opportunity_id") or "")
+        if sample_id:
+            shadow_done_ids.add(sample_id)
+        if opportunity_id:
+            shadow_opportunity_ids.add(opportunity_id)
+        else:
+            missing_opportunity_rows += 1
+        outcome = str(details.get("shadow_outcome") or details.get("outcome") or "-")
+        group = _shadow_group(details, lane, shadow_lane, candidate_lane)
+        family = _shadow_family(details, group)
+        _bump(shadow_outcome_counts, f"{group}:{outcome}")
+        _bump(shadow_family_counts, family)
+        promotion_counts_as = str(details.get("promotion_counts_as") or "")
+        if (
+            promotion_counts_as in {"excluded_terminal", "diagnostic_only"}
+            or details.get("diagnostic_only")
+            or details.get("promotion_eligible") is False
+        ):
+            continue
+        metrics = shadow_metrics.setdefault(
+            group,
+            {"n": 0, "tp1_first": 0, "sl_first": 0, "no_fill": 0, "none": 0, "ambiguous_both": 0, "pnl": 0.0, "families": set()},
+        )
+        metrics["n"] += 1
+        metrics[outcome] = int(metrics.get(outcome, 0)) + 1
+        metrics["families"].add(family)
+        try:
+            metrics["pnl"] += float(details.get("paper_pnl_bp_after_fee") or 0.0)
+        except (TypeError, ValueError):
+            pass
+    pending_shadow = max(0, len(shadow_pending_ids - shadow_done_ids))
+
+    run_status_counts: dict[str, int] = {}
+    for row in scoped_runs:
+        _bump(run_status_counts, f"{row.get('status')}/{row.get('exit_reason') or '-'}")
+    realized = sum(float(row.get("realized_pnl_usdc") or 0) for row in scoped_runs)
+    fees = sum(float(row.get("commission_usdc") or 0) for row in scoped_runs)
+    net = realized - fees
+    traded_runs = [row for row in scoped_runs if float(row.get("cumulative_notional_usdc") or 0) > 0]
+
+    def _top_pairs(counts: dict[str, int], limit: int = 5) -> str:
+        if not counts:
+            return "-"
+        return ", ".join(
+            f"{escape(name)}={count}" for name, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:limit]
+        )
+
+    def _top_reason_pairs(limit: int = 6) -> str:
+        if not reason_rows:
+            return "-"
+        parts: list[str] = []
+        for reason, rows in sorted(reason_rows.items(), key=lambda item: (-item[1], item[0]))[:limit]:
+            parts.append(f"{escape(reason)}={rows}/{len(reason_runs.get(reason, set()))}r")
+        return ", ".join(parts)
+
+    def _promotion_readiness(limit: int = 5) -> str:
+        if not shadow_metrics:
+            return "-"
+        rows: list[str] = []
+        for lane, metrics in sorted(shadow_metrics.items(), key=lambda item: (-int(item[1].get("n") or 0), item[0]))[:limit]:
+            n = int(metrics.get("n") or 0)
+            if n <= 0:
+                continue
+            tp = int(metrics.get("tp1_first") or 0)
+            sl = int(metrics.get("sl_first") or 0) + int(metrics.get("ambiguous_both") or 0)
+            nf = int(metrics.get("no_fill") or 0)
+            tp_rate = tp / n * 100.0
+            sl_rate = sl / n * 100.0
+            nf_rate = nf / n * 100.0
+            pnl = float(metrics.get("pnl") or 0.0)
+            status = "READY?" if n >= 50 and tp_rate >= 65.0 and sl_rate <= 25.0 and nf_rate <= 15.0 and pnl > 0 else "collecting"
+            rows.append(f"{escape(lane)} {n}/50 TP={tp_rate:.1f}% SL={sl_rate:.1f}% NF={nf_rate:.1f}% pnl_bp={pnl:+.1f} {status}")
+        return "; ".join(rows) or "-"
+
+    def _data_quality_warnings() -> str:
+        warnings: list[str] = []
+        ambiguous = sum(1 for event in shadow_outcomes if str(event["details"].get("shadow_outcome") or "") == "ambiguous_both")
+        cooldown_drops = sum(1 for event in shadow_drops if str(event["details"].get("drop_reason") or "") == "cooldown")
+        cap_drops = sum(1 for event in shadow_drops if str(event["details"].get("drop_reason") or "") == "per_run_cap")
+        if missing_opportunity_rows:
+            warnings.append(f"missing_opp={missing_opportunity_rows}")
+        if ambiguous:
+            warnings.append(f"ambiguous={ambiguous}")
+        if cooldown_drops:
+            warnings.append(f"cooldown_drop={cooldown_drops}")
+        if cap_drops:
+            warnings.append(f"cap_drop={cap_drops}")
+        return ", ".join(warnings) or "ok"
+
+    tp_policy_paired_ids = {str(event["details"].get("paired_sample_id") or "") for event in tp_policy_outcomes if event["details"].get("paired_sample_id")}
+    tp_policy_mismatch_by_sample: dict[str, int] = {}
+    for event in tp_policy_outcomes:
+        paired_id = str(event["details"].get("paired_sample_id") or "")
+        if not paired_id:
+            continue
+        try:
+            mismatch_count = int(event["details"].get("tp1_touch_mismatch_count") or 0)
+        except (TypeError, ValueError):
+            mismatch_count = 0
+        tp_policy_mismatch_by_sample[paired_id] = max(tp_policy_mismatch_by_sample.get(paired_id, 0), mismatch_count)
+    tp_policy_mismatch = sum(1 for mismatch_count in tp_policy_mismatch_by_sample.values() if mismatch_count > 0)
+    tp_policy_pending = max(0, len(tp_policy_starts) - len(tp_policy_paired_ids) - len(tp_policy_drops))
+    tp_policy_drift_values: list[float] = []
+    tp_policy_groups: dict[str, dict[str, Any]] = {}
+    for event in tp_policy_outcomes:
+        details = event["details"]
+        policy_id = str(details.get("tp_policy_id") or "")
+        if not policy_id or policy_id == "baseline":
+            continue
+        if details.get("primary_promotion_eligible") is False:
+            continue
+        lane = str(details.get("lane_family") or details.get("shadow_lane_family") or details.get("candidate_lane") or "UNKNOWN")
+        key = f"{lane} {policy_id}"
+        group = tp_policy_groups.setdefault(key, {"n": 0, "delta": 0.0, "deltas": [], "beats": 0, "capture": []})
+        try:
+            delta = float(details.get("delta_vs_baseline_bp_after_fee") or 0.0)
+        except (TypeError, ValueError):
+            delta = 0.0
+        group["n"] += 1
+        group["delta"] += delta
+        group["deltas"].append(delta)
+        if details.get("beats_baseline"):
+            group["beats"] += 1
+        try:
+            group["capture"].append(float(details.get("mfe_capture_ratio") or 0.0) * 100.0)
+        except (TypeError, ValueError):
+            pass
+        drift = details.get("baseline_simulator_drift_bp")
+        if drift is not None:
+            try:
+                tp_policy_drift_values.append(abs(float(drift)))
+            except (TypeError, ValueError):
+                pass
+
+    def _median(values: list[float]) -> float:
+        if not values:
+            return 0.0
+        ordered = sorted(values)
+        mid = len(ordered) // 2
+        if len(ordered) % 2:
+            return ordered[mid]
+        return (ordered[mid - 1] + ordered[mid]) / 2.0
+
+    def _tp_policy_summary(limit: int = 3) -> str:
+        if not tp_policy_groups:
+            return "-"
+        rows: list[str] = []
+        for name, group in sorted(tp_policy_groups.items(), key=lambda item: (-float(item[1].get("delta") or 0.0), item[0]))[:limit]:
+            n = int(group.get("n") or 0)
+            beat = (int(group.get("beats") or 0) / n * 100.0) if n else 0.0
+            med = _median([float(v) for v in group.get("deltas") or []])
+            cap = _median([float(v) for v in group.get("capture") or []])
+            rows.append(f"{escape(name)} N={n} Δ={float(group.get('delta') or 0.0):+.1f}bp med={med:+.1f} beat={beat:.0f}% cap={cap:.0f}%")
+        return "; ".join(rows) or "-"
+
+    def _tp_policy_quality() -> str:
+        parts: list[str] = []
+        parts.append("tp1=ok" if tp_policy_mismatch == 0 else f"tp1_mismatch={tp_policy_mismatch}")
+        if tp_policy_drift_values:
+            avg_drift = sum(tp_policy_drift_values) / len(tp_policy_drift_values)
+            parts.append(f"drift={avg_drift:.1f}bp")
+        else:
+            parts.append("drift=n/a")
+        if tp_policy_drops:
+            parts.append(f"dropped={len(tp_policy_drops)}")
+        return ", ".join(parts)
+
+    def _latest_time(events: list[dict]) -> str:
+        values = [int(event.get("event_time_ms") or 0) for event in events if int(event.get("event_time_ms") or 0) > 0]
+        if not values:
+            return "n/a"
+        return datetime.fromtimestamp(max(values) / 1000.0, tz=timezone.utc).astimezone(TAIPEI).strftime("%H:%M:%S")
+
+    def _evidence_integrity() -> str:
+        no_lane_raw = reason_rows.get("no_codex_v1_lane_match", 0)
+        classified_rate = (len(no_lane_candidates) / no_lane_raw * 100.0) if no_lane_raw else 0.0
+        diagnostic_leaks = sum(
+            1
+            for event in [*shadow_starts, *shadow_outcomes]
+            if event["details"].get("diagnostic_only") and event["details"].get("promotion_eligible")
+        )
+        live_starts = sum(1 for event in tp_policy_starts if event["details"].get("source_type") == "live_trade")
+        live_pairs = len({
+            str(event["details"].get("paired_sample_id") or "")
+            for event in tp_policy_outcomes
+            if event["details"].get("source_type") == "live_trade" and event["details"].get("paired_sample_id")
+        })
+        fee_rows = []
+        for event in [*shadow_starts, *scoped_events]:
+            details = event.get("details", {})
+            fee = details.get("fee_audit")
+            if not fee and isinstance(details.get("codex_v1"), dict):
+                fee = details["codex_v1"].get("fee_audit")
+            if isinstance(fee, dict):
+                fee_rows.append(fee)
+        fee_fail = sum(1 for fee in fee_rows if fee.get("fee_buffer_pass") is False)
+        status = "PASS" if diagnostic_leaks == 0 else f"diag_leak={diagnostic_leaks}"
+        return f"diag_excluded={status}, no_lane_classified={classified_rate:.0f}%, live_tp_pairs={live_pairs}/{live_starts}, fee_audit={len(fee_rows)} rows fail={fee_fail}"
+
+    recent_lines: list[str] = []
+    for event in reversed(scoped_events[-10:]):
+        details = event["details"]
+        lane, status, reason, policy, shadow_lane, candidate_lane = _event_fields(details)
+        display_lane = shadow_lane or candidate_lane or lane
+        recent_lines.append(
+            "  • "
+            f"<code>{escape(str(event.get('run_id') or '-'))}</code> "
+            f"<code>{escape(str(event.get('event_type') or '-'))}</code> "
+            f"lane=<code>{escape(display_lane)}</code> "
+            f"status=<code>{escape(status)}</code> "
+            f"policy=<code>{escape(policy)}</code> "
+            f"reason=<code>{escape(str(reason)[:48])}</code>"
+        )
+
+    version_line = _top_pairs(version_counts, limit=3)
+    window_label = f"{start_tpe.strftime('%m/%d %H:%M')}→{now_tpe.strftime('%H:%M')} TPE"
+    lines = [
+        "📊 <b>Codex gate 統計</b>",
+        f"  • scope: <code>{escape(scope_label)}</code> / window: <code>{escape(window_label)}</code>",
+        f"  • version rows: <code>{version_line}</code>",
+        f"  • runtime: <code>{escape(runtime_version)}</code> schema=<code>{escape(schema_version)}</code> config=<code>{escape(config_hash)}</code>",
+        f"  • freshness scanner/live/shadow/report: <code>{_latest_time(skip_events + no_lane_candidates)}</code> / <code>{_latest_time([event for event in scoped_events if event.get('event_type') in {'entry_codex_v1_accepted', 'entry_placed', 'entry_filled', 'completed'}])}</code> / <code>{_latest_time(shadow_starts + shadow_outcomes + tp_policy_outcomes)}</code> / <code>{now_tpe.strftime('%H:%M:%S')}</code>",
+        f"  • runs=<code>{len(scoped_runs)}</code> traded_runs=<code>{len(traded_runs)}</code> accepted=<code>{accepted_events}</code> placed=<code>{entry_placed_events}</code> filled=<code>{entry_filled_events}</code>",
+        f"  • PnL gross=<code>{realized:+.4f}</code> fee=<code>{fees:.4f}</code> net≈<code>{net:+.4f}</code>",
+        f"  • run_status: <code>{_top_pairs(run_status_counts, limit=5)}</code>",
+        "",
+        "🚧 <b>Block 壓力</b>",
+        f"  • skipped_rows=<code>{len(skip_events)}</code> affected_runs=<code>{len({str(event.get('run_id') or '-') for event in skip_events})}</code> unique_opps≈<code>{len(shadow_opportunity_ids)}</code>",
+        f"  • top_reason rows/runs: <code>{_top_reason_pairs(limit=6)}</code>",
+        f"  • top_lane_or_shadow: <code>{_top_pairs(lane_rows, limit=6)}</code>",
+        f"  • side/strategy/reason: <code>{_top_pairs(side_reason_rows, limit=4)}</code>",
+        f"  • no_lane_bucket: <code>{_top_pairs(no_lane_bucket_counts, limit=6)}</code>",
+        "",
+        "👻 <b>Shadow outcome</b>",
+        f"  • started=<code>{len(shadow_starts)}</code> dropped=<code>{len(shadow_drops)}</code> outcome=<code>{len(shadow_outcomes)}</code> pending≈<code>{pending_shadow}</code>",
+        f"  • family: <code>{_top_pairs(shadow_family_counts, limit=6)}</code>",
+        f"  • start_by_lane: <code>{_top_pairs(shadow_start_counts, limit=5)}</code>",
+        f"  • dropped_by_lane: <code>{_top_pairs(shadow_drop_counts, limit=5)}</code>",
+        f"  • outcome_by_lane: <code>{_top_pairs(shadow_outcome_counts, limit=6)}</code>",
+        f"  • readiness: <code>{_promotion_readiness(limit=5)}</code>",
+        f"  • data_quality: <code>{_data_quality_warnings()}</code>",
+        f"  • evidence_integrity: <code>{_evidence_integrity()}</code>",
+        "",
+        "🎯 <b>TP policy shadow V1.3.2</b>",
+        f"  • samples paired=<code>{len(tp_policy_paired_ids)}</code>/50 outcomes=<code>{len(tp_policy_outcomes)}</code> starts=<code>{len(tp_policy_starts)}</code> dropped=<code>{len(tp_policy_drops)}</code> pending≈<code>{tp_policy_pending}</code>",
+        f"  • quality: <code>{_tp_policy_quality()}</code>",
+        f"  • top_delta: <code>{_tp_policy_summary(limit=3)}</code>",
+        "  • live TP override: <code>OFF</code>",
+        "",
+        "🧾 <b>最近 gate events</b>",
+    ]
+    lines.extend(recent_lines or ["  • <code>none</code>"])
+    return "\n".join(lines)
+
+
 async def cmd_signal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/signal — Confirm current signal status in real-time."""
+    """/signal — Show the current Codex live lane map and order principles."""
     if not await _authorized(update, context):
         return
     app_data = context.application.bot_data
     settings: Settings = app_data["settings"]
-    trader = app_data.get("trader")
     logger.info(
         "telegram_cmd_signal_received",
         chat_id=update.effective_chat.id if update.effective_chat else None,
         user_id=update.effective_user.id if update.effective_user else None,
     )
 
-    if not trader:
-        await update.message.reply_text("❌ 自動交易模組尚未完全初始化或未在實盤模式下啟動。")
-        return
-
-    await update.message.reply_text("⏳ 正在讀取最新 K 線與策略指標，計算即時訊號中...")
-
     try:
-        from datetime import datetime
-        from src.gridbot.testnet.auto_trader import (
-            SIDE_LABELS,
-            REGIME_LABELS,
-            RISK_MODE_LABELS,
-            PLAYBOOK_LABELS,
-            ALLOCATOR_PROFILE_LABELS,
-            ALLOCATOR_STATE_LABELS,
-        )
-        from src.gridbot.strategy.winrate_optimized_portfolio import (
-            describe_winrate_optimized_portfolio_status,
+        from src.gridbot.strategy.codex_v1_live import (
+            CODEX_V1_VERSION,
+            format_codex_v1_signal_overview,
         )
 
-        now_str = datetime.now(TAIPEI).strftime("%Y/%m/%d %H:%M:%S")
-        lines = [f"📡 <b>即時策略訊號狀態報告</b>", f"發送時間: <code>{now_str}</code>\n"]
-
-        for symbol in settings.symbols_list:
-            candles = await trader._load_candles(symbol)
-            if not candles:
-                lines.append(f"━━ <b>{symbol} 評估報告</b> ━━\n❌ 無法獲取最新的 K 線數據\n")
-                continue
-
-            today_net = 0.0 if settings.testnet_telegram_signal_only else await trader._today_net_pnl(symbol)
-            decision = trader._live_signal_decision(symbol, candles, today_net)
-            sig = decision.signal
-
-            action = sig.action
-            action_emoji = "🟢" if action in ("BUY", "LONG", "PLAN_LONG") else "🔴" if action in ("SELL", "SHORT", "PLAN_SHORT") else "➡️"
-            action_lbl = SIDE_LABELS.get(action, action)
-            is_no_signal_wait = (
-                action == "WAIT"
-                and decision.strategy in ("portfolio_wait", "wildcat_wait")
-            )
-
-            strategy_name = settings.testnet_strategy_label
-
-            lines.append(f"━━ <b>{symbol} 評估報告</b> ━━")
-            lines.append(f"策略核心: <code>{strategy_name}</code>")
-            lines.append(f"最新價格: <b>${sig.price:.4f} USDC</b>")
-            if is_no_signal_wait:
-                lines.append("🎯 <b>訊號決策: ➡️ WAIT（目前無新訊號）</b>")
-            else:
-                lines.append(f"🎯 <b>訊號決策: {action_emoji} {action_lbl}</b>")
-            lines.append(f"得分: <code>{sig.score}</code> | 信心度: <code>{sig.confidence}%</code>")
-
-            # Indicators
-            rsi_val = f"{sig.rsi:.2f}" if sig.rsi is not None else "N/A"
-            atr_val = f"{sig.atr:.4f}" if sig.atr is not None else "N/A"
-            vwap_val = f"${sig.vwap:.4f}" if sig.vwap is not None else "N/A"
-            sup_val = f"${sig.support:.4f}" if sig.support is not None else "N/A"
-            if is_no_signal_wait:
-                lines.append("📊 指標摘要: <code>本輪未形成可執行 setup，因此不展開 RSI / ATR / VWAP 細節</code>")
-            else:
-                lines.append(f"📊 RSI: <code>{rsi_val}</code> | ATR: <code>{atr_val}</code>")
-                lines.append(f"🧱 VWAP: <code>{vwap_val}</code> | 支撐: <code>{sup_val}</code>")
-
-            # Allocator and Regime states
-            regime_lbl = REGIME_LABELS.get(decision.regime, decision.regime)
-            risk_lbl = RISK_MODE_LABELS.get(decision.risk_mode, decision.risk_mode)
-            playbook_lbl = PLAYBOOK_LABELS.get(decision.market_playbook, decision.market_playbook)
-            state_lbl = ALLOCATOR_STATE_LABELS.get(decision.allocator_state, decision.allocator_state)
-            profile_lbl = ALLOCATOR_PROFILE_LABELS.get(decision.allocator_profile, decision.allocator_profile)
-
-            lines.append("")
-            lines.append("⚙️ <b>配置器與市場狀態:</b>")
-            lines.append(f"  • 市場型態: <code>{regime_lbl}</code>")
-            lines.append(f"  • 風控模式: <code>{risk_lbl}</code>")
-            lines.append(f"  • 交易劇本: <code>{playbook_lbl}</code>")
-            lines.append(f"  • 分配倍率: <code>{decision.allocator_scale:.2f}x</code>")
-            lines.append(f"  • 分配狀態: <code>{state_lbl}</code> | 配置: <code>{profile_lbl}</code>")
-            if is_no_signal_wait:
-                lines.append("  • 解讀: <code>策略正常待機，這一刻沒有通過條件的進場訊號</code>")
-
-            # Planned parameters if signal is buy/sell
-            if action in ("BUY", "SELL", "LONG", "SHORT") and sig.planned_qty > 0:
-                lines.append("")
-                lines.append("📐 <b>訊號開倉計畫參數:</b>")
-                lines.append(f"  • 進場價: ${sig.price:.4f}")
-                lines.append(f"  • 計畫數量: {sig.planned_qty:.6f}")
-                lines.append(f"  • 計畫名目價值: ${sig.planned_notional_usdc:.2f} USDC")
-                lines.append(f"  • 估計保證金: ${sig.planned_margin_usdc:.4f} USDC")
-                if sig.stop_loss:
-                    lines.append(f"  • 建議止損: <b>${sig.stop_loss:.4f}</b>")
-                if sig.take_profits:
-                    tp_strs = ", ".join(f"${tp:.4f}" for tp in sig.take_profits)
-                    lines.append(f"  • 建議止盈: <b>{tp_strs}</b>")
-
-            # Reasons
-            lines.append("")
-            lines.append("💡 <b>決策理由 / 條件過濾細節:</b>")
-            if sig.reasons:
-                for r in sig.reasons:
-                    lines.append(f"  • {escape(r)}")
-            else:
-                lines.append("  • 無特定描述")
-
-            if settings.testnet_strategy_label == "wildcat_v2_adverse_guard":
-                from src.gridbot.strategy.wildcat_live import explain_wildcat_no_signal
-                reasons = explain_wildcat_no_signal(
-                    candles=candles,
-                    today_pnl_usdc=today_net,
-                    target_daily_usdc=float(getattr(settings, "testnet_equity_usdc", 150.0)) * 0.03,
-                    leverage=int(getattr(settings, "testnet_order_leverage", 75)),
-                )
-                lines.append("")
-                lines.append("🧭 <b>Wildcat 子邏輯即時狀態列表</b>")
-                for r in reasons:
-                    lines.append(f"  • {r}")
-
-            if settings.testnet_strategy_label == "winrate_optimized_portfolio":
-                status = describe_winrate_optimized_portfolio_status(
-                    candles=candles,
-                    today_net=today_net,
-                    cooldown_until=getattr(trader, "_cooldown_until", {}),
-                    equity_usdc=float(getattr(settings, "testnet_equity_usdc", 150.0)),
-                )
-                lines.append("")
-                lines.append("🧭 <b>S1~S5 即時狀態列表</b>")
-                summary = status.get("summary") or {}
-                if status.get("ready"):
-                    lines.append(
-                        "市況："
-                        f"<code>trend={escape(str(summary.get('trend')))}</code> / "
-                        f"<code>vol={escape(str(summary.get('vol')))}</code> / "
-                        f"<code>vol_ratio={float(summary.get('vol_ratio') or 0):.2f}</code> / "
-                        f"<code>body={float(summary.get('body_ratio') or 0):.2f}</code>"
-                    )
-                    ready_candidates = status.get("ready_candidates") or []
-                    if ready_candidates:
-                        lines.append("✅ <b>目前通過候選：</b>")
-                        for row in ready_candidates:
-                            direction = str(row.get("direction") or "WAIT")
-                            side_text = "做多" if direction == "LONG" else "做空" if direction == "SHORT" else "等待"
-                            lines.append(
-                                f"  • <b>{side_text}</b> | "
-                                f"{escape(str(row.get('name') or row.get('key')))} | "
-                                f"score=<code>{int(row.get('score') or 0)}</code>"
-                            )
-                    else:
-                        lines.append("ℹ️ <b>目前沒有任何 S1~S5 通過開單門檻；下方列出每個策略卡點。</b>")
-                    status_icon = {
-                        "ready": "✅",
-                        "watch": "👀",
-                        "inactive": "⏸",
-                        "cooldown": "🧊",
-                    }
-                    status_label = {
-                        "ready": "可開",
-                        "watch": "監控",
-                        "inactive": "不適用",
-                        "cooldown": "冷卻",
-                    }
-                    direction_label = {
-                        "LONG": "做多",
-                        "SHORT": "做空",
-                        "WAIT": "等待",
-                    }
-                    for row in status.get("strategies") or []:
-                        row_status = str(row.get("status") or "inactive")
-                        direction = str(row.get("direction") or "WAIT")
-                        lines.append(
-                            f"{status_icon.get(row_status, '•')} "
-                            f"<b>{escape(str(row.get('name') or row.get('key')))}</b> "
-                            f"<code>{status_label.get(row_status, row_status)}</code> | "
-                            f"{direction_label.get(direction, direction)} | "
-                            f"score=<code>{int(row.get('score') or 0)}</code> "
-                            f"/ level=<code>{int(row.get('level_score') or 0)}</code>"
-                        )
-                        lines.append(f"   └ {escape(str(row.get('reason') or ''))}")
-                else:
-                    lines.append(f"  • {escape(str(summary.get('reason') or 'S1~S5 狀態尚未就緒'))}")
-            lines.append("")
-
-        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+        codex_live_enabled = bool(
+            getattr(settings, "mainnet_codex_v1_enabled", False)
+            or getattr(settings, "mainnet_strategy_label", "") in {
+                CODEX_V1_VERSION,
+                "_codex_v1.4.1",
+                "_codex_v1.4.0",
+                "_codex_v1.3.3_fee_and_evidence_quality_fix",
+                "codex_v1.3.0_w6a_guarded_200cap",
+                "_codex_v1.2.12",
+                "codex_v1.2.12",
+                "_codex_v1.2.11",
+                "codex_v1.2.11",
+                "_codex_v1.2.10",
+                "codex_v1.2.10",
+                "_codex_v1.2.9",
+                "codex_v1.2.9",
+                "_codex_v1.2.8",
+                "codex_v1.2.8",
+                "_codex_v1.2.7",
+                "codex_v1.2.7",
+                "_codex_v1.2.6",
+                "codex_v1.2.6",
+                "_codex_v1.2.5",
+                "codex_v1.2.5",
+                "_codex_v1.2.1",
+                "codex_v1.2.1",
+                "_codex_v1.2.0",
+                "codex_v1.2.0",
+                "_codex_v1.0.1",
+                "codex_v1.0.1",
+                "_codex_v1.0.0",
+                "codex_v1.0.0",
+                "codex_v1",
+            }
+        )
+        disabled_lane_names = tuple(
+            part.strip()
+            for part in str(getattr(settings, "mainnet_codex_v1_disabled_lanes", "") or "").split(",")
+            if part.strip()
+        )
+        report = format_codex_v1_signal_overview(
+            execution_wired=codex_live_enabled,
+            disabled_lane_names=disabled_lane_names,
+            w6_weak_drift_block_enabled=bool(
+                getattr(settings, "mainnet_codex_v1_w6_weak_drift_block_enabled", False)
+            ),
+            w6_weak_drift_threshold_bp=float(
+                getattr(settings, "mainnet_codex_v1_w6_weak_drift_threshold_bp", -30.0)
+            ),
+            w6_deep_pullback_block_enabled=bool(
+                getattr(settings, "mainnet_codex_v1_w6_deep_pullback_block_enabled", False)
+            ),
+            w6_deep_pullback_d30_max_bp=float(
+                getattr(settings, "mainnet_codex_v1_w6_deep_pullback_d30_max_bp", -30.0)
+            ),
+            w6_deep_pullback_adv3_min_bp=float(
+                getattr(settings, "mainnet_codex_v1_w6_deep_pullback_adv3_min_bp", 6.5)
+            ),
+            w6_deep_pullback_rsi_max=float(
+                getattr(settings, "mainnet_codex_v1_w6_deep_pullback_rsi_max", 39.0)
+            ),
+            w6_deep_pullback_vwap_dist_max_bp=float(
+                getattr(settings, "mainnet_codex_v1_w6_deep_pullback_vwap_dist_max_bp", -50.0)
+            ),
+            w6_deep_pullback_pullback_min_bp=float(
+                getattr(settings, "mainnet_codex_v1_w6_deep_pullback_pullback_min_bp", 30.0)
+            ),
+            w2a_tight_block_enabled=bool(
+                getattr(settings, "mainnet_codex_v1_w2a_tight_block_enabled", False)
+            ),
+            w2a_d30_low_bp=float(getattr(settings, "mainnet_codex_v1_w2a_d30_low_bp", -20.0)),
+            w2a_d30_high_bp=float(getattr(settings, "mainnet_codex_v1_w2a_d30_high_bp", -5.0)),
+            w2a_adv3_low_bp=float(getattr(settings, "mainnet_codex_v1_w2a_adv3_low_bp", 0.0)),
+            w2a_adv3_high_bp=float(getattr(settings, "mainnet_codex_v1_w2a_adv3_high_bp", 6.0)),
+            w2a_bb_lower_dist_low_bp=float(
+                getattr(settings, "mainnet_codex_v1_w2a_bb_lower_dist_low_bp", 5.0)
+            ),
+            w2a_bb_lower_dist_high_bp=float(
+                getattr(settings, "mainnet_codex_v1_w2a_bb_lower_dist_high_bp", 20.0)
+            ),
+            w1b_tight_block_enabled=bool(
+                getattr(settings, "mainnet_codex_v1_w1b_tight_block_enabled", False)
+            ),
+            w1b_d30_low_bp=float(getattr(settings, "mainnet_codex_v1_w1b_d30_low_bp", -45.0)),
+            w1b_d30_high_bp=float(getattr(settings, "mainnet_codex_v1_w1b_d30_high_bp", 5.0)),
+            w1b_adv3_high_bp=float(getattr(settings, "mainnet_codex_v1_w1b_adv3_high_bp", 5.0)),
+            w1b_bb_lower_dist_high_bp=float(
+                getattr(settings, "mainnet_codex_v1_w1b_bb_lower_dist_high_bp", 20.0)
+            ),
+            w1b_reprice_wait_max_seconds=float(
+                getattr(settings, "mainnet_codex_v1_w1b_reprice_wait_max_seconds", 60.0)
+            ),
+        )
+        snapshot = await _build_codex_signal_snapshot(
+            context,
+            execution_wired=codex_live_enabled,
+        )
+        if snapshot:
+            await _reply_html_chunks(update.message, snapshot)
+        stats = await _build_codex_signal_stats(context)
+        await _reply_html_chunks(update.message, stats)
 
     except Exception as exc:
         logger.error("cmd_signal_failed", error=str(exc))
@@ -923,6 +1556,27 @@ async def cmd_mainnet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     status = await manager.status()
     await update.message.reply_text(status.text, parse_mode="HTML", reply_markup=status.reply_markup)
+
+
+async def cmd_lanes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/lanes — Read-only status for every frozen legacy lane."""
+    if not await _authorized(update, context):
+        return
+    message = update.message
+    if message is None:
+        return
+    db = _lane_monitor_database(context)
+    if db is None:
+        await message.reply_text("❌ Lane evidence database 尚未初始化。")
+        return
+    text = await build_lane_monitor(db)
+    chunks = lane_monitor_html_chunks(text)
+    for index, chunk in enumerate(chunks):
+        await message.reply_text(
+            chunk,
+            parse_mode="HTML",
+            reply_markup=lane_monitor_keyboard() if index == len(chunks) - 1 else None,
+        )
 
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -997,12 +1651,65 @@ async def handle_mainnet_callback(update: Update, context: ContextTypes.DEFAULT_
     query = update.callback_query
     if query is None:
         return
+    data = query.data or ""
+    lane_monitor_request = data in {"mainnet:lanes", "mainnet:lanes:refresh"} or data.startswith(
+        "mainnet:lane:"
+    )
     manager = context.application.bot_data.get("mainnet_one_run_manager")
-    if manager is None:
+    if manager is None and not lane_monitor_request:
         await query.answer("Mainnet manager 尚未初始化。", show_alert=True)
         return
-    data = query.data or ""
     await query.answer("處理中...")
+    message = query.message
+    if message is None:
+        return
+    if data in {"mainnet:lanes", "mainnet:lanes:refresh"}:
+        db = _lane_monitor_database(context)
+        if db is None:
+            await message.reply_text("❌ Lane evidence database 尚未初始化。")
+            return
+        text = await build_lane_monitor(db)
+        chunks = lane_monitor_html_chunks(text)
+        for index, chunk in enumerate(chunks):
+            await message.reply_text(
+                chunk,
+                parse_mode="HTML",
+                reply_markup=lane_monitor_keyboard() if index == len(chunks) - 1 else None,
+            )
+        return
+    if data.startswith("mainnet:lane:"):
+        db = _lane_monitor_database(context)
+        if db is None:
+            await message.reply_text("❌ Lane evidence database 尚未初始化。")
+            return
+        lane_code = data.removeprefix("mainnet:lane:")
+        text = await build_lane_detail(db, lane_code)
+        chunks = lane_monitor_html_chunks(text)
+        for index, chunk in enumerate(chunks):
+            await message.reply_text(
+                chunk,
+                parse_mode="HTML",
+                reply_markup=lane_monitor_keyboard() if index == len(chunks) - 1 else None,
+            )
+        return
+    if data == "mainnet:adaptive:start":
+        result = await manager.start_adaptive_session(actor="telegram")
+        text = result if isinstance(result, str) else result.text
+        reply_markup = None if isinstance(result, str) else getattr(result, "reply_markup", None)
+        await query.message.reply_text(text, parse_mode="HTML", reply_markup=reply_markup)
+        return
+    if data == "mainnet:adaptive:status":
+        result = await manager.adaptive_status()
+        text = result if isinstance(result, str) else result.text
+        reply_markup = None if isinstance(result, str) else getattr(result, "reply_markup", None)
+        await query.message.reply_text(text, parse_mode="HTML", reply_markup=reply_markup)
+        return
+    if data == "mainnet:adaptive:review":
+        result = await manager.adaptive_review()
+        text = result if isinstance(result, str) else result.text
+        reply_markup = None if isinstance(result, str) else getattr(result, "reply_markup", None)
+        await query.message.reply_text(text, parse_mode="HTML", reply_markup=reply_markup)
+        return
     if data == "mainnet:cancel":
         text = await manager.cancel()
         await query.message.reply_text(text, parse_mode="HTML")

@@ -1,0 +1,183 @@
+{
+  "schema_version": 1,
+  "inventory_date": "2026-07-10",
+  "vm": {
+    "name": "hermesjacktoggy",
+    "ip": "34.80.52.35",
+    "user": "jack_shih",
+    "workspace": "/home/jack_shih/cry3",
+    "git_directory_present": false,
+    "python_version": "3.12.3",
+    "reports_size_reported": "271M"
+  },
+  "tier_definitions": {
+    "A": "Core raw inputs and the integrity-checked preservation archive; keep a durable copy outside the VM.",
+    "B": "Machine-readable research datasets, selectors, and candidates used to reproduce research decisions.",
+    "C": "Derived narrative summaries and redundant presentation formats that are normally regenerable from Tier A or B assets."
+  },
+  "assets": [
+    {
+      "id": "codex_v14_subset_current_db",
+      "name": "codex_v14_subset_current_20260703_133008.db",
+      "category": "core_raw",
+      "tier": "A",
+      "size_bytes": 175800320,
+      "exact_source_path": null
+    },
+    {
+      "id": "v1419_aggtrades",
+      "name": "v1419 aggTrades",
+      "category": "core_raw",
+      "tier": "A",
+      "size_bytes": 129410682,
+      "exact_source_path": null
+    },
+    {
+      "id": "v1420_three_window",
+      "name": "v1420 three-window data",
+      "category": "core_raw",
+      "tier": "A",
+      "size_bytes": 138635384,
+      "exact_source_path": null
+    },
+    {
+      "id": "v1430_w1",
+      "name": "v1430 w1 data",
+      "category": "core_raw",
+      "tier": "A",
+      "size_bytes": 42421894,
+      "exact_source_path": null
+    },
+    {
+      "id": "v1430_w2",
+      "name": "v1430 w2 data",
+      "category": "core_raw",
+      "tier": "A",
+      "size_bytes": 90067489,
+      "exact_source_path": null
+    },
+    {
+      "id": "v1430_w3",
+      "name": "v1430 w3 data",
+      "category": "core_raw",
+      "tier": "A",
+      "size_bytes": 9224702,
+      "exact_source_path": null
+    },
+    {
+      "id": "v1422_fourth_window",
+      "name": "v1422 fourth-window data",
+      "category": "core_raw",
+      "tier": "A",
+      "size_bytes": 4151600,
+      "exact_source_path": null
+    },
+    {
+      "id": "v1426_fifth_window",
+      "name": "v1426 fifth-window data",
+      "category": "core_raw",
+      "tier": "A",
+      "size_bytes": 11544338,
+      "exact_source_path": null
+    },
+    {
+      "id": "v1428_sixth_window",
+      "name": "v1428 sixth-window data",
+      "category": "core_raw",
+      "tier": "A",
+      "size_bytes": 6200890,
+      "exact_source_path": null
+    },
+    {
+      "id": "v1429_seventh_window",
+      "name": "v1429 seventh-window data",
+      "category": "core_raw",
+      "tier": "A",
+      "size_bytes": 2649662,
+      "exact_source_path": null
+    },
+    {
+      "id": "v14_refresh_dataset_json",
+      "name": "codex_research_dataset_v14_refresh_20260703_133008.json",
+      "category": "research_dataset",
+      "tier": "B",
+      "size_bytes": 2850245,
+      "exact_source_path": null
+    },
+    {
+      "id": "v14_refresh_dataset_csv",
+      "name": "codex_research_dataset_v14_refresh_20260703_133008.csv",
+      "category": "research_dataset",
+      "tier": "B",
+      "size_bytes": null,
+      "exact_source_path": null
+    },
+    {
+      "id": "v14_refresh_dataset_md",
+      "name": "codex_research_dataset_v14_refresh_20260703_133008.md",
+      "category": "research_summary",
+      "tier": "C",
+      "size_bytes": null,
+      "exact_source_path": null
+    },
+    {
+      "id": "v1440_holdout_selector_json",
+      "name": "codex_research_selector_v14_refresh_holdout_v1440_20260703_133008.json",
+      "category": "research_selector",
+      "tier": "B",
+      "size_bytes": 996389,
+      "exact_source_path": null
+    },
+    {
+      "id": "v1440_holdout_selector_md",
+      "name": "codex_research_selector_v14_refresh_holdout_v1440_20260703_133008.md",
+      "category": "research_summary",
+      "tier": "C",
+      "size_bytes": null,
+      "exact_source_path": null
+    },
+    {
+      "id": "v1430_nonoracle_candidate_json",
+      "name": "v1430_6win_nonoracle_candidate1.json",
+      "category": "research_candidate",
+      "tier": "B",
+      "size_bytes": null,
+      "exact_source_path": null
+    },
+    {
+      "id": "v1430_nonoracle_candidate_md",
+      "name": "v1430_6win_nonoracle_candidate1.md",
+      "category": "research_summary",
+      "tier": "C",
+      "size_bytes": null,
+      "exact_source_path": null
+    },
+    {
+      "id": "v1423_summary",
+      "name": "v1423 summary",
+      "category": "research_summary",
+      "tier": "C",
+      "size_bytes": null,
+      "exact_source_path": null,
+      "note": "Exact basename and format were not supplied."
+    }
+  ],
+  "archive": {
+    "path": "reports/archive/phase1_20260710/phase1_backtest_assets_20260710.tar.gz",
+    "location": "local",
+    "tier": "A",
+    "size_bytes": 70669341,
+    "sha256": "dfab9cdb102c21bf92ccaf92a6ef47451e91ddb20bcb030532acc4f194705fc3",
+    "file_count": 23
+  },
+  "totals": {
+    "core_raw_size_bytes": 610106961,
+    "known_research_json_size_bytes": 3846634,
+    "known_source_size_bytes_excluding_archive_and_unsized_assets": 613953595
+  },
+  "cautions": [
+    "/tmp is ephemeral and must not be the sole durable location for an asset.",
+    "File presence, size, and checksum do not establish valid strategy performance.",
+    "The VM workspace has no .git directory, so it does not identify a reproducible code commit by itself."
+  ]
+}

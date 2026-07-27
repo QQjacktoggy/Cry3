@@ -1,0 +1,77 @@
+{
+  "artifacts": [
+    {
+      "path": "backtest_asset_manifest.json",
+      "sha256": "ae228373401a37a2de46d38e717d50b7f792fa9b1ac69ee6f1bed84d62b8ae8a",
+      "size_bytes": 5352
+    },
+    {
+      "path": "phase1_backtest_assets_20260710.tar.gz",
+      "sha256": "dfab9cdb102c21bf92ccaf92a6ef47451e91ddb20bcb030532acc4f194705fc3",
+      "size_bytes": 70669341
+    },
+    {
+      "path": "phase1_review_runs_20260710.txt",
+      "sha256": "b4799700f3f9d2b5d82e8b84fd88821f6dff9bf4a81cd62db39aa7f944f2a5f4",
+      "size_bytes": 21291
+    },
+    {
+      "path": "phase1_selected_runs_20260710.db",
+      "sha256": "5b6c584352667bbfc2eda99fa699dd2430267dcfa7f9b5a42fb4bf2c71014c0a",
+      "size_bytes": 19251200
+    },
+    {
+      "path": "phase1_service_tail_20260710.log",
+      "sha256": "6f234b9ec87cef0d33589976b08021ed7c56b498c0169cb2539d4402ad932b6f",
+      "size_bytes": 61100
+    },
+    {
+      "path": "phase1_vm_state_20260710.txt",
+      "sha256": "7e9507314318c7788ac2e566e9ad306bf8496b7a5d7ed0334187c0fbcd39559a",
+      "size_bytes": 414
+    },
+    {
+      "path": "selected_run_ids.txt",
+      "sha256": "6f1cc9e876cc3889ca942d3adf34f3f8bd2b30ac52c8e751574f1efac6946d59",
+      "size_bytes": 681
+    }
+  ],
+  "artifacts_sha256": "d3322dfffd129e812791b7975555013efd096ceb9e80cac5adc5622293ad64c8",
+  "extracted_at": "2026-07-10T02:15:49Z",
+  "manifest_version": 1,
+  "redaction": {
+    "enabled": true,
+    "json_columns": [
+      "mainnet_run_events.details_json",
+      "mainnet_runs.params_json",
+      "mainnet_runs.signal_json"
+    ],
+    "key_fragments": [
+      "api_key",
+      "apikey",
+      "api_secret",
+      "secret",
+      "token",
+      "password",
+      "chat_id",
+      "telegram_chat"
+    ],
+    "method": "recursive_json_key_fragment_match",
+    "replacement": "[REDACTED]"
+  },
+  "source": {
+    "backup_archive_sha256": "b33b2b0f30bc8170a25e15b01cd347abb197ed1c5dc670428a6f888437078cac",
+    "db_sha256": "253107e4f149a0d2f4598b56f7f939a998ebbfadd14875f119bee933ba4dc36e",
+    "deploy_archive_sha256": "7b0ae48d82140ea6e0039c35b8f7095fb2257da8a42426186856db21e1497ef4",
+    "host": "cry3jack",
+    "service": "cry3.service:active",
+    "version": "_codex_v1.4.55"
+  },
+  "subset_db": {
+    "events": 4451,
+    "path": "phase1_selected_runs_20260710.db",
+    "runs": 27,
+    "schema_sha256": "d0fa75fa09461b087c2577ea2871297abe54fadbb02b0a17ee60108cbfc96017",
+    "sha256": "5b6c584352667bbfc2eda99fa699dd2430267dcfa7f9b5a42fb4bf2c71014c0a"
+  }
+}

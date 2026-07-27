@@ -3,6 +3,9 @@
 Handles initialization, scheduled tasks, and graceful shutdown.
 """
 
+import json
+import math
+
 from config.settings import Settings
 from datetime import datetime, time, timezone
 from zoneinfo import ZoneInfo
@@ -14,7 +17,36 @@ from src.gridbot.core.scheduler import Scheduler
 from src.gridbot.grid.analyzer import compute_metrics
 from src.gridbot.grid.models import GridMetrics
 from src.gridbot.mainnet.one_run import MainnetOneRunManager
+from src.gridbot.mainnet.v1459_app_runtime_v3 import build_v1459_app_runtime_v3
+from src.gridbot.mainnet.v1459_readonly_identity_client import V1459ReadOnlyIdentityClient
+from src.gridbot.mainnet.v1469_authority_runtime import V1469AuthorityRuntime
+from src.gridbot.mainnet.v1469_paid_close_runtime import V1469PaidCloseRuntime
+from src.gridbot.mainnet.v1469_paid_entry_runtime import V1469PaidEntryRuntime
+from src.gridbot.mainnet.v1469_paid_execution_adapter import (
+    V1469PaidExecutionAdapter,
+)
+from src.gridbot.mainnet.v1469_paid_promotion_runtime import (
+    V1469PaidPromotionRuntime,
+)
+from src.gridbot.mainnet.v1469_paid_reconciler import V1469PaidReconciler
+from src.gridbot.mainnet.v1469_risk_runtime import V1469RiskAdmissionRuntime
 from src.gridbot.storage.database import Database
+from src.gridbot.storage.v1464_promotion_repository import (
+    V1464PromotionRepository,
+)
+from src.gridbot.storage.v1465_w6a_profile_repository import (
+    V1465W6AProfileRepository,
+)
+from src.gridbot.storage.v1469_arm_observation_repository import (
+    V1469ArmObservationRepository,
+)
+from src.gridbot.storage.v1469_lease_repository import V1469LeaseRepository
+from src.gridbot.storage.v1469_paid_execution_claim_repository import (
+    V1469PaidExecutionClaimRepository,
+)
+from src.gridbot.storage.v1469_risk_event_repository import (
+    V1469RiskEventRepository,
+)
 from src.gridbot.storage.repositories import (
     AuditLogRepository,
     ConfigRepository,
@@ -26,7 +58,7 @@ from src.gridbot.storage.repositories import (
     PerformanceRepository,
     RecommendationRepository,
 )
-from src.gridbot.telegram.bot import build_telegram_app
+from src.gridbot.telegram.bot import build_telegram_app, sync_command_menu
 from src.gridbot.telegram.formatters import (
     format_full_report,
     format_recommendation,
@@ -44,6 +76,10 @@ class App:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.db = Database(settings.db_path)
+        # Telegram Lane Monitor reads large immutable evidence envelopes.  A
+        # dedicated connection keeps those reads out of the latency-critical
+        # mainnet run-cycle queue.
+        self.lane_monitor_db = Database(settings.db_path)
         self.binance = BinanceFuturesClient(settings)
         self.mainnet_settings = settings.model_copy(
             update={
@@ -66,6 +102,44 @@ class App:
         self.audit_repo = AuditLogRepository(self.db)
         self.mainnet_run_repo = MainnetRunRepository(self.db)
         self.config_repo = ConfigRepository(self.db)
+        self.v1464_promotion_repo = V1464PromotionRepository(self.db)
+        self.v1465_w6a_profile_repo = V1465W6AProfileRepository(self.db)
+        self.v1469_arm_observation_repo = V1469ArmObservationRepository(self.db)
+        self.v1469_lease_repo = V1469LeaseRepository(self.db)
+        self.v1469_paid_claim_repo = V1469PaidExecutionClaimRepository(self.db)
+        self.v1469_risk_event_repo = V1469RiskEventRepository(self.db)
+        self.v1469_paid_execution_adapter = V1469PaidExecutionAdapter(
+            self.v1469_paid_claim_repo
+        )
+        self.v1469_paid_reconciler = V1469PaidReconciler(
+            self.v1469_paid_claim_repo
+        )
+        self.v1469_paid_promotion_runtime = V1469PaidPromotionRuntime(
+            self.v1469_paid_claim_repo,
+            evidence_window_ms=(
+                int(self.settings.mainnet_codex_v1469_authority_window_seconds)
+                * 1000
+            ),
+        )
+        self.v1469_authority_runtime = V1469AuthorityRuntime(
+            self.v1469_arm_observation_repo,
+            self.v1469_lease_repo,
+            self.v1469_paid_promotion_runtime,
+        )
+        self.v1469_risk_runtime = V1469RiskAdmissionRuntime(
+            self.v1469_risk_event_repo
+        )
+        self.v1469_paid_entry_runtime = V1469PaidEntryRuntime(
+            authority_runtime=self.v1469_authority_runtime,
+            risk_runtime=self.v1469_risk_runtime,
+            claim_repository=self.v1469_paid_claim_repo,
+        )
+        self.v1469_paid_close_runtime = V1469PaidCloseRuntime(
+            self.v1469_paid_claim_repo,
+            self.v1469_risk_event_repo,
+        )
+        self.v1469_arm_observation_ready = False
+        self.v1469_authority_ready = False
 
         # Fetcher
         self.fetcher = BinanceFetcher(
@@ -80,10 +154,121 @@ class App:
         self.telegram_app = None
         self.testnet_auto_trader = None
         self.mainnet_one_run_manager = None
+        self.adaptive_evidence_repo = None
+        self.adaptive_result_repo = None
+        self.v1459_observation_runtime = None
 
     async def initialize(self) -> None:
         """Initialize all components."""
+        # v1.4.64: validate the paid Codex boundary before opening the database
+        # or making any exchange connection.  A missing/mistyped live flag must
+        # stop startup instead of silently falling back to a legacy paid path.
+        self.settings.assert_mainnet_v1463_runtime_safety()
         await self.db.initialize()
+        if (
+            self.settings.telegram_bot_token
+            and getattr(self, "lane_monitor_db", None) is not None
+        ):
+            await self.lane_monitor_db.initialize()
+        if bool(self.settings.mainnet_codex_v1464_auto_promotion_enabled):
+            try:
+                fingerprint = (
+                    await self.v1464_promotion_repo.assert_schema_ready()
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "unsafe v1.4.64 promotion database schema: "
+                    f"{type(exc).__name__}:{str(exc)[:500]}"
+                ) from exc
+            logger.info(
+                "v1464_promotion_schema_ready",
+                fingerprint=fingerprint,
+            )
+        if bool(
+            self.settings.mainnet_codex_v1465_w6a_profile_shadow_enabled
+            or self.settings.mainnet_codex_v1465_w6a_profile_selector_enabled
+            or self.settings.mainnet_codex_v1465_w6a_profile_enforcement_enabled
+        ):
+            try:
+                fingerprint = (
+                    await self.v1465_w6a_profile_repo.assert_schema_ready()
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "unsafe v1.4.65 W6A profile database schema: "
+                    f"{type(exc).__name__}:{str(exc)[:500]}"
+                ) from exc
+            logger.info(
+                "v1465_w6a_profile_schema_ready",
+                fingerprint=fingerprint,
+            )
+        if bool(self.settings.mainnet_codex_v1469_observation_enabled):
+            try:
+                bucket_seconds = int(
+                    self.settings.mainnet_codex_v1469_observation_bucket_seconds
+                )
+                if bucket_seconds != 30:
+                    raise ValueError("observation bucket must be exactly 30 seconds")
+                fingerprint = (
+                    await self.v1469_arm_observation_repo.assert_schema_ready()
+                )
+            except Exception as exc:
+                self.v1469_arm_observation_ready = False
+                raise RuntimeError(
+                    "unsafe v1.4.69 observation configuration/schema: "
+                    f"{type(exc).__name__}:{str(exc)[:500]}"
+                ) from exc
+            else:
+                self.v1469_arm_observation_ready = True
+                logger.info(
+                    "v1469_observation_schema_ready",
+                    fingerprint=fingerprint,
+                    bucket_seconds=bucket_seconds,
+                )
+        v1469_authority_enabled = bool(
+            self.settings.mainnet_codex_v1469_arbiter_enabled
+            or self.settings.mainnet_codex_v1469_live_enforcement_enabled
+        )
+        if v1469_authority_enabled:
+            # This entire readiness boundary deliberately precedes both
+            # Binance connect calls.  Each repository validates the concrete
+            # schema it owns (migrations 016 through 024); a migration marker
+            # alone is not treated as proof of readiness.
+            try:
+                if int(
+                    self.settings.mainnet_codex_v1469_observation_bucket_seconds
+                ) != 30:
+                    raise ValueError("observation bucket must be exactly 30 seconds")
+                exact_runtime = {
+                    "mainnet_codex_v1469_safety_window_seconds": 15 * 60,
+                    "mainnet_codex_v1469_authority_window_seconds": 45 * 60,
+                    "mainnet_codex_v1469_guard_window_seconds": 180 * 60,
+                    "mainnet_codex_v1469_regime_max_age_seconds": 60,
+                    "mainnet_codex_v1469_submit_max_age_seconds": 10,
+                    "mainnet_codex_v1469_probation_lease_seconds": 5 * 60,
+                    "mainnet_codex_v1469_live_lease_seconds": 10 * 60,
+                }
+                mismatched = {
+                    name: getattr(self.settings, name, None)
+                    for name, expected in exact_runtime.items()
+                    if int(getattr(self.settings, name, -1)) != expected
+                }
+                if mismatched:
+                    raise ValueError(
+                        f"v1.4.69 exact runtime settings mismatch: {mismatched}"
+                    )
+                await self.v1469_arm_observation_repo.assert_schema_ready()
+                await self.v1469_lease_repo.assert_schema_ready()
+                await self.v1469_risk_event_repo.assert_schema_ready()
+                await self.v1469_paid_claim_repo.assert_schema_ready()
+            except Exception as exc:
+                self.v1469_authority_ready = False
+                raise RuntimeError(
+                    "unsafe v1.4.69 authority configuration/schema: "
+                    f"{type(exc).__name__}:{str(exc)[:500]}"
+                ) from exc
+            self.v1469_authority_ready = True
+            logger.info("v1469_authority_schema_ready", bucket_seconds=30)
         await self.binance.connect()
         if self.settings.mainnet_one_run_enabled and self.settings.mainnet_api_key:
             await self.mainnet_binance.connect()
@@ -92,10 +277,207 @@ class App:
     async def shutdown(self) -> None:
         """Graceful shutdown."""
         self.scheduler.shutdown()
+        manager = getattr(self, "mainnet_one_run_manager", None)
+        if manager is not None:
+            try:
+                await manager.shutdown_v1469_observation_writer()
+            except Exception as exc:  # observation must not block shutdown
+                logger.warning(
+                    "v1469_observation_shutdown_failed",
+                    error=str(exc)[:300],
+                )
         await self.binance.close()
         await self.mainnet_binance.close()
+        lane_monitor_db = getattr(self, "lane_monitor_db", None)
+        if lane_monitor_db is not None:
+            await lane_monitor_db.close()
         await self.db.close()
         logger.info("app_shutdown")
+
+    async def _reconcile_v1469_paid_claims_on_restart(self):
+        """Resolve ambiguous adaptive submissions before entry admission.
+
+        This boundary is deliberately dormant while v1.4.69 paid enforcement
+        is disabled. When enabled, the mainnet client has already connected
+        and the scheduler has not started yet. The reconciler is read-only
+        toward Binance and can only transition durable claims after finding
+        their deterministic client order id.
+        """
+        if not bool(
+            self.settings.mainnet_codex_v1469_live_enforcement_enabled
+        ):
+            return None
+        if not self.v1469_authority_ready:
+            raise RuntimeError(
+                "v1.4.69 paid restart reconciliation requires authority readiness"
+            )
+
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        try:
+            result = await self.v1469_paid_reconciler.reconcile_on_restart(
+                environment="MAINNET",
+                symbol=None,
+                now_ms=now_ms,
+                limit=100,
+                find_by_client_order_id=(
+                    self.mainnet_binance.get_order_by_client_order_id
+                ),
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "v1.4.69 paid restart reconciliation failed: "
+                f"{type(exc).__name__}:{str(exc)[:500]}"
+            ) from exc
+
+        if result is None or not bool(getattr(result, "ok", False)):
+            errors = tuple(getattr(result, "errors", ()) or ())
+            detail = "; ".join(
+                (
+                    f"{getattr(item, 'code', 'UNKNOWN')}:"
+                    f"{getattr(item, 'detail', '')}"
+                )[:500]
+                for item in errors[:5]
+            )
+            raise RuntimeError(
+                "v1.4.69 paid restart reconciliation was not clean"
+                + (f": {detail}" if detail else "")
+            )
+
+        logger.info(
+            "v1469_paid_restart_reconciliation_complete",
+            enumerated_claims=int(result.enumerated_claims),
+            lookup_calls=int(result.lookup_calls),
+            visible_orders=int(result.visible_orders),
+            absent_orders=int(result.absent_orders),
+            transitioned_claims=int(result.transitioned_claims),
+        )
+        return result
+
+    @staticmethod
+    def _v1469_json_mapping(value, *, field: str) -> dict:
+        if isinstance(value, dict):
+            return value
+        try:
+            parsed = json.loads(str(value or "{}"))
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"{field} is not valid JSON") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError(f"{field} must be a JSON object")
+        return parsed
+
+    async def _backfill_v1469_paid_terminal_claims_on_restart(self) -> int:
+        """Repair completed paid runs before any new entry can be admitted."""
+        if not bool(
+            self.settings.mainnet_codex_v1469_live_enforcement_enabled
+        ):
+            return 0
+        if not self.v1469_authority_ready:
+            raise RuntimeError(
+                "v1.4.69 paid terminal backfill requires authority readiness"
+            )
+
+        repaired = 0
+        inspected_paid = 0
+        try:
+            runs = await self.mainnet_run_repo.get_recent_runs(limit=100)
+            for run in runs:
+                if str(run.get("status") or "").upper() != "COMPLETED":
+                    continue
+                signal = self._v1469_json_mapping(
+                    run.get("signal_json"),
+                    field="signal_json",
+                )
+                plan = signal.get("v1469_paid_execution")
+                claim_id = str(
+                    signal.get("v1469_paid_claim_id") or ""
+                ).strip()
+                if plan is None and not claim_id:
+                    continue
+                inspected_paid += 1
+                if (
+                    not isinstance(plan, dict)
+                    or plan.get("schema")
+                    != "v1469.paid-execution-plan.1"
+                    or not claim_id
+                ):
+                    raise ValueError(
+                        "completed paid run has invalid execution identity"
+                    )
+                run_id = str(run.get("run_id") or "").strip()
+                if not run_id:
+                    raise ValueError("completed paid run is missing run_id")
+                events = await self.mainnet_run_repo.get_events_by_types(
+                    run_id,
+                    ("completed",),
+                    limit=5,
+                )
+                if len(events) != 1:
+                    raise ValueError(
+                        "completed paid run must have exactly one completed event"
+                    )
+                event = events[0]
+                details = self._v1469_json_mapping(
+                    event.get("details_json"),
+                    field="completed.details_json",
+                )
+                if details.get("eligible_for_wr_ev") is not True:
+                    raise ValueError(
+                        "completed paid run is not reconciliation-eligible"
+                    )
+                if str(
+                    details.get("reconciliation_status") or ""
+                ).upper() != "COMPLETE":
+                    raise ValueError(
+                        "completed paid run lacks complete reconciliation"
+                    )
+                reason = str(
+                    details.get("exit_reason_final")
+                    or details.get("reason")
+                    or ""
+                ).strip()
+                try:
+                    net_pnl = float(details["net_pnl"])
+                    terminal_at_ms = int(details["terminal_at_ms"])
+                except (KeyError, TypeError, ValueError, OverflowError) as exc:
+                    raise ValueError(
+                        "completed paid run has invalid terminal facts"
+                    ) from exc
+                if (
+                    not reason
+                    or not math.isfinite(net_pnl)
+                    or terminal_at_ms <= 0
+                ):
+                    raise ValueError(
+                        "completed paid run has invalid terminal facts"
+                    )
+                loss_cap = float(
+                    self.settings.mainnet_codex_v1469_per_trade_loss_cap_usdc
+                )
+                hard_loss_marker = loss_cap > 0.0 and net_pnl <= -loss_cap
+                result = await self.v1469_paid_close_runtime.record_close(
+                    claim_id=claim_id,
+                    fee_net_pnl_usdc=net_pnl,
+                    terminal_reason=reason,
+                    occurred_at_ms=terminal_at_ms,
+                    source_run_id=run_id,
+                    hard_loss_marker=hard_loss_marker,
+                    actor="v1469-startup-terminal-backfill",
+                )
+                if not result.replayed:
+                    repaired += 1
+        except Exception as exc:
+            raise RuntimeError(
+                "v1.4.69 paid terminal backfill failed: "
+                f"{type(exc).__name__}:{str(exc)[:500]}"
+            ) from exc
+
+        logger.info(
+            "v1469_paid_terminal_backfill_complete",
+            scanned_runs=len(runs),
+            inspected_paid_runs=inspected_paid,
+            repaired_claims=repaired,
+        )
+        return repaired
 
     async def run_fetch_cycle(self) -> None:
         """Execute a single fetch cycle for all symbols."""
@@ -402,6 +784,9 @@ class App:
 
     async def send_testnet_daily_report(self) -> None:
         """Send scheduled daily testnet P&L report via Telegram."""
+        if not self.settings.testnet_legacy_enabled:
+            logger.info("testnet_daily_report_skipped", reason="legacy_testnet_disabled")
+            return
         if not self.telegram_app or not self.settings.telegram_chat_id_int:
             logger.info("testnet_daily_report_skipped", reason="telegram_not_configured")
             return
@@ -452,6 +837,8 @@ class App:
 
         async def _run():
             await self.initialize()
+            await self._reconcile_v1469_paid_claims_on_restart()
+            await self._backfill_v1469_paid_terminal_claims_on_restart()
 
             # Build Telegram app only when configured. Testnet signal-only runs
             # should still stay alive when Telegram credentials are not present.
@@ -461,6 +848,9 @@ class App:
                     binance_client=self.binance,
                     gemini_analyzer=self.gemini,
                     db=self.db,
+                )
+                self.telegram_app.bot_data["lane_monitor_db"] = (
+                    self.lane_monitor_db
                 )
                 self.telegram_app.bot_data["scheduler"] = self.scheduler
             else:
@@ -474,6 +864,23 @@ class App:
             if self.telegram_app:
                 self.telegram_app.bot_data["trader"] = self.testnet_auto_trader
 
+            v1459 = await build_v1459_app_runtime_v3(
+                settings=self.settings,
+                db=self.db,
+                read_only_identity_client=V1459ReadOnlyIdentityClient(self.mainnet_binance),
+                code_version="v1.4.59-continuation-observation-v2",
+            )
+            self.adaptive_evidence_repo = v1459.composition.evidence_repository
+            self.adaptive_result_repo = v1459.composition.result_repository
+            self.v1459_observation_runtime = v1459.runtime
+
+            from src.gridbot.mainnet.v1459_cohort_tracking import V1459CohortTracker
+
+            self.v1459_cohort_tracker = V1459CohortTracker(
+                db=self.db,
+                config_repo=self.config_repo,
+            )
+
             self.mainnet_one_run_manager = MainnetOneRunManager(
                 settings=self.settings,
                 client=self.mainnet_binance,
@@ -481,6 +888,43 @@ class App:
                 trade_repo=self.trade_repo,
                 telegram_app=self.telegram_app,
                 config_repo=self.config_repo,
+                observation_runtime=self.v1459_observation_runtime,
+                cohort_tracker=self.v1459_cohort_tracker,
+                promotion_repo=self.v1464_promotion_repo,
+                w6a_profile_repo=self.v1465_w6a_profile_repo,
+                arm_observation_repo=(
+                    self.v1469_arm_observation_repo
+                    if self.v1469_arm_observation_ready
+                    else None
+                ),
+                v1469_lease_repo=(
+                    self.v1469_lease_repo if self.v1469_authority_ready else None
+                ),
+                v1469_paid_claim_repo=(
+                    self.v1469_paid_claim_repo
+                    if self.v1469_authority_ready
+                    else None
+                ),
+                v1469_risk_event_repo=(
+                    self.v1469_risk_event_repo
+                    if self.v1469_authority_ready
+                    else None
+                ),
+                v1469_paid_execution_adapter=(
+                    self.v1469_paid_execution_adapter
+                    if self.v1469_authority_ready
+                    else None
+                ),
+                v1469_paid_entry_runtime=(
+                    self.v1469_paid_entry_runtime
+                    if self.v1469_authority_ready
+                    else None
+                ),
+                v1469_paid_close_runtime=(
+                    self.v1469_paid_close_runtime
+                    if self.v1469_authority_ready
+                    else None
+                ),
             )
             if self.telegram_app:
                 self.telegram_app.bot_data["mainnet_one_run_manager"] = self.mainnet_one_run_manager
@@ -496,7 +940,7 @@ class App:
                     self.run_analysis_cycle,
                     interval_minutes=30,  # monitor every 30 min
                 )
-            if self.settings.trading_mode == "testnet_live":
+            if self.settings.testnet_legacy_enabled and self.settings.trading_mode == "testnet_live":
                 self.scheduler.add_testnet_trade_job(
                     self.testnet_auto_trader.run_entry_cycle,
                     interval_minutes=self.settings.testnet_auto_trade_interval_minutes,
@@ -530,12 +974,14 @@ class App:
             if self.telegram_app:
                 logger.info("starting_telegram_bot")
                 await self.telegram_app.initialize()
+                # Manual startup does not invoke PTB post_init.
+                await sync_command_menu(self.telegram_app)
                 await self.telegram_app.start()
                 await self.telegram_app.updater.start_polling(drop_pending_updates=True)
             else:
                 logger.info("telegram_bot_skipped")
 
-            if self.settings.trading_mode == "testnet_live":
+            if self.settings.testnet_legacy_enabled and self.settings.trading_mode == "testnet_live":
                 logger.info("running_initial_testnet_trade_cycle")
                 await self.testnet_auto_trader.run_cycle()
 
